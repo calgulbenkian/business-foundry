@@ -1,0 +1,17 @@
+{
+  "name": "business-foundry-browser-checks",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser verification for Business Foundry; no frontend runtime dependencies",
+  "scripts": {
+    "test:browser": "node tests/browser.cjs",
+    "check": "node --check src/foundry/static/app.js && prettier --check \"src/foundry/static/*.{js,css,html}\" tests/browser.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1",
+    "prettier": "3.6.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

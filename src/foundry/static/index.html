@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#153d38" />
+    <title>Business Foundry</title>
+    <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <section id="login" class="login-screen" hidden>
+      <div class="login-story">
+        <div class="brand"><span class="mark">bf</span> Business Foundry</div>
+        <div>
+          <p class="eyebrow">A FOUNDATION FOR WHAT COMES NEXT</p>
+          <h1>From an idea<br />to a business<br />you can run.</h1>
+          <p>
+            Start something new. Buy something worth building on.<br />Keep the decisions, evidence
+            and work connected.
+          </p>
+        </div>
+        <p class="small">Open source · Local first · Built for human judgment</p>
+      </div>
+      <div class="login-form">
+        <div>
+          <p class="eyebrow">YOUR PRIVATE WORKSPACE</p>
+          <h2>Welcome to the Foundry.</h2>
+          <p>Sign in with the access key from your local setup.</p>
+          <form id="login-form">
+            <label
+              >Access key<input
+                name="token"
+                type="password"
+                required
+                autocomplete="current-password"
+                placeholder="Paste your access key" /></label
+            ><button class="primary" type="submit">
+              Open workspace <span aria-hidden="true">↗</span>
+            </button>
+            <p id="login-error" role="alert" class="error"></p>
+          </form>
+          <details>
+            <summary>Finding your key</summary>
+            <p>
+              In the repository folder, run <code>uv run foundry token</code>. Keep this key
+              private. For shared access, ask the workspace owner for a scoped key.
+            </p>
+          </details>
+          <p class="small">
+            Business records stay on this server. AI sharing is optional and requires a separate
+            action.
+          </p>
+        </div>
+      </div>
+    </section>
+    <div id="app" hidden>
+      <aside class="sidebar">
+        <a class="brand" href="/" aria-label="Business Foundry home"
+          ><span class="mark">bf</span><span>Business <br />Foundry</span></a
+        ><label class="workspace-label" for="business-select">WORKSPACE</label
+        ><select id="business-select" aria-label="Choose business"></select>
+        <nav aria-label="Business sections" id="nav"></nav>
+        <div class="sidebar-bottom">
+          <span class="local-dot"></span> Your data. Your decisions.
+          <p>v0.1 · Open operating foundation</p>
+          <button class="text-button" data-action="logout">Sign out</button>
+        </div>
+      </aside>
+      <main>
+        <header class="topbar">
+          <span id="breadcrumb">Workspace / Overview</span>
+          <div>
+            <span id="actor-name" class="small"></span
+            ><button class="secondary compact" data-action="new-business">+ New business</button>
+          </div>
+        </header>
+        <div id="demo-banner" class="demo-banner" hidden>
+          SYNTHETIC DEMO
+          <span
+            >This workspace uses fictional figures and receipts. No real legal or commercial action
+            has occurred.</span
+          >
+        </div>
+        <section id="content" aria-live="polite"></section>
+        <footer>
+          Built on records, evidence and accountable decisions.
+          <a
+            href="https://github.com/calgulbenkian/business-foundry"
+            target="_blank"
+            rel="noopener noreferrer"
+            >View the open source project ↗</a
+          >
+        </footer>
+      </main>
+    </div>
+    <dialog id="dialog">
+      <div class="dialog-heading">
+        <h2 id="dialog-title"></h2>
+        <button class="icon-button" data-action="close-dialog" aria-label="Close dialog">×</button>
+      </div>
+      <div id="dialog-content"></div>
+    </dialog>
+    <div id="toast" role="status" hidden></div>
+  </body>
+</html>

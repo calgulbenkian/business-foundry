@@ -1,0 +1,12 @@
+services:
+  foundry:
+    build: .
+    ports:
+      - '127.0.0.1:8765:8765'
+    volumes:
+      - foundry-data:/data
+    environment:
+      FOUNDRY_ALLOWED_HOSTS: 'localhost,127.0.0.1'
+    restart: unless-stopped
+volumes:
+  foundry-data:

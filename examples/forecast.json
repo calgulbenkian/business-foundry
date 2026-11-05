@@ -1,0 +1,19 @@
+{
+  "title": "Illustrative first operating cycle",
+  "inputs": {
+    "months": 36,
+    "opening_equity": "50000",
+    "opening_debt": "0",
+    "monthly_units": "2",
+    "unit_price": "4000",
+    "unit_cost": "800",
+    "monthly_growth": "0.04",
+    "fixed_costs": "7000",
+    "receivable_days": 30,
+    "monthly_capex": "0",
+    "tax_rate": "0.25",
+    "discount_rate": "0.20",
+    "terminal_growth": "0.02"
+  },
+  "evidence_ids": []
+}

@@ -1,0 +1,15 @@
+.git
+.foundry
+.venv
+.env*
+__pycache__
+*.db
+*.db-*
+*.sqlite*
+node_modules
+test-results
+dist
+build
+.pytest_cache
+.ruff_cache
+.coverage

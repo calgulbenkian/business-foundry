@@ -1,0 +1,56 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install uv==0.10.10
+      - run: uv sync --locked --extra dev --python '${{ matrix.python }}'
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest --cov=foundry --cov-report=term-missing
+      - run: uv build
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24'
+          cache: npm
+      - run: pip install uv==0.10.10
+      - run: uv sync --locked --extra dev
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+      - run: npm run check
+      - run: npm run test:browser
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: docker build -t business-foundry:test .
+      - name: Verify packaged application and persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh business-foundry:test -c 'test "$(id -u)" = "10001" && foundry demo > /tmp/demo.json && python -c "import json, subprocess; x=json.load(open(\"/tmp/demo.json\")); subprocess.run([\"foundry\",\"verify\",x[\"id\"]],check=True)" && python -c "from pathlib import Path; import foundry; assert (Path(foundry.__file__).parent / \"static/index.html\").exists()"'

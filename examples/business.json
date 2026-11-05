@@ -1,0 +1,10 @@
+{
+  "name": "Example geospatial business",
+  "concept": "Synthetic example: deliver a licensed, human-reviewed site-screening report to an infrastructure planning team.",
+  "route": "start",
+  "jurisdiction": "undecided",
+  "currency": "USD",
+  "customer": "Example planning team; willingness to pay is unverified",
+  "owner": "Example founder",
+  "is_demo": true
+}
