@@ -1,4 +1,5 @@
 from decimal import Decimal as D
+from decimal import localcontext
 
 import pytest
 from pydantic import ValidationError
@@ -181,3 +182,16 @@ def test_period_rollups_sum_flows_and_close_balances():
     assert tail["equity"] == "10800.00"
     assert [r["period"] for r in period_rollups(rows[:13])] == ["Year 1", "Month 13"]
     assert period_rollups([]) == []
+
+
+def test_period_rollups_handle_maximum_bound_forecast():
+    inputs = ForecastInputs(
+        months=60, monthly_units=100000000, unit_price=1000000000000, monthly_growth="0.5"
+    )
+    rows = forecast(inputs)["scenarios"]["base"]["months"]
+    periods = period_rollups(rows)
+    assert [p["period"] for p in periods] == [f"Year {n}" for n in range(1, 6)]
+    assert periods[-1]["cash"] == rows[-1]["cash"]
+    with localcontext() as ctx:
+        ctx.prec = 50
+        assert periods[-1]["revenue"] == str(sum((D(r["revenue"]) for r in rows[48:]), D(0)))

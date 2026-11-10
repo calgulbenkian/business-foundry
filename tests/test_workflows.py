@@ -2,6 +2,7 @@ import copy
 import json
 import re
 from datetime import date
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -614,6 +615,19 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     )
     stale_memo = generate("investment_memo", deal["id"])
     assert "WARNING: Supporting evidence has changed since this deal analysis was saved." in stale_memo
+
+
+def test_maximum_bound_forecast_generates_business_plan(setup):
+    _, s, a, bid, _ = setup
+    inputs = dict(months=60, monthly_units=100000000, unit_price=1000000000000, monthly_growth="0.5")
+    saved = s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Max plan", inputs=inputs))
+    month60 = saved["data"]["scenarios"]["base"]["months"][-1]
+    doc = s.generate_document(a, bid, key(), dump(models.DocumentCreate, template="business_plan"))
+    plan = doc["data"]["content"]
+    assert table_rows(plan, "| Line item ") == ["Line item"] + [f"Year {n}" for n in range(1, 6)]
+    revenue = table_rows(plan, "| Revenue ")
+    assert len(revenue) == 6 and all(re.fullmatch(r"\d{1,3}(,\d{3})*\.\d{2}", v) for v in revenue[1:])
+    assert table_rows(plan, "| Cash  ")[-1] == f"{Decimal(month60['cash']):,.2f}"
 
 
 def test_long_forecast_renders_yearly_dcf_columns(setup):

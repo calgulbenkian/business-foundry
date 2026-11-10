@@ -172,21 +172,24 @@ STOCK_KEYS = ("cash", "receivables", "net_fixed_assets", "total_assets", "debt",
 def period_rollups(rows: list[dict]) -> list[dict]:
     """Group monthly rows into 12-month periods: flows are summed, balances taken at period close."""
     result = []
-    for start in range(0, len(rows), 12):
-        chunk = rows[start : start + 12]
-        first, last = chunk[0]["month"], chunk[-1]["month"]
-        if len(chunk) == 12:
-            label = f"Year {start // 12 + 1}"
-        elif first == last:
-            label = f"Month {first}"
-        else:
-            label = f"Months {first}\u2013{last}"
-        period = {"period": label}
-        for k in FLOW_KEYS:
-            period[k] = money(sum((D(r[k]) for r in chunk), ZERO))
-        for k in STOCK_KEYS:
-            period[k] = money(D(chunk[-1][k]))
-        result.append(period)
+    with localcontext() as ctx:
+        # Monthly rows are produced at precision 40; quantizing their sums at the default 28 raises.
+        ctx.prec = 50
+        for start in range(0, len(rows), 12):
+            chunk = rows[start : start + 12]
+            first, last = chunk[0]["month"], chunk[-1]["month"]
+            if len(chunk) == 12:
+                label = f"Year {start // 12 + 1}"
+            elif first == last:
+                label = f"Month {first}"
+            else:
+                label = f"Months {first}\u2013{last}"
+            period = {"period": label}
+            for k in FLOW_KEYS:
+                period[k] = money(sum((D(r[k]) for r in chunk), ZERO))
+            for k in STOCK_KEYS:
+                period[k] = money(D(chunk[-1][k]))
+            result.append(period)
     return result
 
 
