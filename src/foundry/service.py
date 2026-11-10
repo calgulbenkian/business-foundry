@@ -126,6 +126,8 @@ class Service:
                 data["verified_by"] = actor["id"]
             if object_id:
                 old = self.store.get(con, bid, object_id, payload["kind"])
+                if old["state"] == "verified" and actor["role"] not in REVIEWERS:
+                    raise DomainError("A human owner or reviewer must change a verified record.", 403)
                 item = self.store.update(
                     con, old, data, data["certainty"], actor, payload["expected_version"], payload["title"]
                 )

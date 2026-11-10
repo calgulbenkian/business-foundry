@@ -1,9 +1,10 @@
 from decimal import Decimal as D
+from decimal import localcontext
 
 import pytest
 from pydantic import ValidationError
 
-from foundry.finance import acquisition, annual_debt_service, forecast
+from foundry.finance import acquisition, annual_debt_service, forecast, period_rollups
 from foundry.models import Adjustment, DealInputs, ForecastInputs
 
 
@@ -166,3 +167,31 @@ def test_negative_earnings_do_not_produce_positive_multiple_valuation():
 def test_inconsistent_deal_inputs_rejected(changes):
     with pytest.raises(ValidationError):
         deal(**changes)
+
+
+def test_period_rollups_sum_flows_and_close_balances():
+    rows = forecast(simple(months=14))["scenarios"]["base"]["months"]
+    year, tail = period_rollups(rows)
+    assert year["period"] == "Year 1"
+    assert year["revenue"] == "12000.00"
+    assert year["net_income"] == "8400.00"
+    assert year["cash"] == "9400.00"
+    assert tail["period"] == "Months 13\u201314"
+    assert tail["revenue"] == "2000.00"
+    assert tail["cash"] == "10800.00"
+    assert tail["equity"] == "10800.00"
+    assert [r["period"] for r in period_rollups(rows[:13])] == ["Year 1", "Month 13"]
+    assert period_rollups([]) == []
+
+
+def test_period_rollups_handle_maximum_bound_forecast():
+    inputs = ForecastInputs(
+        months=60, monthly_units=100000000, unit_price=1000000000000, monthly_growth="0.5"
+    )
+    rows = forecast(inputs)["scenarios"]["base"]["months"]
+    periods = period_rollups(rows)
+    assert [p["period"] for p in periods] == [f"Year {n}" for n in range(1, 6)]
+    assert periods[-1]["cash"] == rows[-1]["cash"]
+    with localcontext() as ctx:
+        ctx.prec = 50
+        assert periods[-1]["revenue"] == str(sum((D(r["revenue"]) for r in rows[48:]), D(0)))

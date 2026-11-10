@@ -1060,7 +1060,7 @@ async function handle(a, id) {
     const o = find(id);
     showDialog(
       o.title,
-      `${o.stale ? '<div class="notice">Inputs have changed since this draft was generated.</div>' : ''}<pre>${h(o.data.content)}</pre><a class="secondary" href="/api/businesses/${h(state.bid)}/documents/${h(id)}/download">Download Markdown</a>`,
+      `${o.stale ? '<div class="notice">Inputs have changed since this draft was generated.</div>' : ''}<pre class="document">${h(o.data.content)}</pre><a class="secondary" href="/api/businesses/${h(state.bid)}/documents/${h(id)}/download">Download Markdown</a>`,
     );
   } else if (a === 'inspect') {
     const o = find(id);

@@ -19,6 +19,8 @@ Use **Business records** for customers, offers, assets/rights, contracts, roles,
 
 Make the offer specific: buyer, problem, deliverable, exclusions, price, timing, acceptance and payment. Record the rights to every data source and software asset needed for delivery. Connect people, entities, ownership and roles with related-record links; those descriptions do not grant access to the application.
 
+A connected MCP client (see [AI.md](AI.md)) can run the `founder_intake`, `acquisition_intake` and `readiness_review` prompt workflows to interview you and draft these records. They record only assumptions or reported claims; human review gates are unchanged.
+
 Use obligations for tax/reporting reviews, renewals, licenses, customer commitments and similar dated work. v0.1 lists overdue obligations; it does not send reminders or automatically establish recurrence.
 
 ## 3. Preserve and review evidence

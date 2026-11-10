@@ -1,5 +1,8 @@
+import copy
 import json
+import re
 from datetime import date
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -8,6 +11,7 @@ from conftest import reviewed
 from foundry import models
 from foundry.cli import backup_database
 from foundry.demo import seed
+from foundry.documents import render_document
 from foundry.service import Service
 from foundry.store import DomainError, Store
 
@@ -405,3 +409,237 @@ def test_concurrent_receipts_cannot_overpay_an_invoice(setup):
     snapshot = service.snapshot(actor, bid)
     assert snapshot["stats"]["cash_collected"] == "60.00"
     assert snapshot["stats"]["outstanding_invoices"] == "40.00"
+
+
+def test_verified_record_can_only_be_changed_by_a_human_reviewer(setup):
+    store, service, owner, bid, _ = setup
+    evidence = reviewed(setup, source_type="document")
+    record = service.add_record(
+        owner,
+        bid,
+        key(),
+        dump(
+            models.RecordCreate,
+            kind="customer",
+            title="Verified buyer",
+            certainty="verified",
+            evidence_ids=[evidence["id"]],
+        ),
+    )
+    assert record["state"] == "verified"
+    for role in ["agent", "operator"]:
+        p = service.add_principal(owner, {"name": role, "role": role, "business_ids": [bid]})
+        actor = store.authenticate(p["token"])
+        with pytest.raises(DomainError, match="verified record") as exc:
+            service.add_record(
+                actor,
+                bid,
+                key(),
+                dump(
+                    models.RecordUpdate,
+                    kind="customer",
+                    title="Downgraded buyer",
+                    certainty="assumption",
+                    expected_version=1,
+                ),
+                record["id"],
+            )
+        assert exc.value.status == 403
+    updated = service.add_record(
+        owner,
+        bid,
+        key(),
+        dump(
+            models.RecordUpdate,
+            kind="customer",
+            title="Buyer under re-review",
+            certainty="reported",
+            expected_version=1,
+        ),
+        record["id"],
+    )
+    assert updated["version"] == 2 and updated["state"] == "reported"
+
+
+def test_updating_an_asset_reopens_rights_and_delivery_reviews(setup):
+    _, service, actor, _, _ = setup
+    bid = seed(service, actor)["id"]
+    asset = next(o for o in service.snapshot(actor, bid)["objects"] if o["kind"] == "asset")
+    service.add_record(
+        actor,
+        bid,
+        key(),
+        {
+            **{k: v for k, v in asset["data"].items() if k in models.RecordCreate.model_fields},
+            "kind": "asset",
+            "title": asset["title"],
+            "details": "Licence scope changed and needs a fresh review.",
+            "certainty": "reported",
+            "expected_version": asset["version"],
+        },
+        asset["id"],
+    )
+    tasks = {
+        o["data"]["key"]: o
+        for o in service.snapshot(actor, bid)["objects"]
+        if o["kind"] == "task" and not o["data"]["deal_id"]
+    }
+    assert tasks["rights"]["state"] == "needs_review"
+    assert tasks["delivery"]["state"] == "needs_review"
+    assert tasks["agreement"]["state"] == "needs_review"
+    assert tasks["structure"]["state"] == "verified"
+
+
+def table_rows(content, marker):
+    line = next(x for x in content.splitlines() if marker in x)
+    return [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:-1]]
+
+
+def test_business_plan_and_memo_render_deterministic_tables(setup):
+    _, s, a, bid, _ = setup
+    s.save_forecast(
+        a,
+        bid,
+        key(),
+        dump(
+            models.ForecastCreate,
+            title="Six | month\nplan",
+            inputs=dict(
+                months=6,
+                opening_equity=1000,
+                monthly_units=10,
+                unit_price=100,
+                unit_cost=20,
+                monthly_growth=0,
+                fixed_costs=100,
+                receivable_days=0,
+                tax_rate=0,
+            ),
+        ),
+    )
+    evidence = reviewed(setup, source_type="document", title="Lease statement")
+    deal = s.save_deal(
+        a,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target="Loss-making | shop",
+            thesis="Test the screening tables on a loss-making target.",
+            annual_revenue=100000,
+            reported_ebitda=-5000,
+            replacement_management=10000,
+            adjustments=[
+                {"label": "Owner | car\nlease", "amount": 3000, "evidence_id": evidence["id"]},
+                {"label": "Unsupported | item", "amount": 1000},
+            ],
+            purchase_price=50000,
+            fees=0,
+            working_capital=0,
+            senior_debt=0,
+        ),
+    )
+
+    def generate(template, deal_id=None):
+        doc = s.generate_document(
+            a, bid, key(), dump(models.DocumentCreate, template=template, deal_id=deal_id)
+        )
+        return doc["data"]["content"]
+
+    plan = generate("business_plan")
+    memo = generate("investment_memo", deal["id"])
+    for content in (plan, memo):
+        assert "```json" not in content and '"months":' not in content
+    assert "Model: Six \\| month plan (financial_plan_" in plan
+    assert "Currency: USD. Horizon: 6 months." in plan
+    assert table_rows(plan, "| Total revenue ") == ["Total revenue", "6,000.00", "4,500.00", "7,500.00"]
+    assert table_rows(plan, "| First shortfall month ")[1:] == ["None modeled"] * 3
+    assert table_rows(plan, "| Statements balance ")[1:] == ["Yes"] * 3
+    assert table_rows(plan, "| Line item ") == ["Line item", "Months 1–6"]
+    assert table_rows(plan, "| Revenue ") == ["Revenue", "6,000.00"]
+    assert table_rows(plan, "| Cash  ") == ["Cash", "5,200.00"]
+    assert table_rows(plan, "| Monthly growth ") == ["Monthly growth", "0.00%"]
+    assert "| ---------------------- | " in plan and "-------: |" in plan
+    assert table_rows(plan, "| Base     |")[1].startswith("Not available — needs at least 12 months")
+    assert "DCF basis:" not in plan
+    assert "Full monthly statements are stored in financial plan financial_plan_" in plan
+
+    assert "## Target: Loss-making \\| shop" in memo
+    assert "WARNING: Supporting evidence" not in memo
+    assert table_rows(memo, "| Reported EBITDA ") == ["Reported EBITDA", "-5,000.00", ""]
+    assert table_rows(memo, "| Add: Owner") == ["Add: Owner \\| car lease", "3,000.00", evidence["id"]]
+    assert table_rows(memo, "| Normalized EBITDA ") == ["Normalized EBITDA", "-12,000.00", ""]
+    assert table_rows(memo, "| Unsupported") == [
+        "Unsupported \\| item",
+        "1,000.00",
+        "None",
+        "A reviewed evidence record is required.",
+    ]
+    assert table_rows(memo, "| Multiple range ") == ["Multiple range", "3.00x – 5.00x"]
+    assert table_rows(memo, "| Assumed enterprise value range ")[1].startswith("Not meaningful")
+    assert table_rows(memo, "| Assumed equity value range ")[1].startswith("Not meaningful")
+    assert table_rows(memo, "| Buyer equity required ") == ["Sources", "Buyer equity required", "50,000.00"]
+    assert "Annual debt service: 0.00 USD." in memo
+    assert table_rows(memo, "| Base     |") == [
+        "Base",
+        "-12,000.00",
+        "-27,000.00",
+        "-27,000.00",
+        "No debt service",
+        "Yes",
+    ]
+    assert "## Conditions before commitment" in memo
+    for content in (plan, memo):
+        for block in content.split("\n\n"):
+            rows = [x for x in block.splitlines() if x.startswith("|")]
+            assert len({len(re.findall(r"(?<!\\)\|", x)) for x in rows}) <= 1
+
+    snapshot = s.snapshot(a, bid)
+    stored_deal = next(o for o in snapshot["objects"] if o["id"] == deal["id"])
+    assert render_document("investment_memo", snapshot, stored_deal) == render_document(
+        "investment_memo", snapshot, stored_deal
+    )
+    legacy = copy.deepcopy(snapshot)
+    plan_obj = next(o for o in legacy["objects"] if o["kind"] == "financial_plan")
+    del plan_obj["data"]["inputs"]["excess_cash"]
+    _, legacy_plan = render_document("business_plan", legacy)
+    assert "| Excess cash" not in legacy_plan and "| Discount rate" in legacy_plan
+
+    s.review_evidence(
+        a,
+        bid,
+        evidence["id"],
+        key(),
+        dump(models.Review, note="Lease statement withdrawn.", expected_version=evidence["version"]),
+        True,
+    )
+    stale_memo = generate("investment_memo", deal["id"])
+    assert "WARNING: Supporting evidence has changed since this deal analysis was saved." in stale_memo
+
+
+def test_maximum_bound_forecast_generates_business_plan(setup):
+    _, s, a, bid, _ = setup
+    inputs = dict(months=60, monthly_units=100000000, unit_price=1000000000000, monthly_growth="0.5")
+    saved = s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Max plan", inputs=inputs))
+    month60 = saved["data"]["scenarios"]["base"]["months"][-1]
+    doc = s.generate_document(a, bid, key(), dump(models.DocumentCreate, template="business_plan"))
+    plan = doc["data"]["content"]
+    assert table_rows(plan, "| Line item ") == ["Line item"] + [f"Year {n}" for n in range(1, 6)]
+    revenue = table_rows(plan, "| Revenue ")
+    assert len(revenue) == 6 and all(re.fullmatch(r"\d{1,3}(,\d{3})*\.\d{2}", v) for v in revenue[1:])
+    assert table_rows(plan, "| Cash  ")[-1] == f"{Decimal(month60['cash']):,.2f}"
+
+
+def test_long_forecast_renders_yearly_dcf_columns(setup):
+    _, s, a, bid, _ = setup
+    s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Default plan"))
+    s.save_deal(a, bid, key(), dump(models.DealInputs, target="Debt case", thesis="A financed target."))
+    snapshot = s.snapshot(a, bid)
+    _, plan = render_document("business_plan", snapshot)
+    assert table_rows(plan, "| Line item ") == ["Line item", "Year 1", "Year 2", "Year 3"]
+    assert "DCF basis: Projected unlevered cash flow" in plan
+    assert table_rows(plan, "| Base     |")[5].endswith("%")
+    deal = next(o for o in snapshot["objects"] if o["kind"] == "deal")
+    _, memo = render_document("investment_memo", snapshot, deal)
+    assert table_rows(memo, "| Base     |")[4].endswith("x")
+    assert "None — no unsupported adjustments were submitted." in memo
