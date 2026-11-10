@@ -4,7 +4,15 @@ All models are deterministic and use Python Decimal arithmetic. Outputs are deci
 
 ## Operating model
 
-The forecast supports 1–60 months. A month is 30 days. In month `t`, units equal first-month units × `(1 + monthly growth)^(t−1)`. Revenue is units × price. Cost of sales is units × unit cost; fixed costs are paid in their month. The assumptions should include wages, benefits, software, support, insurance and other operating expenses appropriate to the business.
+The forecast supports 1–60 months. A month is 30 days. Model version 1.1.0 calculates active units and fixed costs in month `t` (1-indexed) as:
+
+- `new_units_t = monthly_units × volume_factor × (1 + monthly_growth)^(t−1)`
+- `units_t = new_units_t + monthly_retention × units_{t−1}`, with `units_0 = 0`
+- `fixed_t = (fixed_costs + (fixed_cost_step if t ≥ fixed_cost_step_month else 0)) × fixed_factor`
+
+Revenue is units × price. Cost of sales is units × unit cost; fixed costs are paid in their month. With the default `monthly_retention = 0` and no fixed-cost step, the results equal version 1.0.0.
+
+`monthly_retention` (0–1) carries that share of the prior month's active units into the next month, an aggregate recurring-unit carryover. It is not a per-cohort ledger and has no contract terms, tiers or aging. `fixed_cost_step` is an extra monthly fixed cost (for example a hire or a lease) from `fixed_cost_step_month` onward. A positive step requires a start month within the forecast horizon, and a start month requires a positive step. The assumptions should include wages, benefits, software, support, insurance and other operating expenses appropriate to the business.
 
 Receipts lag billed revenue by the selected collection delay, including a fractional-month interpolation. For a 45-day delay, half of a month's sales is collected the following month and half in the month after that. Revenue less receipts accumulates in receivables; initial receivables are zero. Costs do not wait for customer payment.
 
@@ -20,7 +28,9 @@ Negative cash explicitly means an unfunded requirement. It remains visible rathe
 | Downside | 75% | 110% |
 | Upside | 125% | 105% |
 
-These stresses are not probability estimates. Create additional model versions to explore price, churn, sales timing, funding, collection delays or other assumptions. There is no recurring-revenue cohort engine, inventory, accounts payable, multi-currency consolidation, sales/VAT tax engine, tax-loss carryforward, deferred tax, complex financing or statutory reporting in v0.1. The tax-rate input is not a jurisdictional tax recommendation.
+The unit factor multiplies new units. Because the retention recurrence is linear, it scales retained units and total units in every month by the same factor. The retention rate itself is the same in every scenario. The fixed-cost factor applies to both base fixed costs and the scheduled step.
+
+These stresses are not probability estimates. Create additional model versions to explore price, churn or retention, sales timing, funding, collection delays or other assumptions. There is no per-cohort recurring-revenue engine, inventory, accounts payable, multi-currency consolidation, sales/VAT tax engine, tax-loss carryforward, deferred tax, complex financing or statutory reporting in v0.1. The tax-rate input is not a jurisdictional tax recommendation.
 
 ## Discounted cash flow
 
@@ -44,4 +54,4 @@ The downside subtracts 10% of revenue from EBITDA with no cost relief. The upsid
 
 ## Validation
 
-The tests compare the first operating cycle with independent hand calculations, check 0/15/30/45/60/90-day receipt timing and revenue conservation, trace interest/principal/depreciation through all statements, and verify loss treatment, funding gaps, asset lives and DCF. Acquisition tests check supported versus unsupported adjustments, amortization, zero debt, sources equaling uses and invalid input combinations. No live company financials are used in the test fixtures.
+The tests compare the first operating cycle with independent hand calculations (including unit retention and fixed-cost step cases in every scenario), check 0/15/30/45/60/90-day receipt timing and revenue conservation, trace interest/principal/depreciation through all statements, and verify loss treatment, funding gaps, asset lives and DCF. Acquisition tests check supported versus unsupported adjustments, amortization, zero debt, sources equaling uses and invalid input combinations. No live company financials are used in the test fixtures.

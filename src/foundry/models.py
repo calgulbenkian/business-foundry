@@ -113,7 +113,10 @@ class ForecastInputs(Model):
     monthly_growth: Annotated[Decimal, Field(ge=Decimal("-0.8"), le=Decimal("0.5"), allow_inf_nan=False)] = (
         Decimal("0.03")
     )
+    monthly_retention: Rate = Decimal("0")
     fixed_costs: Money = Decimal("6000")
+    fixed_cost_step: Money = Decimal("0")
+    fixed_cost_step_month: Annotated[int, Field(ge=1, le=60)] | None = None
     receivable_days: Annotated[int, Field(ge=0, le=90)] = 30
     monthly_capex: Money = Decimal("0")
     asset_life_months: Annotated[int, Field(ge=1, le=240)] = 36
@@ -126,10 +129,23 @@ class ForecastInputs(Model):
     )
     excess_cash: Money = Decimal("0")
 
+    @field_validator("fixed_cost_step_month", mode="before")
+    @classmethod
+    def step_month_not_bool(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Fixed-cost step start month must be a whole month number.")
+        return value
+
     @model_validator(mode="after")
     def valid_terminal(self):
         if self.terminal_growth >= self.discount_rate:
             raise ValueError("Discount rate must exceed terminal growth.")
+        if self.fixed_cost_step > 0 and self.fixed_cost_step_month is None:
+            raise ValueError("Fixed-cost step requires a start month.")
+        if self.fixed_cost_step == 0 and self.fixed_cost_step_month is not None:
+            raise ValueError("Fixed-cost step start month requires a positive step amount.")
+        if self.fixed_cost_step_month is not None and self.fixed_cost_step_month > self.months:
+            raise ValueError("Fixed-cost step start month cannot exceed forecast horizon.")
         return self
 
 

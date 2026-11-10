@@ -123,6 +123,94 @@ def test_invalid_forecast_inputs_rejected(changes):
         simple(**changes)
 
 
+def column(result, scenario, key):
+    return [row[key] for row in result["scenarios"][scenario]["months"]]
+
+
+def test_unit_retention_against_independent_hand_calculation():
+    # Units: 10, 10 + 0.5*10 = 15, 10 + 0.5*15 = 17.5. Cash: 1000 + 700 + 1100 + 1300.
+    result = forecast(simple(monthly_retention="0.5"))
+    assert result["model_version"] == "1.1.0"
+    base = result["scenarios"]["base"]
+    assert column(result, "base", "revenue") == ["1000.00", "1500.00", "1750.00"]
+    assert column(result, "base", "units") == ["10.0000", "15.0000", "17.5000"]
+    assert base["summary"]["ending_cash"] == "4100.00"
+    assert base["summary"]["statements_balance"] is True
+    assert column(result, "downside", "revenue") == ["750.00", "1125.00", "1312.50"]
+    assert column(result, "upside", "revenue") == ["1250.00", "1875.00", "2187.50"]
+    for case in ("downside", "upside"):
+        assert result["scenarios"][case]["summary"]["statements_balance"] is True
+
+
+def test_fixed_cost_step_against_independent_hand_calculation():
+    # EBITDA: 700, 650, 650 with no tax or receivable delay.
+    result = forecast(simple(fixed_cost_step="50", fixed_cost_step_month=2))
+    base = result["scenarios"]["base"]
+    assert column(result, "base", "fixed_costs") == ["100.00", "150.00", "150.00"]
+    assert base["summary"]["ending_cash"] == "3000.00"
+    assert base["summary"]["statements_balance"] is True
+    assert column(result, "downside", "fixed_costs") == ["110.00", "165.00", "165.00"]
+    assert column(result, "upside", "fixed_costs") == ["105.00", "157.50", "157.50"]
+
+
+@pytest.mark.parametrize(
+    "start,expected",
+    [(1, ["150.00", "150.00", "150.00"]), (3, ["100.00", "100.00", "150.00"])],
+)
+def test_fixed_cost_step_start_month_boundaries(start, expected):
+    result = forecast(simple(fixed_cost_step="50", fixed_cost_step_month=start))
+    assert column(result, "base", "fixed_costs") == expected
+
+
+def test_new_fields_default_to_version_one_behaviour():
+    inputs = simple()
+    assert inputs.monthly_retention == 0
+    assert inputs.fixed_cost_step == 0
+    assert inputs.fixed_cost_step_month is None
+    assert column(forecast(inputs), "base", "fixed_costs") == ["100.00"] * 3
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"fixed_cost_step": "50", "fixed_cost_step_month": None},
+        {"fixed_cost_step": "0", "fixed_cost_step_month": 2},
+        {"months": 3, "fixed_cost_step": "50", "fixed_cost_step_month": 4},
+        {"fixed_cost_step": "50", "fixed_cost_step_month": 0},
+        {"fixed_cost_step": "50", "fixed_cost_step_month": True},
+        {"fixed_cost_step": "-1", "fixed_cost_step_month": 1},
+        {"monthly_retention": "-0.01"},
+        {"monthly_retention": "1.01"},
+        {"monthly_retention": "NaN"},
+        {"monthly_retention": "Infinity"},
+    ],
+)
+def test_invalid_retention_and_fixed_cost_step_rejected(changes):
+    with pytest.raises(ValidationError):
+        simple(**changes)
+
+
+def test_full_retention_and_step_balance_at_maximum_bounds():
+    inputs = ForecastInputs(
+        months=60,
+        monthly_units=100000000,
+        unit_price=1000000000000,
+        monthly_growth="0.5",
+        monthly_retention="1",
+        fixed_cost_step="1000000000000",
+        fixed_cost_step_month=1,
+    )
+    result = forecast(inputs)
+    for case in ("base", "downside", "upside"):
+        summary = result["scenarios"][case]["summary"]
+        assert summary["statements_balance"] is True, case
+        assert summary["max_balance_error"] == "0.00"
+        rows = result["scenarios"][case]["months"]
+        periods = period_rollups(rows)
+        assert [p["period"] for p in periods] == [f"Year {n}" for n in range(1, 6)]
+        assert periods[-1]["cash"] == rows[-1]["cash"]
+
+
 def deal(**changes):
     return DealInputs(
         **(dict(target="Example target", thesis="Acquire predictable delivery capacity.") | changes)

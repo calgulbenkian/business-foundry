@@ -21,17 +21,23 @@ def ratio(value: Decimal | None) -> str | None:
 
 def _forecast(a: ForecastInputs, volume_factor=ONE, fixed_factor=ONE):
     with localcontext() as ctx:
-        ctx.prec = 40
+        ctx.prec = 50
         cash = a.opening_equity + a.opening_debt
         debt, ar, retained, gross_assets, accumulated_dep = a.opening_debt, ZERO, ZERO, ZERO, ZERO
         revenues, rows, flows = [], [], []
         lag, fraction = divmod(a.receivable_days, 30)
         fraction = D(fraction) / 30
         minimum_cash, first_shortfall, max_balance_error = cash, None, ZERO
+        prior_units = ZERO
         for index in range(a.months):
-            units = a.monthly_units * volume_factor * (1 + a.monthly_growth) ** index
+            month = index + 1
+            new_units = a.monthly_units * volume_factor * (1 + a.monthly_growth) ** index
+            units = new_units + a.monthly_retention * prior_units
+            prior_units = units
+            step_active = a.fixed_cost_step_month is not None and month >= a.fixed_cost_step_month
+            step = a.fixed_cost_step if step_active else ZERO
             revenue = units * a.unit_price
-            cogs, fixed = units * a.unit_cost, a.fixed_costs * fixed_factor
+            cogs, fixed = units * a.unit_cost, (a.fixed_costs + step) * fixed_factor
             revenues.append(revenue)
 
             def billed(i):
@@ -131,7 +137,7 @@ def forecast(inputs: ForecastInputs):
         "upside": _forecast(inputs, D("1.25"), D("1.05")),
     }
     return {
-        "model_version": "1.0.0",
+        "model_version": "1.1.0",
         "inputs": inputs.model_dump(mode="json"),
         "scenarios": cases,
         "scenario_definitions": {
@@ -142,6 +148,8 @@ def forecast(inputs: ForecastInputs):
         "assumptions": [
             "Monthly periods of 30 days; receipts are delayed by the chosen collection period.",
             "Costs, taxes and interest are paid in the month incurred; no inventory or payables model.",
+            "Monthly retention carries that share of prior-month active units into the next month, without cohort or contract-term aging. Scenario unit stresses scale new and retained units proportionally; the retention rate itself is unchanged across scenarios.",
+            "A fixed-cost step adds to monthly fixed costs from its start month onward and is stressed with fixed costs.",
             "Opening cash is opening equity plus opening debt. No unmodeled rescue financing is assumed.",
             "Constant monthly capital spending; straight-line depreciation starts immediately.",
             "No tax-loss carryforwards, deferred tax or jurisdiction-specific tax calculation.",
