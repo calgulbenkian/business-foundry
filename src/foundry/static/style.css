@@ -701,6 +701,9 @@ pre {
   border: 1px solid #e4e9e1;
   border-radius: 8px;
 }
+pre.document {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 code {
   font-size: 11px;
   padding: 2px 5px;
