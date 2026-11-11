@@ -19,6 +19,7 @@ import logging
 import logging.handlers
 import multiprocessing
 import os
+import re
 import secrets
 import signal
 import socket
@@ -49,9 +50,11 @@ WINDOW_READY_SECONDS = 120
 SESSION_DAYS = 30
 SERVER_START_SECONDS = 15
 SHUTDOWN_SECONDS = 10
-# After a termination signal, how long the window has to close the normal way before the app
-# cleans up and exits without it.
-SIGNAL_EXIT_SECONDS = 20
+# After a termination signal the process ends within SIGNAL_EXIT_SECONDS, whatever the window,
+# the server or the database are doing. The window first has SIGNAL_CLOSE_SECONDS to close the
+# normal way; if it has not, the app runs the same cleanup itself in the time that remains.
+SIGNAL_EXIT_SECONDS = 30
+SIGNAL_CLOSE_SECONDS = 10
 
 log = logging.getLogger("foundry.desktop")
 
@@ -186,6 +189,17 @@ def _mac_filesystem(path: Path) -> tuple[str, bool]:
     return result.f_fstypename.decode(errors="replace"), bool(result.f_flags & MNT_LOCAL)
 
 
+# /proc/self/mounts writes these four characters of a mount point as octal escapes.
+_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+_MOUNT_ESCAPE = re.compile(r"\\(040|011|012|134)")
+
+
+def _mount_point(field: str) -> str:
+    """Decode a mount point field in one pass, so that an escaped backslash followed by digits
+    (``\\134040``) stays a backslash followed by digits instead of becoming a space."""
+    return _MOUNT_ESCAPE.sub(lambda match: _MOUNT_ESCAPES[match.group(1)], field)
+
+
 def _linux_filesystem(path: Path, mounts: str) -> str:
     best, kind = "", ""
     target = str(path)
@@ -193,7 +207,7 @@ def _linux_filesystem(path: Path, mounts: str) -> str:
         fields = line.split()
         if len(fields) < 3:
             continue
-        point = fields[1].replace("\\040", " ")
+        point = _mount_point(fields[1])
         inside = target == point or target.startswith(point.rstrip("/") + "/")
         if inside and len(point) >= len(best):
             best, kind = point, fields[2]
@@ -210,7 +224,9 @@ def is_network_path(path: Path, platform: str | None = None) -> bool:
         kind, local = _mac_filesystem(existing)
         return not local or kind in NETWORK_FILESYSTEMS
     try:
-        mounts = Path("/proc/self/mounts").read_text()
+        # Mount points are bytes. Decode them the way the path itself is decoded, so a name that
+        # is not valid UTF-8 still matches (and does not stop the app with a decoding error).
+        mounts = os.fsdecode(Path("/proc/self/mounts").read_bytes())
     except OSError:
         return False
     return _linux_filesystem(existing.resolve(), mounts) in NETWORK_FILESYSTEMS
@@ -244,19 +260,124 @@ def replace_missing_streams():
             setattr(sys, name, open(os.devnull, "w"))  # kept open for the process
 
 
+REDACTED = "[redacted]"
+# The start address's code parameter however it is written, so that even part of a code (a
+# shortened URL, say), which an exact match would miss, is removed, and with it ``code=``, so
+# that a search of the log for ``code=`` finds no start address.
+_START_QUERY = re.compile(r"(/desktop/start\?(?:[^\s#?]*&)?)code=[A-Za-z0-9_-]*")
+_PLAIN = logging.Formatter()
+
+
+class LogRedaction(logging.Filter):
+    """Keeps every launch code and the window's session token out of every log record.
+
+    It is installed as the process's log record factory, so it sees each record from any
+    logger, at whatever level a library has set, as the record is made and before any handler
+    or formatter, including handlers a library adds for itself (pywebview writes to stderr).
+    Each secret is added before it exists outside this module. If a secret, or a start address,
+    is in a record's message, its arguments (it formats them once to check), the text of a logged
+    exception or a stack, that part is replaced by the redacted text. As second layers it is also
+    a filter on the handlers present when logging is set up and when the window library loads,
+    and the log file's formatter redacts each finished line.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._secrets: tuple[str, ...] = ()
+        self._lock = threading.Lock()
+        self._installed = False
+
+    def protect(self, secret: str):
+        """Remove ``secret`` from every log record from now on."""
+        self.install()
+        with self._lock:
+            if secret and secret not in self._secrets:
+                self._secrets = (*self._secrets, secret)
+
+    def install(self):
+        with self._lock:
+            if self._installed:
+                return
+            make = logging.getLogRecordFactory()
+
+            def factory(*args, **kwargs):
+                return self.scrub(make(*args, **kwargs))
+
+            logging.setLogRecordFactory(factory)
+            self._installed = True
+
+    def redact(self, text: str) -> str:
+        text = _START_QUERY.sub(lambda match: match.group(1) + REDACTED, text)
+        for secret in self._secrets:
+            text = text.replace(secret, REDACTED)
+        return text
+
+    def scrub(self, record: logging.LogRecord) -> logging.LogRecord:
+        try:
+            try:
+                message = record.getMessage()
+                clean = self.redact(message)
+            except Exception:
+                # Arguments that do not fit the message would otherwise be printed raw, with the
+                # logging error, to stderr.
+                message, clean = None, self.redact(f"{record.msg} {record.args!r}")
+            if clean != message:
+                record.msg, record.args = clean, None
+            if record.exc_info:
+                text = _PLAIN.formatException(record.exc_info)
+                clean = self.redact(text)
+                if clean != text:
+                    record.exc_info, record.exc_text = None, clean
+            elif record.exc_text:
+                record.exc_text = self.redact(record.exc_text)
+            if record.stack_info:
+                record.stack_info = self.redact(record.stack_info)
+        except Exception:
+            record.msg, record.args = "(a log record withheld: it could not be checked for secrets)", None
+            record.exc_info = record.exc_text = record.stack_info = None
+        return record
+
+    def filter(self, record):
+        self.scrub(record)
+        return True
+
+
+LOG_REDACTION = LogRedaction()
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        return LOG_REDACTION.redact(super().format(record))
+
+
+def guard_log_handlers():
+    """Add the redaction filter to every handler that exists now, on any logger."""
+    loggers = [logging.getLogger()]
+    loggers += [x for x in logging.Logger.manager.loggerDict.values() if isinstance(x, logging.Logger)]
+    handlers = [h for logger in loggers for h in logger.handlers]
+    if logging.lastResort is not None:
+        handlers.append(logging.lastResort)
+    for handler in handlers:
+        if LOG_REDACTION not in handler.filters:
+            handler.addFilter(LOG_REDACTION)
+
+
 def configure_logging(data_dir: Path) -> Path:
     path = data_dir / "desktop.log"
     if not path.exists():
         os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+    LOG_REDACTION.install()
     handler = logging.handlers.RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler.setFormatter(_RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
-    # httpx logs every request's full URL at INFO. Nothing in the app sends the launch code
-    # through httpx, but keep any URL with a query string out of the file regardless.
+    # A further layer: httpx logs every request's full URL at INFO. Nothing in the app sends the
+    # launch code through httpx, and the redaction above would remove it, but keep any URL with a
+    # query string out of the file regardless.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    guard_log_handlers()
     return path
 
 
@@ -318,8 +439,21 @@ class LaunchSignIn:
     Each 256-bit code is generated here, kept only in memory and handed straight to the window.
     At most one code is valid at a time: issuing a new one replaces the last. A code is accepted
     once, within LAUNCH_CODE_SECONDS of being issued, and exchanged for an ordinary owner
-    browser session. At most LAUNCH_ATTEMPTS codes are issued per process, none after the
-    window has signed in. Sessions it created are deleted at shutdown.
+    browser session. At most LAUNCH_ATTEMPTS codes are issued per process. Sessions it created
+    are deleted at shutdown.
+
+    The rules hold however the window's request, the controller (``sign_in_window``), wrong
+    guesses and shutdown interleave. All state changes under one lock, which is never held while
+    the database is used, so ``close`` and a wrong guess are always prompt:
+
+    - Accepting a code spends it and starts an exchange; only one exchange can be in progress.
+      While it is, no other code exists (``issue`` waits for it to end) and ``wait`` does not
+      report the time as up: the exchange either signs the window in or is reported refused.
+    - Once the window has signed in, the app is closing, or the controller has given up
+      (``conclude``), no code is issued or accepted. So one launch opens at most one session.
+    - A session's hash is recorded before its row is written, so ``end_sessions`` removes it
+      whenever the row lands. An exchange that finishes after ``close`` deletes its own row and
+      returns no token, so no cookie is handed out after closing.
 
     Whoever waits on ``wait`` learns how the current code ended: the window signed in, the code
     was presented but refused, or the app is closing.
@@ -344,9 +478,12 @@ class LaunchSignIn:
         self._code: str | None = None
         self._deadline = 0.0
         self._outcome: str | None = None
-        self._finished = False  # signed in or closed: no more codes
+        self._exchanging = False  # an accepted code is being exchanged for a session
+        self._signed_in = False
+        self._closed = False
+        self._concluded = False  # the controller gave up: no more codes
         self._changed = threading.Condition()
-        self._sessions: set[str] = set()
+        self._sessions: set[str] = set()  # hashes of every session this launch began to open
 
     def __repr__(self):
         return f"LaunchSignIn(host={self.host!r})"
@@ -355,65 +492,136 @@ class LaunchSignIn:
     def origin(self) -> str:
         return "http://" + self.host
 
+    def _over(self) -> bool:
+        return self._signed_in or self._closed or self._concluded
+
     def issue(self) -> str:
         """Create a new code, start its clock and return the window's start URL.
 
         Call it as the window is told to navigate, so that the window, not the server's start,
-        uses the time. Any earlier code stops working.
+        uses the time. Any earlier code stops working. If a code is being exchanged, this waits
+        for the exchange to end first, and raises if it signed the window in.
         """
         with self._changed:
-            if self._finished:
+            while self._exchanging and not self._closed:
+                self._changed.wait()
+            if self._over():
                 raise RuntimeError("The window has already signed in, or the app is closing.")
             if self._issued >= self._attempts:
                 raise RuntimeError(f"Only {self._attempts} launch codes are issued per process.")
+            code = secrets.token_urlsafe(32)  # 256 bits
+            # Known to the log redaction before it exists anywhere a library could log it.
+            LOG_REDACTION.protect(code)
             self._issued += 1
-            self._code = secrets.token_urlsafe(32)  # 256 bits
+            self._code = code
             self._deadline = self._clock() + self.lifetime
             self._outcome = None
-            log.info("Issued launch code %s of %s.", self._issued, self._attempts)
-            return f"{self.origin}/desktop/start?code={self._code}"
+            issued = self._issued
+        log.info("Issued launch code %s of %s.", issued, self._attempts)
+        return f"{self.origin}/desktop/start?code={code}"
 
     def redeem(self, code: str) -> str | None:
         """Exchange the current launch code for a session token; None when it is refused."""
+        token = secrets.token_urlsafe(40)
+        hashed = digest(token)
         with self._changed:
             current = self._code
-            if current is None or not hmac.compare_digest(str(code).encode(), current.encode()):
-                # A guess, or a code that has been used or replaced. The current code, if any,
-                # is not spent: a wrong guess must not lock the window out.
-                log.warning("Refused a launch code that is not the current one.")
-                return None
-            self._code = None  # used once, whether or not it is in time
-            if self._clock() > self._deadline:
-                log.warning("Refused a launch code presented after it expired.")
-                self._finish_attempt(self.REFUSED)
-                return None
-        token = self._open_session()
+            if (
+                self._over()
+                or current is None
+                or not hmac.compare_digest(str(code).encode(), current.encode())
+            ):
+                # A guess, a code that has been used or replaced, or one presented after sign-in
+                # has ended. The current code, if any, is not spent: a wrong guess must not lock
+                # the window out.
+                refused = "Refused a launch code that is not the current one."
+            elif self._clock() > self._deadline:
+                self._code = None  # used once, whether or not it is in time
+                self._end_attempt(self.REFUSED)
+                refused = "Refused a launch code presented after it expired."
+            else:
+                self._code = None
+                self._exchanging = True
+                self._sessions.add(hashed)  # before the row exists: shutdown always removes it
+                refused = None
+        if refused:
+            log.warning(refused)
+            return None
+        LOG_REDACTION.protect(token)
+        opened = False
+        try:
+            opened = self._open_session(token)
+        except Exception:
+            log.exception("Could not open the window's session.")
         with self._changed:
-            self._finish_attempt(self.SIGNED_IN if token else self.REFUSED)
-        return token
+            self._exchanging = False
+            kept = opened and not self._closed
+            if kept:
+                self._signed_in = True
+                self._end_attempt(self.SIGNED_IN)
+            elif not self._closed:
+                self._end_attempt(self.REFUSED)
+            else:
+                self._changed.notify_all()  # the app is closing: its outcome stays CLOSED
+        if kept:
+            log.info("Signed in the app window.")
+            return token
+        if opened:
+            log.info("The app began closing while the window signed in; its session is removed.")
+        try:
+            self._delete_sessions([hashed])  # also if the write failed after it was committed
+        except Exception:
+            log.exception("Could not remove an unused session.")
+        return None
 
-    def _finish_attempt(self, outcome: str):
+    def _end_attempt(self, outcome: str):
         self._outcome = outcome
-        if outcome == self.SIGNED_IN:
-            self._finished = True
         self._changed.notify_all()
 
     def wait(self, timeout: float) -> str | None:
-        """How the current code ended, or None if nothing happened within timeout seconds."""
+        """How the current code ended, or None if nothing happened within timeout seconds.
+
+        A code that is still being exchanged for a session when the time is up is waited for, so
+        a sign-in in progress is never reported as a code that was not used. ``close`` ends the
+        wait at once.
+        """
         with self._changed:
-            self._changed.wait_for(lambda: self._outcome is not None, timeout)
+            end = self._clock() + timeout
+            while self._outcome is None:
+                left = end - self._clock()
+                if left <= 0 and not self._exchanging:
+                    return None
+                self._changed.wait(None if self._exchanging else left)
             return self._outcome
+
+    def conclude(self) -> str:
+        """End sign-in for this launch, unless the window has signed in or the app is closing.
+
+        Waits for a code that is being exchanged. Returns SIGNED_IN or CLOSED if one of those
+        happened; otherwise no code is issued or accepted after this, and it returns REFUSED.
+        The controller decides on the failure page with this, so the page is never shown over a
+        sign-in that then succeeds.
+        """
+        with self._changed:
+            while self._exchanging and not self._closed:
+                self._changed.wait()
+            if self._signed_in:
+                return self.SIGNED_IN
+            if self._closed:
+                return self.CLOSED
+            self._concluded = True
+            self._code = None
+            return self.REFUSED
 
     def close(self):
         """Refuse every code from now on and wake anyone waiting."""
         with self._changed:
             self._code = None
-            self._finished = True
+            self._closed = True
             self._outcome = self.CLOSED
             self._changed.notify_all()
 
-    def _open_session(self) -> str | None:
-        token = secrets.token_urlsafe(40)
+    def _open_session(self, token: str) -> bool:
         expiry = (datetime.now(UTC) + timedelta(days=SESSION_DAYS)).isoformat(timespec="microseconds")
         with self.store.write() as con:
             owner = con.execute(
@@ -421,19 +629,21 @@ class LaunchSignIn:
             ).fetchone()
             if not owner:
                 log.error("No active owner to sign in as.")
-                return None
+                return False
             con.execute("DELETE FROM sessions WHERE expires_at<?", (now(),))
             con.execute("INSERT INTO sessions VALUES(?,?,?)", (digest(token), owner["id"], expiry))
-        self._sessions.add(digest(token))
-        log.info("Signed in the app window.")
-        return token
+        return True
+
+    def _delete_sessions(self, hashes):
+        with self.store.write() as con:
+            con.executemany("DELETE FROM sessions WHERE token_hash=?", [(h,) for h in hashes])
 
     def end_sessions(self):
-        hashes = list(self._sessions)
+        """Delete every session this launch opened or began to open. Call after ``close``."""
+        with self._changed:
+            hashes = sorted(self._sessions)
         if hashes:
-            with self.store.write() as con:
-                con.executemany("DELETE FROM sessions WHERE token_hash=?", [(h,) for h in hashes])
-        self._sessions.clear()
+            self._delete_sessions(hashes)
 
 
 def sign_in_window(signin: LaunchSignIn, navigate, give_up) -> bool:
@@ -449,21 +659,25 @@ def sign_in_window(signin: LaunchSignIn, navigate, give_up) -> bool:
         try:
             url = signin.issue()
         except RuntimeError:
-            break  # closing, or out of codes
+            break  # signed in, closing, or out of codes: ``conclude`` below says which
         attempt += 1
         navigate(url)
-        # A little longer than the code's lifetime, so a request that arrived just in time can
-        # finish opening its session.
+        # A little longer than the code's lifetime, so a request that arrived just in time is
+        # counted. A code still being exchanged when this runs out is waited for.
         outcome = signin.wait(signin.lifetime + LAUNCH_GRACE_SECONDS)
         if outcome == signin.SIGNED_IN:
             return True
         if outcome == signin.CLOSED:
-            return False
+            break  # the window may have signed in just before: ``conclude`` says
         reason = "its code was refused" if outcome == signin.REFUSED else "its code was not used in time"
         log.warning("The window did not sign in (attempt %s): %s.", attempt, reason)
-    if signin.wait(0) != signin.CLOSED:
-        log.error("The window could not sign in after %s launch codes.", attempt)
-        give_up()
+    final = signin.conclude()
+    if final == signin.SIGNED_IN:
+        return True
+    if final == signin.CLOSED:
+        return False
+    log.error("The window could not sign in after %s launch codes.", attempt)
+    give_up()
     return False
 
 
@@ -507,19 +721,41 @@ class DesktopApp:
         self.signin: LaunchSignIn | None = None
         self.server = None
         self._thread: threading.Thread | None = None
-        self._stopped = False
+        self._stopping = False
+        self._stopped = threading.Event()
         self._stop_lock = threading.Lock()
 
     @property
+    def stopping(self) -> bool:
+        """Whether shutdown has begun; it may still be in progress."""
+        return self._stopping
+
+    @property
     def stopped(self) -> bool:
-        return self._stopped
+        """Whether shutdown has finished: ``stop`` has done its cleanup and returned."""
+        return self._stopped.is_set()
+
+    def wait_stopped(self, timeout: float | None) -> bool:
+        return self._stopped.wait(timeout)
 
     @property
     def port(self) -> int:
         return int(self.signin.host.rsplit(":", 1)[1])
 
-    def start(self) -> LaunchSignIn:
-        """Start serving; return the sign-in that issues the window's launch codes."""
+    def start(self) -> LaunchSignIn | None:
+        """Start serving; return the sign-in that issues the window's launch codes.
+
+        Returns None, and starts nothing, if ``stop`` has already been called (by the signal
+        handling, while this was waiting for the lock).
+        """
+        # Held while starting, so that a stop from another thread waits for a server it can stop.
+        with self._stop_lock:
+            if self._stopping:
+                log.info("Not starting: the app is closing.")
+                return None
+            return self._start()
+
+    def _start(self) -> LaunchSignIn:
         import uvicorn
 
         from .api import create_app
@@ -561,25 +797,47 @@ class DesktopApp:
         return self.signin
 
     def stop(self):
-        """Stop the server, end the window's session and checkpoint the database. Idempotent."""
+        """Stop the server, end the window's session and checkpoint the database. Idempotent.
+
+        A second caller waits for the first to finish. ``stopped`` becomes true only when the
+        cleanup has run, whether or not every step of it succeeded.
+        """
         with self._stop_lock:
-            if self._stopped or self.server is None:
+            if self._stopping:
                 return
-            self._stopped = True
-            self.signin.close()
-            self.server.should_exit = True
-            self._thread.join(SHUTDOWN_SECONDS)
-            if self._thread.is_alive():
-                log.warning("The server did not stop within %s seconds.", SHUTDOWN_SECONDS)
-            self.signin.end_sessions()
-            con = self.signin.store.connect()
+            self._stopping = True
             try:
-                busy, frames, done = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if self.server is not None:
+                    self._shut_down()
             finally:
-                con.close()
-            if busy:
-                log.warning("Database checkpoint incomplete (%s of %s frames).", done, frames)
-            log.info("Stopped cleanly.")
+                self._stopped.set()
+
+    def _shut_down(self):
+        self.signin.close()
+        self.server.should_exit = True
+        self._thread.join(SHUTDOWN_SECONDS)
+        if self._thread.is_alive():
+            log.warning("The server did not stop within %s seconds.", SHUTDOWN_SECONDS)
+        clean = True
+        for step, failure in (
+            (self.signin.end_sessions, "Could not delete the window's session."),
+            (self._checkpoint, "Could not checkpoint the database."),
+        ):
+            try:
+                step()
+            except Exception:
+                clean = False
+                log.exception(failure)
+        log.info("Stopped cleanly." if clean else "Stopped; part of the cleanup failed (see above).")
+
+    def _checkpoint(self):
+        con = self.signin.store.connect()
+        try:
+            busy, frames, done = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            con.close()
+        if busy:
+            log.warning("Database checkpoint incomplete (%s of %s frames).", done, frames)
 
 
 # Window -------------------------------------------------------------------------------------
@@ -600,16 +858,27 @@ def _require_edge_chromium():
 
 
 class SignalShutdown:
-    """Turn Ctrl+C and termination signals into the app's normal shutdown.
+    """Turn Ctrl+C and termination signals into the app's normal shutdown, within a time limit.
 
-    A Python handler is installed for each signal, which makes the signal's disposition "caught"
-    for the whole process, and ``signal.set_wakeup_fd`` makes Python's low-level handler write
-    the signal number to a socket. That happens on whichever thread the operating system picks,
-    including threads started by other code before ``main`` (a packaged app's bootstrap, or a
-    GUI toolkit), and while the main thread is held in the GUI's native loop, where the Python
-    handler itself would not run. A helper thread reads the socket and closes the window, which
-    runs the same shutdown as the close button. If the window has not closed within
-    SIGNAL_EXIT_SECONDS, the helper stops the app itself and exits.
+    ``signal.set_wakeup_fd`` makes Python's low-level handler write the signal number to a
+    socket, and a Python handler is installed for each signal, which makes its disposition
+    "caught" for the whole process. The write happens on whichever thread the operating system
+    picks, including threads started by other code before ``main`` (a packaged app's bootstrap,
+    or a GUI toolkit), and while the main thread is held in the GUI's native loop, where the
+    Python handler itself would not run. The socket is in place before the first handler, so a
+    signal that reaches one of the handlers is always written to it.
+
+    Two threads act on a signal:
+
+    - The reader takes the time the moment it reads the signal and, from then on, only sleeps:
+      SIGNAL_EXIT_SECONDS later it ends the process with ``os._exit``. It takes no lock and
+      writes no log, so nothing the window, the server, the database or the log does can hold
+      it, and the process is gone by then even if ``main`` never returns.
+    - The shutdown thread closes the window, from a thread of its own (pywebview's ``destroy``
+      can wait for the GUI for a long time). That runs the same shutdown as the close button.
+      If the app has not finished stopping SIGNAL_CLOSE_SECONDS after the signal, it starts
+      ``DesktopApp.stop`` itself, again from a thread of its own (another stop may hold the
+      lock), and exits as soon as the cleanup is done.
 
     Must be created on the main thread (Python allows signal handlers to be set only there).
     """
@@ -620,12 +889,18 @@ class SignalShutdown:
         self.app = app
         self.received = threading.Event()
         self.close_window = None  # set once there is a window to close
+        self._signum: int | None = None
+        self._exit_at = 0.0
+        self._go = threading.Event()  # a signal arrived, or restore() was called
         self._reader, self._writer = socket.socketpair()
         self._writer.setblocking(False)
         self._previous = {sig: signal.getsignal(sig) for sig in self.signals}
+        # The socket first, then the handlers: see the class notes.
+        self._previous_fd = signal.set_wakeup_fd(self._writer.fileno(), warn_on_full_buffer=False)
         for sig in self.signals:
             signal.signal(sig, self._noted)
-        self._previous_fd = signal.set_wakeup_fd(self._writer.fileno(), warn_on_full_buffer=False)
+        # A signal that arrived before the threads start waits in the socket.
+        threading.Thread(target=self._shut_down, name="foundry-shutdown", daemon=True).start()
         threading.Thread(target=self._watch, name="foundry-signals", daemon=True).start()
 
     @staticmethod
@@ -640,42 +915,58 @@ class SignalShutdown:
                 return
             if not data:
                 return
-            signum = data[0]
-            if signum in self.signals and not self.received.is_set():
+            if data[0] in self.signals:
                 break
+        signum = data[0]
+        exit_at = time.monotonic() + SIGNAL_EXIT_SECONDS
+        self._signum, self._exit_at = signum, exit_at
         self.received.set()
-        log.info("Received signal %s; closing the window.", signum)
-        # main() checks ``received`` after setting ``close_window``, and this reads
-        # ``close_window`` after setting ``received``, so one of the two always acts.
-        close = self.close_window
-        if close is not None:
-            try:
-                close()
-            except Exception:
-                log.exception("Could not close the window after a signal.")
-        if self._wait_for_exit():
-            return
-        log.warning(
-            "The app did not stop within %s seconds of the signal; stopping now.", SIGNAL_EXIT_SECONDS
-        )
-        self.app.stop()
-        logging.shutdown()
+        self._go.set()
+        while (left := exit_at - time.monotonic()) > 0:
+            time.sleep(left)
         os._exit(128 + signum)
 
-    def _wait_for_exit(self) -> bool:
-        """Whether the app stopped within SIGNAL_EXIT_SECONDS (the process is then ending)."""
-        deadline = time.monotonic() + SIGNAL_EXIT_SECONDS
-        while time.monotonic() < deadline:
-            if self.app.stopped:
-                return True
-            time.sleep(0.1)
-        return self.app.stopped
+    def _shut_down(self):
+        self._go.wait()
+        signum = self._signum
+        if signum is None:
+            return  # restore() was called without a signal
+        log.info("Received signal %s; closing the window.", signum)
+        # main() checks ``received`` after setting ``close_window``, and this reads
+        # ``close_window`` after ``received`` is set, so one of the two always acts.
+        close = self.close_window
+        if close is not None:
+            threading.Thread(target=self._close, args=(close,), name="foundry-close", daemon=True).start()
+        close_by = self._exit_at - SIGNAL_EXIT_SECONDS + SIGNAL_CLOSE_SECONDS
+        if self.app.wait_stopped(max(0.0, close_by - time.monotonic())):
+            return  # stopped the normal way; main() is returning, and the reader still bounds it
+        log.warning(
+            "The app did not stop within %s seconds of the signal; stopping now.", SIGNAL_CLOSE_SECONDS
+        )
+        threading.Thread(target=self._stop, name="foundry-stop", daemon=True).start()
+        if self.app.wait_stopped(max(0.0, self._exit_at - time.monotonic())):
+            os._exit(128 + signum)
+
+    @staticmethod
+    def _close(close):
+        try:
+            close()
+        except Exception:
+            log.exception("Could not close the window after a signal.")
+
+    def _stop(self):
+        try:
+            self.app.stop()
+        except Exception:
+            log.exception("Could not stop the app after a signal.")
 
     def restore(self):
         """Put the previous handlers back (main thread only). Used by tests and on exit."""
-        signal.set_wakeup_fd(self._previous_fd)
+        # Handlers first: until each one is replaced, its signal still reaches the socket.
         for sig, handler in self._previous.items():
             signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+        signal.set_wakeup_fd(self._previous_fd)
+        self._go.set()
         self._writer.close()
         self._reader.close()
 
@@ -683,6 +974,7 @@ class SignalShutdown:
 def open_window(app: DesktopApp, signals: SignalShutdown | None = None):
     import webview
 
+    guard_log_handlers()  # pywebview adds its own stderr handler when it is imported
     _require_edge_chromium()
     webview.settings["ALLOW_DOWNLOADS"] = True  # exports and document downloads
     # The window opens on a local placeholder. The start address, and with it the launch code's
@@ -703,7 +995,7 @@ def open_window(app: DesktopApp, signals: SignalShutdown | None = None):
         try:
             sign_in_window(app.signin, window.load_url, lambda: window.load_html(SIGN_IN_FAILED_PAGE))
         except Exception:
-            if not app.stopped:
+            if not app.stopping:
                 log.exception("Could not sign in the window.")
 
     window.events.closing += closing
@@ -763,8 +1055,8 @@ def main(argv=None):
             # finally below, such as SystemExit raised inside the GUI toolkit. Idempotent.
             atexit.register(app.stop)
             try:
-                app.start()
-                if signals.received.is_set():
+                # start() returns None if the signal handling has already stopped the app.
+                if app.start() is None or signals.received.is_set():
                     log.info("Stopping before the window opened.")
                 else:
                     open_window(app, signals)
