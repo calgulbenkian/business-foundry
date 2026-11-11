@@ -130,7 +130,7 @@ def column(result, scenario, key):
 def test_unit_retention_against_independent_hand_calculation():
     # Units: 10, 10 + 0.5*10 = 15, 10 + 0.5*15 = 17.5. Cash: 1000 + 700 + 1100 + 1300.
     result = forecast(simple(monthly_retention="0.5"))
-    assert result["model_version"] == "1.1.0"
+    assert result["model_version"] == "1.1.1"
     base = result["scenarios"]["base"]
     assert column(result, "base", "revenue") == ["1000.00", "1500.00", "1750.00"]
     assert column(result, "base", "units") == ["10.0000", "15.0000", "17.5000"]

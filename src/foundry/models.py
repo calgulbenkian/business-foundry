@@ -8,7 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Short = Annotated[str, Field(min_length=1, max_length=240)]
 Money = Annotated[Decimal, Field(ge=0, le=Decimal("1000000000000"), allow_inf_nan=False)]
-Rate = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
+# Rates carry at most 12 decimal places so that the models can evaluate them exactly (docs/FINANCE.md).
+RATE_PLACES = 12
+Rate = Annotated[Decimal, Field(ge=0, le=1, decimal_places=RATE_PLACES, allow_inf_nan=False)]
 Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
 
 
@@ -110,9 +112,9 @@ class ForecastInputs(Model):
     monthly_units: Annotated[Decimal, Field(ge=0, le=100000000, allow_inf_nan=False)] = Decimal("5")
     unit_price: Money = Decimal("2000")
     unit_cost: Money = Decimal("300")
-    monthly_growth: Annotated[Decimal, Field(ge=Decimal("-0.8"), le=Decimal("0.5"), allow_inf_nan=False)] = (
-        Decimal("0.03")
-    )
+    monthly_growth: Annotated[
+        Decimal, Field(ge=Decimal("-0.8"), le=Decimal("0.5"), decimal_places=RATE_PLACES, allow_inf_nan=False)
+    ] = Decimal("0.03")
     monthly_retention: Rate = Decimal("0")
     fixed_costs: Money = Decimal("6000")
     fixed_cost_step: Money = Decimal("0")
@@ -123,10 +125,12 @@ class ForecastInputs(Model):
     tax_rate: Rate = Decimal("0.25")
     annual_interest_rate: Rate = Decimal("0.08")
     monthly_principal: Money = Decimal("0")
-    discount_rate: Annotated[Decimal, Field(gt=0, le=1, allow_inf_nan=False)] = Decimal("0.20")
-    terminal_growth: Annotated[Decimal, Field(ge=Decimal("-0.2"), le=Decimal("0.1"), allow_inf_nan=False)] = (
-        Decimal("0.02")
+    discount_rate: Annotated[Decimal, Field(gt=0, le=1, decimal_places=RATE_PLACES, allow_inf_nan=False)] = (
+        Decimal("0.20")
     )
+    terminal_growth: Annotated[
+        Decimal, Field(ge=Decimal("-0.2"), le=Decimal("0.1"), decimal_places=RATE_PLACES, allow_inf_nan=False)
+    ] = Decimal("0.02")
     excess_cash: Money = Decimal("0")
 
     @field_validator("fixed_cost_step_month", mode="before")

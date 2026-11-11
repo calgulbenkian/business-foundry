@@ -2,21 +2,40 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, localcontext
+from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
+    ROUND_05UP,
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    Inexact,
+    localcontext,
+)
 
 from .models import DealInputs, ForecastInputs
 
 D = Decimal
 ZERO = D(0)
 ONE = D(1)
+CENT, BASIS = D("0.01"), D("0.0001")
+FORECAST_VERSION, ACQUISITION_VERSION = "1.1.1", "1.0.1"
+
+
+def _fixed(value: Decimal, places: Decimal) -> str:
+    # The context is sized to the value, so rounding to the fixed places is never refused for lack of digits.
+    digits = max(value.adjusted() - places.as_tuple().exponent + 2, 1)
+    context = Context(prec=digits, rounding=ROUND_HALF_EVEN, Emax=MAX_EMAX, Emin=MIN_EMIN)
+    result = value.quantize(places, context=context)
+    return str(result.copy_abs() if result.is_zero() else result)
 
 
 def money(value: Decimal) -> str:
-    return str(value.quantize(D("0.01")))
+    return _fixed(value, CENT)
 
 
 def ratio(value: Decimal | None) -> str | None:
-    return str(value.quantize(D("0.0001"))) if value is not None else None
+    return _fixed(value, BASIS) if value is not None else None
 
 
 def _forecast(a: ForecastInputs, volume_factor=ONE, fixed_factor=ONE):
@@ -144,7 +163,7 @@ def forecast(inputs: ForecastInputs):
         "upside": _forecast(inputs, D("1.25"), D("1.05")),
     }
     return {
-        "model_version": "1.1.0",
+        "model_version": FORECAST_VERSION,
         "inputs": inputs.model_dump(mode="json"),
         "scenarios": cases,
         "scenario_definitions": {
@@ -208,13 +227,38 @@ def period_rollups(rows: list[dict]) -> list[dict]:
     return result
 
 
+# Significant digits of the returned payment. Up to the 1e12 money limit a payment is below 2e12, so 28
+# digits leave 13 below the cent, and ROUND_05UP keeps the later half-even rounding to cents exact.
+DEBT_SERVICE_DIGITS = 28
+
+
 def annual_debt_service(principal: Decimal, rate: Decimal, years: int) -> Decimal:
+    """Level monthly payment, annualized: principal × rate × s^n / (s^n − 12^n), where s = 12 + rate.
+
+    The equivalent form principal × m / (1 − (1 + m)^−n) × 12, with m = rate / 12, needs 1 + m, which has
+    no exact decimal. Here every intermediate is an exact Decimal (Inexact is trapped) and only the final
+    division is rounded, so money() of the result equals the exact payment rounded half-even to cents.
+    """
     if not principal:
         return ZERO
-    n, monthly = years * 12, rate / 12
-    if monthly == 0:
-        return principal / n * 12
-    return principal * monthly / (1 - (1 + monthly) ** -n) * 12
+    n = years * 12
+    with localcontext() as ctx:
+        ctx.prec, ctx.Emax, ctx.Emin = 28, MAX_EMAX, MIN_EMIN
+        ctx.traps[Inexact] = True
+        exact_digits = len(principal.as_tuple().digits) + 8
+        if rate:
+            # A validated rate has at most 12 decimal places, so s has at most 14 digits and s^n at most 14n.
+            rate = rate.normalize(Context(prec=len(rate.as_tuple().digits)))
+            s_digits = max(rate.adjusted() + 2, 3) + max(-rate.as_tuple().exponent, 0)
+            ctx.prec = exact_digits + len(rate.as_tuple().digits) + s_digits * n
+            growth = (12 + rate) ** n
+            numerator, denominator = principal * rate * growth, growth - D(12) ** n
+        else:
+            ctx.prec = exact_digits
+            numerator, denominator = principal, D(years)
+        magnitude = numerator.adjusted() - denominator.adjusted() + 2
+        digits = max(DEBT_SERVICE_DIGITS, magnitude + 3)
+        return Context(prec=digits, rounding=ROUND_05UP).divide(numerator, denominator)
 
 
 def acquisition(inputs: DealInputs, verified_evidence: set[str]):
@@ -251,7 +295,7 @@ def acquisition(inputs: DealInputs, verified_evidence: set[str]):
         }
     low, high = normalized * a.multiple_low, normalized * a.multiple_high
     return {
-        "model_version": "1.0.0",
+        "model_version": ACQUISITION_VERSION,
         "inputs": a.model_dump(mode="json"),
         "normalized_ebitda": money(normalized),
         "accepted_adjustments": accepted,
