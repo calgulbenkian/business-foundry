@@ -434,8 +434,10 @@ def render_document(template, snapshot, deal=None):
     if template in {"readiness_report", "business_plan", "operating_manual", "investment_memo"}:
         lines += ["## Work and unresolved requirements", ""]
         for o in objects:
-            if o["kind"] == "task" and (
-                template != "investment_memo" or o["data"].get("deal_id") == deal["id"]
+            if (
+                o["kind"] == "task"
+                and o["state"] != "superseded"
+                and (template != "investment_memo" or o["data"].get("deal_id") == deal["id"])
             ):
                 lines += [f"- [{o['state']}] {o['title']} — {o['id']}", f"  {o['data']['description']}"]
                 if o.get("blockers"):

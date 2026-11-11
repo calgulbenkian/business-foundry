@@ -240,7 +240,7 @@ function overview() {
   const s = state.snapshot.stats,
     b = state.snapshot.business.data;
   const tasks = objs('task')
-    .filter((t) => !['verified', 'not_applicable'].includes(t.state))
+    .filter((t) => !['verified', 'not_applicable', 'superseded'].includes(t.state))
     .sort((a, b) => a.blockers.length - b.blockers.length)
     .slice(0, 4);
   const plan = objs('financial_plan').at(-1);
@@ -295,7 +295,7 @@ function chart(scenarios) {
   return svg;
 }
 function work() {
-  const tasks = objs('task'),
+  const tasks = objs('task').filter((t) => t.state !== 'superseded'),
     groups = [...new Set(tasks.map((t) => t.data.category))];
   return (
     heading(
@@ -593,7 +593,7 @@ function businessDialog(edit = false) {
     },
     edit ? 'Save changes' : 'Create workspace',
     edit
-      ? 'Changes reopen completed work for review. Jurisdiction is fixed in this release; use a new workspace for a reviewed jurisdiction change.'
+      ? 'Changes reopen completed work for review. This form cannot change the jurisdiction: an owner or reviewer changes it as a separate, recorded decision with a reason, using the API or the foundry jurisdiction command.'
       : 'A concept creates the operating workspace and dependency-aware work plan. Unknowns can stay unknown until you have evidence.',
   );
 }

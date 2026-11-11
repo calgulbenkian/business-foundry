@@ -1,0 +1,1152 @@
+"""Changing the planning jurisdiction: a reviewed, recorded human decision.
+
+The change supersedes the current package's steps (kept, with history, in a terminal state), adds the new
+package's steps as new pending steps, and reopens completed work. Expected step lists are written out by
+hand below; they are deliberately not derived from the catalog at run time.
+"""
+
+import asyncio
+import json
+import os
+import sys
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from test_mcp import foundry_api
+
+from foundry import catalog, cli, models
+from foundry.api import create_app
+from foundry.demo import seed
+from foundry.service import Service
+from foundry.store import DomainError, Store
+
+REASON = "Founders confirmed where they will operate; adviser review is recorded."
+
+# The sixteen base steps every business has, by catalog key.
+BASE_KEYS = {
+    "demand",
+    "offer",
+    "economics",
+    "structure",
+    "founders",
+    "rights",
+    "registration",
+    "tax",
+    "bank",
+    "permissions",
+    "delivery",
+    "agreement",
+    "acceptance",
+    "invoice",
+    "collection",
+    "close",
+}
+
+# Each jurisdiction's own step: (key, title, depends on the base structure decision).
+PACKAGE = {
+    "undecided": ("jurisdiction", "Resolve operating and founder jurisdictions", False),
+    "other": ("jurisdiction", "Obtain a local requirements review", False),
+    "US-DE": ("local_review", "Review Delaware and operating-state requirements", True),
+    "GB": ("local_review", "Review UK director, registration and reporting duties", True),
+    "SE": ("local_review", "Review Swedish company and tax setup", True),
+}
+
+# The fields a stored step had before this change. The change adds none.
+STEP_FIELDS = {
+    "key",
+    "category",
+    "description",
+    "depends_on_keys",
+    "required_record_kinds",
+    "external",
+    "title",
+    "source_uri",
+    "pack_version",
+    "source_checked_on",
+    "applicability",
+    "owner",
+    "evidence_ids",
+    "history",
+    "depends_on",
+    "deal_id",
+}
+
+
+def dump(cls, **kwargs):
+    return cls(**kwargs).model_dump(mode="json")
+
+
+def key():
+    return str(uuid4())
+
+
+def make_business(service, actor, jurisdiction="undecided", route="start"):
+    return service.create_business(
+        actor,
+        key(),
+        dump(
+            models.BusinessCreate,
+            name="Jurisdiction test",
+            concept="A synthetic business for jurisdiction change tests.",
+            jurisdiction=jurisdiction,
+            route=route,
+        ),
+    )
+
+
+def source(service, actor, bid, review=True, source_type="document", title="Synthetic source"):
+    evidence = service.add_evidence(
+        actor,
+        bid,
+        key(),
+        dump(
+            models.EvidenceCreate,
+            title=title,
+            content="Synthetic source text for a jurisdiction change test.",
+            source_type=source_type,
+        ),
+    )
+    if not review:
+        return evidence
+    return service.review_evidence(
+        actor,
+        bid,
+        evidence["id"],
+        key(),
+        dump(models.Review, note="Checked the synthetic source text.", expected_version=1),
+    )
+
+
+def withdraw(service, actor, bid, evidence):
+    return service.review_evidence(
+        actor,
+        bid,
+        evidence["id"],
+        key(),
+        dump(models.Review, note="Synthetic source withdrawn.", expected_version=evidence["version"]),
+        True,
+    )
+
+
+def move(service, actor, bid, task, state, evidence=()):
+    return service.transition(
+        actor,
+        bid,
+        task["id"],
+        key(),
+        dump(
+            models.TaskTransition,
+            state=state,
+            expected_version=task["version"],
+            note=f"Synthetic move to {state}.",
+            evidence_ids=[e["id"] for e in evidence],
+        ),
+    )
+
+
+def all_tasks(service, actor, bid):
+    return {o["id"]: o for o in service.snapshot(actor, bid)["objects"] if o["kind"] == "task"}
+
+
+def live_core(service, actor, bid):
+    """Live, non-deal steps by catalog key."""
+    return {
+        t["data"]["key"]: t
+        for t in all_tasks(service, actor, bid).values()
+        if not t["data"]["deal_id"] and t["state"] != "superseded"
+    }
+
+
+def deal_steps(service, actor, bid):
+    return {t["id"]: t for t in all_tasks(service, actor, bid).values() if t["data"]["deal_id"]}
+
+
+def change(service, actor, bid, to, reason=REASON, evidence=(), version=None, command=None):
+    if version is None:
+        version = service.snapshot(actor, bid)["business"]["version"]
+    return service.change_jurisdiction(
+        actor,
+        bid,
+        command or key(),
+        dump(
+            models.JurisdictionChange,
+            expected_version=version,
+            jurisdiction=to,
+            reason=reason,
+            evidence_ids=[e["id"] for e in evidence],
+        ),
+    )
+
+
+def raw(store):
+    """Every stored row that a change could touch, exactly as stored."""
+    with store.read() as con:
+        return {
+            table: [tuple(r) for r in con.execute(f"SELECT * FROM {table} ORDER BY {order}")]
+            for table, order in (
+                ("businesses", "id"),
+                ("objects", "id"),
+                ("revisions", "object_id, version"),
+                ("events", "seq"),
+                ("commands", "principal_id, command_key"),
+                ("payment_references", "business_id, reference"),
+            )
+        }
+
+
+def last_seq(store):
+    with store.read() as con:
+        return con.execute("SELECT max(seq) FROM events").fetchone()[0]
+
+
+def without_ids(result):
+    return {
+        **{k: v for k, v in result.items() if k not in {"business", "business_version"}},
+        "added": [{k: v for k, v in a.items() if k != "id"} for a in result["added"]],
+    }
+
+
+# Named changes with their full effect.
+
+
+def test_undecided_to_gb_supersedes_adds_reopens_and_marks_documents_stale(setup):
+    store, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    snapshot = service.snapshot(owner, bid)
+    receipt = next(o for o in snapshot["objects"] if o["kind"] == "evidence")
+    document = next(o for o in snapshot["objects"] if o["kind"] == "document")
+    assert not document["stale"]
+    core, deals = live_core(service, owner, bid), deal_steps(service, owner, bid)
+    assert set(core) == BASE_KEYS | {"jurisdiction"}
+    assert {t["state"] for t in core.values()} == {"verified"}
+    assert len(deals) == 7 and {t["state"] for t in deals.values()} == {"pending"}
+    assert snapshot["stats"]["tasks"] == 24 and snapshot["stats"]["verified"] == 17
+    seq = last_seq(store)
+
+    result = change(service, owner, bid, "GB", evidence=[receipt])
+
+    old = core["jurisdiction"]
+    assert result["business_version"] == 2
+    assert result["business"]["version"] == 2 and result["business"]["data"]["jurisdiction"] == "GB"
+    assert (result["from"], result["to"]) == ("undecided", "GB")
+    assert result["superseded"] == [
+        {
+            "id": old["id"],
+            "key": "jurisdiction",
+            "title": "Resolve operating and founder jurisdictions",
+            "state": "verified",
+        }
+    ]
+    [added] = result["added"]
+    assert added == {
+        "id": added["id"],
+        "key": "local_review",
+        "title": "Review UK director, registration and reporting duties",
+        "depends_on": [core["structure"]["id"]],
+    }
+    assert sorted(r["key"] for r in result["reopened"]) == sorted(BASE_KEYS)
+    assert {r["id"]: r["state"] for r in result["reopened"]} == {core[k]["id"]: "verified" for k in BASE_KEYS}
+
+    after = live_core(service, owner, bid)
+    assert set(after) == BASE_KEYS | {"local_review"}
+    for k in BASE_KEYS:
+        assert after[k]["id"] == core[k]["id"]
+        assert after[k]["state"] == "needs_review"
+        assert after[k]["version"] == core[k]["version"] + 1
+        assert after[k]["data"]["history"][:-1] == core[k]["data"]["history"]
+        entry = after[k]["data"]["history"][-1]
+        assert {k2: entry[k2] for k2 in ("from", "to", "note", "actor_id")} == {
+            "from": "verified",
+            "to": "needs_review",
+            "note": "Jurisdiction changed from undecided to GB",
+            "actor_id": owner["id"],
+        }
+    new = after["local_review"]
+    assert new["id"] == added["id"] and new["state"] == "pending" and new["version"] == 1
+    assert new["data"]["depends_on"] == [core["structure"]["id"]]
+    assert new["data"]["deal_id"] is None and new["data"]["history"] == []
+    assert new["blockers"] == ["Complete: Decide the entity and ownership structure"]
+    assert deal_steps(service, owner, bid) == deals
+
+    superseded = all_tasks(service, owner, bid)[old["id"]]
+    assert superseded["state"] == "superseded" and superseded["version"] == old["version"] + 1
+    assert superseded["data"]["history"][:-1] == old["data"]["history"]
+    entry = superseded["data"]["history"][-1]
+    assert {k: v for k, v in entry.items() if k != "at"} == {
+        "from": "verified",
+        "to": "superseded",
+        "note": "Jurisdiction changed from undecided to GB. "
+        "This step belongs to the earlier planning guide and is kept as history.",
+        "jurisdiction_from": "undecided",
+        "jurisdiction_to": "GB",
+        "actor_id": owner["id"],
+    }
+    assert superseded["blockers"] == []
+
+    snapshot = service.snapshot(owner, bid)
+    assert snapshot["stats"]["tasks"] == 24  # 16 base + 1 new local review + 7 deal steps
+    assert snapshot["stats"]["superseded"] == 1
+    assert snapshot["stats"]["verified"] == 0 and snapshot["stats"]["needs_review"] == 16
+    stale = next(o for o in snapshot["objects"] if o["id"] == document["id"])
+    assert stale["stale"] and stale["data"]["content"] == document["data"]["content"]
+
+    events = [e for e in service.audit(owner, bid)["events"] if e["seq"] > seq]
+    assert [e["action"] for e in events] == (
+        ["business.updated", "task.superseded", "task.created"]
+        + ["task.updated"] * 16
+        + ["business.jurisdiction_changed"]
+    )
+    assert {e["actor_id"] for e in events} == {owner["id"]}
+    assert events[0]["payload"] == result["business"]
+    assert events[1]["payload"] == {k: v for k, v in superseded.items() if k != "blockers"}
+    decision = events[-1]["payload"]
+    assert decision == {
+        "title": "Jurisdiction changed from undecided to GB",
+        "reason": REASON,
+        "evidence_ids": [receipt["id"]],
+        "actor_id": owner["id"],
+        "actor_name": "Local owner",
+        "business_version": 2,
+        "from": "undecided",
+        "to": "GB",
+        "superseded": result["superseded"],
+        "added": result["added"],
+        "reopened": result["reopened"],
+    }
+    integrity = service.audit(owner, bid)["integrity"]
+    assert integrity["valid"] and integrity["record_errors"] == []
+
+
+def gb_with_completed_review(service, owner):
+    """A GB business whose structure decision is not applicable and whose local review is verified."""
+    bid = make_business(service, owner, "GB")["id"]
+    evidence = source(service, owner, bid)
+    core = live_core(service, owner, bid)
+    move(service, owner, bid, core["structure"], "not_applicable", [evidence])
+    local = core["local_review"]
+    for state in ("prepared", "approved", "verified"):
+        local = move(service, owner, bid, local, state, [evidence])
+    return bid, evidence
+
+
+def test_gb_to_se_supersedes_the_verified_local_review_and_reopens_structure(setup):
+    _, service, owner, _, _ = setup
+    bid, _ = gb_with_completed_review(service, owner)
+    core = live_core(service, owner, bid)
+    assert core["local_review"]["state"] == "verified"
+    assert service.snapshot(owner, bid)["stats"]["verified"] == 1
+
+    result = change(service, owner, bid, "SE")
+
+    old = core["local_review"]
+    assert result["superseded"] == [
+        {
+            "id": old["id"],
+            "key": "local_review",
+            "title": "Review UK director, registration and reporting duties",
+            "state": "verified",
+        }
+    ]
+    assert result["reopened"] == [
+        {
+            "id": core["structure"]["id"],
+            "key": "structure",
+            "title": "Decide the entity and ownership structure",
+            "state": "not_applicable",
+        }
+    ]
+    [added] = result["added"]
+    assert added == {
+        "id": added["id"],
+        "key": "local_review",
+        "title": "Review Swedish company and tax setup",
+        "depends_on": [core["structure"]["id"]],
+    }
+    after = live_core(service, owner, bid)
+    assert set(after) == BASE_KEYS | {"local_review"}
+    assert after["local_review"]["id"] == added["id"] != old["id"]
+    assert after["local_review"]["data"]["category"] == "Setup"
+    assert after["structure"]["state"] == "needs_review"
+    assert after["structure"]["data"]["history"][-1]["note"] == "Jurisdiction changed from GB to SE"
+    superseded = all_tasks(service, owner, bid)[old["id"]]
+    assert superseded["state"] == "superseded"
+    assert [h["to"] for h in superseded["data"]["history"]] == [
+        "prepared",
+        "approved",
+        "verified",
+        "superseded",
+    ]
+    assert superseded["data"]["history"][-1]["jurisdiction_from"] == "GB"
+    assert superseded["data"]["history"][-1]["jurisdiction_to"] == "SE"
+    # Its prerequisite (structure) is open again, but a superseded step is not open work: no blockers.
+    assert superseded["data"]["depends_on"] == [core["structure"]["id"]]
+    assert superseded["blockers"] == []
+    stats = service.snapshot(owner, bid)["stats"]
+    assert (stats["tasks"], stats["superseded"], stats["verified"], stats["needs_review"]) == (17, 1, 0, 1)
+    assert service.audit(owner, bid)["integrity"]["valid"]
+
+
+def test_gb_to_undecided_restores_the_resolution_step_as_new_work(setup):
+    _, service, owner, _, _ = setup
+    bid, _ = gb_with_completed_review(service, owner)
+    core = live_core(service, owner, bid)
+    result = change(service, owner, bid, "undecided")
+    [added] = result["added"]
+    assert added == {
+        "id": added["id"],
+        "key": "jurisdiction",
+        "title": "Resolve operating and founder jurisdictions",
+        "depends_on": [],
+    }
+    assert [s["id"] for s in result["superseded"]] == [core["local_review"]["id"]]
+    after = live_core(service, owner, bid)
+    assert set(after) == BASE_KEYS | {"jurisdiction"}
+    assert after["jurisdiction"]["state"] == "pending" and after["jurisdiction"]["blockers"] == []
+    assert service.snapshot(owner, bid)["business"]["data"]["jurisdiction"] == "undecided"
+
+
+def test_undecided_to_other_replaces_one_jurisdiction_step_with_another(setup):
+    _, service, owner, bid, _ = setup
+    core = live_core(service, owner, bid)
+    result = change(service, owner, bid, "other")
+    [added] = result["added"]
+    assert added == {
+        "id": added["id"],
+        "key": "jurisdiction",
+        "title": "Obtain a local requirements review",
+        "depends_on": [],
+    }
+    assert result["superseded"] == [
+        {
+            "id": core["jurisdiction"]["id"],
+            "key": "jurisdiction",
+            "title": "Resolve operating and founder jurisdictions",
+            "state": "pending",
+        }
+    ]
+    assert result["reopened"] == []
+    after = live_core(service, owner, bid)
+    assert after["jurisdiction"]["id"] == added["id"] != core["jurisdiction"]["id"]
+    assert all_tasks(service, owner, bid)[core["jurisdiction"]["id"]]["state"] == "superseded"
+
+
+def test_round_trip_keeps_every_earlier_step_and_adds_fresh_work(setup):
+    _, service, owner, bid, _ = setup
+    evidence = source(service, owner, bid)
+    first = live_core(service, owner, bid)
+    original = move(service, owner, bid, first["jurisdiction"], "not_applicable", [evidence])
+
+    there = change(service, owner, bid, "GB")
+    gb = live_core(service, owner, bid)["local_review"]
+    gb = move(service, owner, bid, gb, "prepared", [evidence])
+    back = change(service, owner, bid, "undecided")
+
+    assert there["superseded"][0]["id"] == original["id"]
+    assert back["superseded"] == [
+        {
+            "id": gb["id"],
+            "key": "local_review",
+            "title": "Review UK director, registration and reporting duties",
+            "state": "prepared",
+        }
+    ]
+    [fresh] = back["added"]
+    assert fresh["key"] == "jurisdiction" and fresh["id"] not in {original["id"], gb["id"]}
+    tasks = all_tasks(service, owner, bid)
+    assert len(tasks) == 19
+    assert tasks[original["id"]]["state"] == "superseded"
+    assert tasks[original["id"]]["version"] == original["version"] + 1  # untouched by the second change
+    assert [h["to"] for h in tasks[original["id"]]["data"]["history"]] == ["not_applicable", "superseded"]
+    assert tasks[gb["id"]]["state"] == "superseded"
+    assert tasks[fresh["id"]]["state"] == "pending"
+    after = live_core(service, owner, bid)
+    assert set(after) == BASE_KEYS | {"jurisdiction"}
+    assert {k: after[k]["id"] for k in BASE_KEYS} == {k: first[k]["id"] for k in BASE_KEYS}
+    snapshot = service.snapshot(owner, bid)
+    assert snapshot["business"]["version"] == 3
+    assert (snapshot["stats"]["tasks"], snapshot["stats"]["superseded"]) == (17, 2)
+    assert service.audit(owner, bid)["integrity"]["valid"]
+
+
+PAIRS = [(a, b) for a in PACKAGE for b in PACKAGE if a != b]
+
+
+@pytest.mark.parametrize(("start", "to"), PAIRS)
+def test_every_change_between_known_jurisdictions_is_allowed(setup, start, to):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, start)["id"]
+    before = live_core(service, owner, bid)
+    old_key, old_title, _ = PACKAGE[start]
+    new_key, new_title, needs_structure = PACKAGE[to]
+    assert set(before) == BASE_KEYS | {old_key} and before[old_key]["title"] == old_title
+
+    result = change(service, owner, bid, to)
+
+    assert (result["from"], result["to"], result["business_version"]) == (start, to, 2)
+    assert result["superseded"] == [
+        {"id": before[old_key]["id"], "key": old_key, "title": old_title, "state": "pending"}
+    ]
+    assert result["reopened"] == []
+    expected_dependencies = [before["structure"]["id"]] if needs_structure else []
+    [added] = result["added"]
+    assert added == {
+        "id": added["id"],
+        "key": new_key,
+        "title": new_title,
+        "depends_on": expected_dependencies,
+    }
+    after = live_core(service, owner, bid)
+    assert set(after) == BASE_KEYS | {new_key}
+    for k in BASE_KEYS:
+        assert after[k] == before[k]
+    assert after[new_key]["id"] == added["id"] != before[old_key]["id"]
+    assert after[new_key]["data"]["depends_on"] == expected_dependencies
+    assert (after[new_key]["state"], after[new_key]["version"]) == ("pending", 1)
+    assert all_tasks(service, owner, bid)[before[old_key]["id"]]["state"] == "superseded"
+    stats = service.snapshot(owner, bid)["stats"]
+    assert (stats["tasks"], stats["superseded"]) == (17, 1)
+
+
+@pytest.mark.parametrize("current", list(PACKAGE))
+def test_changing_to_the_current_jurisdiction_is_refused(setup, current):
+    store, service, owner, _, _ = setup
+    bid = make_business(service, owner, current)["id"]
+    before = raw(store)
+    with pytest.raises(DomainError, match=f"already {current}") as exc:
+        change(service, owner, bid, current)
+    assert exc.value.status == 422
+    with pytest.raises(DomainError, match=f"already {current}"):
+        service.preview_jurisdiction(owner, bid, current)
+    assert raw(store) == before
+
+
+def test_package_keys_never_name_a_base_step():
+    """Package steps are recognised by key, so no package may reuse a base step's key; a base step could
+    otherwise be superseded. This checks the catalog's shape, not an expected step list."""
+    assert {spec["key"] for spec in catalog.BASE} == BASE_KEYS
+    assert {spec["key"] for specs in catalog.JURISDICTIONS.values() for spec in specs}.isdisjoint(BASE_KEYS)
+
+
+# Acquisition steps.
+
+
+def test_acquisition_business_keeps_its_deal_steps_and_reopens_completed_ones(setup):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, "GB", route="acquire")["id"]
+    evidence = source(service, owner, bid)
+    deal = service.save_deal(
+        owner,
+        bid,
+        key(),
+        dump(models.DealInputs, target="Synthetic target", thesis="A synthetic deal thesis."),
+    )
+    deals = deal_steps(service, owner, bid)
+    assert len(deals) == 7
+    mandate = next(t for t in deals.values() if t["data"]["key"] == "mandate")
+    for state in ("prepared", "approved", "verified"):
+        mandate = move(service, owner, bid, mandate, state, [evidence])
+    core = live_core(service, owner, bid)
+
+    result = change(service, owner, bid, "US-DE")
+
+    assert [s["id"] for s in result["superseded"]] == [core["local_review"]["id"]]
+    assert result["reopened"] == [
+        {
+            "id": mandate["id"],
+            "key": "mandate",
+            "title": "Approve the acquisition thesis",
+            "state": "verified",
+        }
+    ]
+    assert result["added"][0]["title"] == "Review Delaware and operating-state requirements"
+    assert result["added"][0]["depends_on"] == [core["structure"]["id"]]
+    after = deal_steps(service, owner, bid)
+    assert set(after) == set(deals)
+    assert {t["data"]["deal_id"] for t in after.values()} == {deal["id"]}
+    assert {t["state"] for i, t in after.items() if i != mandate["id"]} == {"pending"}
+    assert after[mandate["id"]]["state"] == "needs_review"
+    assert after[mandate["id"]]["data"]["history"][-1]["note"] == "Jurisdiction changed from GB to US-DE"
+    stats = service.snapshot(owner, bid)["stats"]
+    assert (stats["tasks"], stats["superseded"]) == (24, 1)
+
+
+def test_deal_steps_are_never_superseded_even_with_package_keys(setup, monkeypatch):
+    """A deal step sharing a package step's key is kept, and new steps depend only on business steps."""
+    _, service, owner, _, _ = setup
+    monkeypatch.setattr(
+        catalog,
+        "DEAL_TASKS",
+        [
+            catalog.task("local_review", "Deal-specific local review", "Acquisition", "Synthetic step."),
+            catalog.task("structure", "Deal structure", "Acquisition", "Synthetic step."),
+        ],
+    )
+    bid = make_business(service, owner, "GB", route="acquire")["id"]
+    service.save_deal(
+        owner,
+        bid,
+        key(),
+        dump(models.DealInputs, target="Synthetic target", thesis="A synthetic deal thesis."),
+    )
+    deals = deal_steps(service, owner, bid)
+    core = live_core(service, owner, bid)
+    result = change(service, owner, bid, "SE")
+    assert [s["id"] for s in result["superseded"]] == [core["local_review"]["id"]]
+    assert result["added"][0]["depends_on"] == [core["structure"]["id"]]
+    assert deal_steps(service, owner, bid) == deals
+
+
+# Prerequisites, reopening and transitions around superseded steps.
+
+
+def test_a_superseded_prerequisite_never_blocks_or_reopens_a_live_step(setup, monkeypatch):
+    """No catalog step depends on a package step today, so this builds one: a base step that follows the
+    undecided package's step, which here also requires a risk record."""
+    store, service, owner, _, _ = setup
+    monkeypatch.setattr(
+        catalog,
+        "BASE",
+        [catalog.task("after", "Follow the jurisdiction step", "Setup", "Synthetic step.", ["jurisdiction"])],
+    )
+    monkeypatch.setitem(
+        catalog.JURISDICTIONS,
+        "undecided",
+        [
+            catalog.task(
+                "jurisdiction",
+                "Resolve operating and founder jurisdictions",
+                "Setup",
+                "Synthetic step.",
+                records=["risk"],
+            )
+        ],
+    )
+    bid = make_business(service, owner, "undecided")["id"]
+    old_basis, own_basis = source(service, owner, bid, title="Old basis"), source(service, owner, bid)
+    core = live_core(service, owner, bid)
+    assert core["after"]["blockers"] == ["Complete: Resolve operating and founder jurisdictions"]
+    move(service, owner, bid, core["jurisdiction"], "prepared", [old_basis])
+
+    change(service, owner, bid, "GB")
+
+    after = live_core(service, owner, bid)["after"]
+    assert after["blockers"] == []
+    for state in ("prepared", "approved", "verified"):
+        after = move(service, owner, bid, after, state, [own_basis])
+    assert after["state"] == "verified"
+    # The superseded step cited the old basis; withdrawing it reopens nothing that only followed that step.
+    withdraw(service, owner, bid, old_basis)
+    assert live_core(service, owner, bid)["after"]["state"] == "verified"
+    # A new record of a kind only the superseded step required reopens nothing that followed it either.
+    service.add_record(owner, bid, key(), dump(models.RecordCreate, kind="risk", title="A new risk"))
+    assert live_core(service, owner, bid)["after"]["state"] == "verified"
+
+
+PRIOR_PATHS = {
+    "pending": [],
+    "in_progress": ["in_progress"],
+    "prepared": ["prepared"],
+    "approved": ["prepared", "approved"],
+    "verified": ["prepared", "approved", "verified"],
+    "needs_review": ["in_progress", "needs_review"],
+    "not_applicable": ["not_applicable"],
+}
+TARGETS = ["in_progress", "prepared", "approved", "submitted", "verified", "needs_review", "not_applicable"]
+
+
+@pytest.mark.parametrize("prior", list(PRIOR_PATHS))
+def test_a_superseded_step_never_changes_again(setup, prior):
+    store, service, owner, _, _ = setup
+    bid = make_business(service, owner, "GB")["id"]
+    evidence = source(service, owner, bid)
+    receipt = source(service, owner, bid, source_type="external_receipt", title="Receipt")
+    core = live_core(service, owner, bid)
+    move(service, owner, bid, core["structure"], "not_applicable", [evidence])
+    local = core["local_review"]
+    for state in PRIOR_PATHS[prior]:
+        local = move(service, owner, bid, local, state, [evidence])
+    assert local["state"] == prior
+
+    change(service, owner, bid, "SE")
+    old = all_tasks(service, owner, bid)[local["id"]]
+    assert old["state"] == "superseded" and old["data"]["history"][-1]["from"] == prior
+
+    for target in TARGETS:
+        with pytest.raises(DomainError, match="kept as history"):
+            move(service, owner, bid, old, target, [receipt])
+    # A general business edit reopens every completed live step, and withdrawing evidence the old step
+    # cited reopens what relied on it; neither touches a superseded step.
+    business = service.snapshot(owner, bid)["business"]
+    service.update_business(
+        owner,
+        bid,
+        key(),
+        {
+            **business["data"],
+            "concept": "A revised synthetic concept.",
+            "expected_version": business["version"],
+        },
+    )
+    withdraw(service, owner, bid, evidence)
+    assert all_tasks(service, owner, bid)[local["id"]] == old
+    assert service.audit(owner, bid)["integrity"]["valid"]
+
+
+def test_general_edit_still_refuses_a_jurisdiction_change_and_points_to_the_action(setup):
+    store, service, owner, bid, _ = setup
+    business = service.snapshot(owner, bid)["business"]
+    before = raw(store)
+    with pytest.raises(DomainError, match="jurisdiction action") as exc:
+        service.update_business(
+            owner, bid, key(), {**business["data"], "jurisdiction": "GB", "expected_version": 1}
+        )
+    assert "POST /api/businesses/{id}/jurisdiction" in exc.value.message
+    assert raw(store) == before
+
+
+# Preview.
+
+
+def preview_fixture(service, owner, start):
+    bid = make_business(service, owner, start, route="acquire")["id"]
+    evidence = source(service, owner, bid)
+    service.save_deal(
+        owner,
+        bid,
+        key(),
+        dump(models.DealInputs, target="Synthetic target", thesis="A synthetic deal thesis."),
+    )
+    core = live_core(service, owner, bid)
+    move(service, owner, bid, core["structure"], "not_applicable", [evidence])
+    move(service, owner, bid, core["demand"], "prepared", [evidence])
+    mandate = next(t for t in deal_steps(service, owner, bid).values() if t["data"]["key"] == "mandate")
+    for state in ("prepared", "approved", "verified"):
+        mandate = move(service, owner, bid, mandate, state, [evidence])
+    return bid
+
+
+@pytest.mark.parametrize(
+    ("start", "to"), [("undecided", "GB"), ("GB", "SE"), ("GB", "undecided"), ("undecided", "other")]
+)
+def test_preview_is_exactly_what_the_change_does(setup, start, to):
+    store, service, owner, _, _ = setup
+    bid = preview_fixture(service, owner, start)
+    before = raw(store)
+    preview = service.preview_jurisdiction(owner, bid, to)
+    assert raw(store) == before
+    assert preview["business_version"] == 1
+    assert {r["key"] for r in preview["reopened"]} == {"structure", "mandate"}
+
+    result = change(service, owner, bid, to)
+
+    assert without_ids(result) == {k: v for k, v in preview.items() if k != "business_version"}
+    tasks = all_tasks(service, owner, bid)
+    assert {s["id"] for s in result["superseded"]} == {
+        i for i, t in tasks.items() if t["state"] == "superseded"
+    }
+    for r in result["reopened"]:
+        assert tasks[r["id"]]["state"] == "needs_review"
+    for a in result["added"]:
+        t = tasks[a["id"]]
+        assert (t["data"]["key"], t["title"], t["data"]["depends_on"], t["state"]) == (
+            a["key"],
+            a["title"],
+            a["depends_on"],
+            "pending",
+        )
+
+
+def test_preview_is_readable_by_every_key_that_can_read_the_business(setup, client):
+    store, service, owner, bid, _ = setup
+    other = make_business(service, owner)["id"]
+    roles = ["viewer", "agent", "operator", "reviewer"]
+    tokens = {
+        role: service.add_principal(owner, {"name": role, "role": role, "business_ids": [bid]})["token"]
+        for role in roles
+    }
+    outsider = service.add_principal(owner, {"name": "Elsewhere", "role": "viewer", "business_ids": [other]})
+    expected = service.preview_jurisdiction(owner, bid, "SE")
+    url = f"/api/businesses/{bid}/jurisdiction/preview"
+    for role in roles + ["owner"]:
+        auth = {} if role == "owner" else {"Authorization": "Bearer " + tokens[role]}
+        response = client.get(url, params={"to": "SE"}, headers=auth)
+        assert response.status_code == 200, role
+        assert response.json() == expected
+    response = client.get(url, params={"to": "SE"}, headers={"Authorization": "Bearer " + outsider["token"]})
+    assert response.status_code == 403
+    response = client.get(url, params={"to": "FR"})
+    assert response.status_code == 422 and response.json()["detail"].startswith("query.to: ")
+    response = client.get(url)
+    assert response.status_code == 422 and response.json()["detail"].startswith("query.to: ")
+    response = client.get(url, params={"to": "undecided"})
+    assert response.status_code == 422 and "already undecided" in response.json()["detail"]
+
+
+# Authority, versions, idempotency and atomicity through the HTTP API.
+
+
+def change_body(version=1, to="GB", reason=REASON, evidence_ids=()):
+    return {
+        "expected_version": version,
+        "jurisdiction": to,
+        "reason": reason,
+        "evidence_ids": list(evidence_ids),
+    }
+
+
+def test_only_an_owner_or_reviewer_can_change_jurisdiction_through_the_api(setup):
+    store, service, owner, bid, token = setup
+    other = make_business(service, owner)["id"]
+    tokens = {
+        role: service.add_principal(owner, {"name": role, "role": role, "business_ids": [bid]})["token"]
+        for role in ["agent", "operator", "viewer", "reviewer"]
+    }
+    elsewhere = service.add_principal(
+        owner, {"name": "Elsewhere", "role": "reviewer", "business_ids": [other]}
+    )
+    url = f"/api/businesses/{bid}/jurisdiction"
+    with TestClient(create_app(store.path, allowed_hosts=["testserver"])) as c:
+        for name, credential in [
+            ("agent", tokens["agent"]),
+            ("operator", tokens["operator"]),
+            ("viewer", tokens["viewer"]),
+            ("other business reviewer", elsewhere["token"]),
+        ]:
+            before = raw(store)
+            response = c.post(
+                url,
+                json=change_body(),
+                headers={"Authorization": "Bearer " + credential, "Idempotency-Key": "try-" + name},
+            )
+            assert response.status_code == 403, name
+            assert raw(store) == before, name
+
+        response = c.post(
+            url,
+            json=change_body(),
+            headers={"Authorization": "Bearer " + tokens["reviewer"], "Idempotency-Key": "reviewer-change"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["business_version"] == 2 and body["to"] == "GB"
+        assert body["added"][0]["title"] == "Review UK director, registration and reporting duties"
+
+        response = c.post(
+            url,
+            json=change_body(version=2, to="SE"),
+            headers={"Authorization": "Bearer " + token, "Idempotency-Key": "owner-change"},
+        )
+        assert response.status_code == 200 and response.json()["business_version"] == 3
+    events = [
+        e for e in service.audit(owner, bid)["events"] if e["action"] == "business.jurisdiction_changed"
+    ]
+    assert [e["actor_id"] for e in events] == [store.authenticate(tokens["reviewer"])["id"], owner["id"]]
+
+
+def test_api_refuses_stale_versions_and_invalid_requests_without_changes(setup, client):
+    store, service, owner, bid, _ = setup
+    url = f"/api/businesses/{bid}/jurisdiction"
+    before = raw(store)
+    for body, status, detail in [
+        (change_body(version=2), 409, "The business changed. Refresh before saving."),
+        (change_body(reason="   "), 422, "body.reason: "),
+        (change_body(reason="x" * 4001), 422, "body.reason: "),
+        (change_body(to="FR"), 422, "body.jurisdiction: "),
+        ({k: v for k, v in change_body().items() if k != "reason"}, 422, "body.reason: "),
+        ({**change_body(), "force": True}, 422, "body: an unexpected field was sent"),
+        (change_body(evidence_ids=["evidence_missing"]), 404, "Record not found."),
+    ]:
+        response = client.post(url, json=body, headers={"Idempotency-Key": key()})
+        assert response.status_code == status, body
+        assert response.json()["detail"].startswith(detail), body
+    assert client.post(url, json=change_body()).status_code == 400
+    assert raw(store) == before
+
+
+def test_replay_returns_the_original_result_and_changes_nothing_further(setup, client):
+    store, service, owner, bid, _ = setup
+    url = f"/api/businesses/{bid}/jurisdiction"
+    headers = {"Idempotency-Key": "jurisdiction-once"}
+    first = client.post(url, json=change_body(), headers=headers)
+    assert first.status_code == 200
+    settled = raw(store)
+    replay = client.post(url, json=change_body(), headers=headers)
+    assert replay.status_code == 200 and replay.json() == first.json()
+    assert raw(store) == settled
+    different = client.post(url, json=change_body(reason="A different stated reason."), headers=headers)
+    assert different.status_code == 409 and "different request" in different.json()["detail"]
+    assert raw(store) == settled
+    # After further changes the replay still returns the original result and does nothing.
+    change(service, owner, bid, "SE")
+    moved_on = raw(store)
+    payload = dump(models.JurisdictionChange, expected_version=1, jurisdiction="GB", reason=REASON)
+    assert service.change_jurisdiction(owner, bid, "jurisdiction-once", payload) == first.json()
+    assert raw(store) == moved_on
+    assert service.snapshot(owner, bid)["business"]["data"]["jurisdiction"] == "SE"
+
+
+REFUSALS = {
+    "unknown evidence": 404,
+    "unreviewed evidence": 422,
+    "withdrawn evidence": 422,
+    "evidence of another business": 404,
+    "same jurisdiction": 422,
+    "unknown jurisdiction": 422,
+    "stale version": 409,
+    "blank reason": 422,
+    "agent": 403,
+    "operator": 403,
+    "viewer": 403,
+}
+
+
+@pytest.mark.parametrize("refusal", list(REFUSALS))
+def test_every_refusal_leaves_the_workspace_byte_for_byte_unchanged(setup, refusal):
+    store, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    payload = change_body()
+    actor = owner
+    if refusal == "unknown evidence":
+        payload["evidence_ids"] = ["evidence_00000000000000000000"]
+    elif refusal == "unreviewed evidence":
+        payload["evidence_ids"] = [source(service, owner, bid, review=False)["id"]]
+    elif refusal == "withdrawn evidence":
+        payload["evidence_ids"] = [withdraw(service, owner, bid, source(service, owner, bid))["id"]]
+    elif refusal == "evidence of another business":
+        other = make_business(service, owner)["id"]
+        payload["evidence_ids"] = [source(service, owner, other)["id"]]
+    elif refusal == "same jurisdiction":
+        payload["jurisdiction"] = "undecided"
+    elif refusal == "unknown jurisdiction":
+        payload["jurisdiction"] = "FR"
+    elif refusal == "stale version":
+        payload["expected_version"] = 2
+    elif refusal == "blank reason":
+        payload["reason"] = "  \n "
+    else:
+        principal = service.add_principal(owner, {"name": refusal, "role": refusal, "business_ids": [bid]})
+        actor = store.authenticate(principal["token"])
+    before = raw(store)
+    with pytest.raises(DomainError) as exc:
+        service.change_jurisdiction(actor, bid, "the-only-key", payload)
+    assert exc.value.status == REFUSALS[refusal]
+    assert raw(store) == before
+    if actor is owner:
+        # The refused request left no idempotency record: the same key now runs a valid change.
+        result = service.change_jurisdiction(owner, bid, "the-only-key", change_body())
+        assert result["business_version"] == 2
+
+
+def test_a_failure_part_way_through_rolls_everything_back(setup, monkeypatch):
+    store, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    before = raw(store)
+    calls = []
+
+    def fail(*args):
+        calls.append(args)
+        raise DomainError("Simulated failure while reopening work.")
+
+    monkeypatch.setattr(service, "_reopen", fail)
+    with pytest.raises(DomainError, match="Simulated failure"):
+        change(service, owner, bid, "GB")
+    assert len(calls) == 1  # the business row and steps had already been written in this transaction
+    assert raw(store) == before
+
+
+# Documents.
+
+
+def test_documents_after_a_change_never_list_superseded_steps(setup):
+    _, service, owner, bid, _ = setup
+    old = live_core(service, owner, bid)["jurisdiction"]
+    for template in ("readiness_report", "business_plan", "operating_manual"):
+        content = service.generate_document(
+            owner, bid, key(), dump(models.DocumentCreate, template=template)
+        )["data"]["content"]
+        assert f"- [pending] Resolve operating and founder jurisdictions — {old['id']}" in content
+    change(service, owner, bid, "other")
+    snapshot = service.snapshot(owner, bid)
+    assert all(o["stale"] for o in snapshot["objects"] if o["kind"] == "document")
+    new = live_core(service, owner, bid)["jurisdiction"]
+    for template in ("readiness_report", "business_plan", "operating_manual"):
+        content = service.generate_document(
+            owner, bid, key(), dump(models.DocumentCreate, template=template)
+        )["data"]["content"]
+        assert old["id"] not in content
+        assert "Resolve operating and founder jurisdictions" not in content
+        assert f"- [pending] Obtain a local requirements review — {new['id']}" in content
+        assert "Planning jurisdiction: other." in content
+
+
+# Stored data from earlier releases.
+
+
+def test_steps_stored_before_this_change_need_no_migration(setup):
+    store, service, owner, _, _ = setup
+    bid = make_business(service, owner, "GB")["id"]
+    tasks = all_tasks(service, owner, bid)
+    assert all(set(t["data"]) == STEP_FIELDS for t in tasks.values())
+    local = next(t for t in tasks.values() if t["data"]["key"] == "local_review")
+    # A step written under an older planning-guide version is still recognised by its key.
+    with store.write() as con:
+        stored = store.get(con, bid, local["id"])
+        store.update(con, stored, {**stored["data"], "pack_version": "2026.10.1"}, "pending", owner, 1)
+    with store.read() as con:
+        assert con.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0] == "1"
+
+    result = change(service, owner, bid, "SE")
+
+    assert [s["id"] for s in result["superseded"]] == [local["id"]]
+    after = all_tasks(service, owner, bid)
+    assert all(set(t["data"]) == STEP_FIELDS for t in after.values())
+    assert after[local["id"]]["data"]["pack_version"] == "2026.10.1"
+    assert service.audit(owner, bid)["integrity"]["valid"]
+
+
+# Command line, verification, backup and restore.
+
+
+def test_command_line_change_verify_backup_and_restore(tmp_path, capsys):
+    db = tmp_path / "private" / "foundry.db"
+    cli.main(["--db", str(db), "init"])
+    configuration = tmp_path / "business.json"
+    configuration.write_text(
+        json.dumps({"name": "CLI business", "concept": "A synthetic command-line business."})
+    )
+    capsys.readouterr()
+    cli.main(["--db", str(db), "create", str(configuration)])
+    bid = json.loads(capsys.readouterr().out)["id"]
+    store = Store(db)
+    owner = store.authenticate((db.parent / "owner.key").read_text().strip())
+    service = Service(store)
+    evidence = source(service, owner, bid)
+
+    before = raw(store)
+    cli.main(["--db", str(db), "jurisdiction", bid, "GB", "--preview"])
+    preview = json.loads(capsys.readouterr().out)
+    assert raw(store) == before
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(db), "jurisdiction", bid, "GB"])
+    assert "--reason" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(db), "jurisdiction", bid, "GB", "--reason", REASON, "--evidence", "evidence_x"])
+    assert "Record not found" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(db), "jurisdiction", bid, "GB", "--reason", REASON, "--expected-version", "5"])
+    assert "Refresh" in capsys.readouterr().err
+    assert raw(store) == before
+
+    cli.main(["--db", str(db), "jurisdiction", bid, "GB", "--reason", REASON, "--evidence", evidence["id"]])
+    result = json.loads(capsys.readouterr().out)
+    assert without_ids(result) == {k: v for k, v in preview.items() if k != "business_version"}
+    assert result["business_version"] == 2
+    decision = service.audit(owner, bid)["events"][-1]
+    assert decision["action"] == "business.jurisdiction_changed"
+    assert decision["actor_id"] == owner["id"]
+    assert decision["payload"]["evidence_ids"] == [evidence["id"]]
+    assert decision["payload"]["reason"] == REASON
+
+    cli.main(["--db", str(db), "verify", bid])
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+
+    backup = tmp_path / "backup" / "foundry.db"
+    restored = tmp_path / "restored" / "foundry.db"
+    cli.main(["--db", str(db), "backup", str(backup)])
+    cli.main(["--db", str(restored), "restore", str(backup)])
+    capsys.readouterr()
+    restored_store = Store(restored)
+    restored_service = Service(restored_store)
+    restored_owner = restored_store.authenticate((db.parent / "owner.key").read_text().strip())
+    snapshot = restored_service.snapshot(restored_owner, bid)
+    assert snapshot == service.snapshot(owner, bid)
+    assert snapshot["business"]["data"]["jurisdiction"] == "GB"
+    assert snapshot["stats"]["superseded"] == 1
+    integrity = restored_service.audit(restored_owner, bid)["integrity"]
+    assert integrity["valid"] and integrity["record_errors"] == []
+    superseded = next(o for o in snapshot["objects"] if o["kind"] == "task" and o["state"] == "superseded")
+    with pytest.raises(DomainError, match="kept as history"):
+        move(restored_service, restored_owner, bid, superseded, "prepared")
+
+
+# The agent, through the real MCP adapter.
+
+
+def test_agent_through_mcp_has_no_jurisdiction_tool_and_cannot_move_superseded_steps(setup):
+    store, service, owner, bid, _ = setup
+    agent = service.add_principal(
+        owner, {"name": "Jurisdiction agent", "role": "agent", "business_ids": [bid]}
+    )
+    old = live_core(service, owner, bid)["jurisdiction"]
+    change(service, owner, bid, "GB")
+    superseded = all_tasks(service, owner, bid)[old["id"]]
+
+    async def check(url):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "foundry.cli", "mcp"],
+            env={**os.environ, "FOUNDRY_API_URL": url, "FOUNDRY_API_TOKEN": agent["token"]},
+        )
+        async with stdio_client(parameters) as (read, write):
+            async with ClientSession(read, write) as client:
+                initialized = await client.initialize()
+                assert "planning jurisdiction is a human decision" in initialized.instructions
+                names = {t.name for t in (await client.list_tools()).tools}
+                assert names == {
+                    "list_businesses",
+                    "get_business",
+                    "add_record",
+                    "update_record",
+                    "add_evidence",
+                    "prepare_task",
+                    "build_forecast",
+                    "analyze_acquisition",
+                    "generate_document",
+                }
+                body = json.loads(
+                    (await client.call_tool("get_business", {"business_id": bid})).content[0].text
+                )
+                assert body["business"]["data"]["jurisdiction"] == "GB"
+                stored = next(o for o in body["objects"] if o["id"] == old["id"])
+                assert stored["state"] == "superseded" and stored["blockers"] == []
+                assert (body["stats"]["tasks"], body["stats"]["superseded"]) == (17, 1)
+                result = await client.call_tool(
+                    "prepare_task",
+                    {
+                        "business_id": bid,
+                        "task_id": old["id"],
+                        "command_key": "prepare-superseded",
+                        "expected_version": superseded["version"],
+                        "note": "Attempt to prepare history.",
+                        "evidence_ids": [],
+                    },
+                )
+                assert result.isError and "kept as history" in result.content[0].text
+                prompt = await client.get_prompt("founder_intake", {"business_id": bid})
+                text = prompt.messages[0].content.text
+                assert "The planning jurisdiction is a human decision. No tool changes it." in text
+                assert "Operating footprint for the planning jurisdiction" in text
+
+    with foundry_api(store) as url:
+        asyncio.run(check(url))
+        before = raw(store)
+        # The agent key is refused by the API itself, not only by the adapter's tool list.
+        response = httpx.post(
+            url + f"/api/businesses/{bid}/jurisdiction",
+            json=change_body(version=2, to="SE"),
+            headers={"Authorization": "Bearer " + agent["token"], "Idempotency-Key": "agent-try"},
+        )
+        assert response.status_code == 403
+        assert "human owner or reviewer" in response.json()["detail"]
+        assert raw(store) == before
+        preview = httpx.get(
+            url + f"/api/businesses/{bid}/jurisdiction/preview",
+            params={"to": "SE"},
+            headers={"Authorization": "Bearer " + agent["token"]},
+        )
+        assert preview.status_code == 200 and preview.json()["to"] == "SE"
+    assert all_tasks(service, owner, bid)[old["id"]] == superseded
