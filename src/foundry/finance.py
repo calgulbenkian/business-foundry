@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from decimal import (
     MAX_EMAX,
+    MAX_PREC,
     MIN_EMIN,
     ROUND_05UP,
     ROUND_HALF_EVEN,
     Context,
     Decimal,
     Inexact,
+    InvalidOperation,
+    Overflow,
     localcontext,
 )
 
@@ -23,8 +26,12 @@ FORECAST_VERSION, ACQUISITION_VERSION = "1.1.1", "1.0.1"
 
 
 def _fixed(value: Decimal, places: Decimal) -> str:
+    # A zero of either sign and any exponent is shown as zero; its exponent says nothing about its size.
+    if value.is_zero():
+        return str(ZERO.quantize(places))
     # The context is sized to the value, so rounding to the fixed places is never refused for lack of digits.
-    digits = max(value.adjusted() - places.as_tuple().exponent + 2, 1)
+    # Only a value whose fixed-point form has more than MAX_PREC digits is refused (InvalidOperation).
+    digits = min(max(value.adjusted() - places.as_tuple().exponent + 2, 1), MAX_PREC)
     context = Context(prec=digits, rounding=ROUND_HALF_EVEN, Emax=MAX_EMAX, Emin=MIN_EMIN)
     result = value.quantize(places, context=context)
     return str(result.copy_abs() if result.is_zero() else result)
@@ -227,38 +234,77 @@ def period_rollups(rows: list[dict]) -> list[dict]:
     return result
 
 
-# Significant digits of the returned payment. Up to the 1e12 money limit a payment is below 2e12, so 28
-# digits leave 13 below the cent, and ROUND_05UP keeps the later half-even rounding to cents exact.
+# Significant digits of a returned payment. Up to the 1e12 money limit a payment, or the total of two, is below
+# 4e12, so 28 digits leave 13 below the cent, and ROUND_05UP keeps the later half-even rounding to cents exact.
 DEBT_SERVICE_DIGITS = 28
 
 
-def annual_debt_service(principal: Decimal, rate: Decimal, years: int) -> Decimal:
-    """Level monthly payment, annualized: principal × rate × s^n / (s^n − 12^n), where s = 12 + rate.
+def _exact_context(prec: int) -> Context:
+    # Inexact is trapped, so an undersized precision raises instead of silently rounding.
+    return Context(
+        prec=max(prec, 1), Emax=MAX_EMAX, Emin=MIN_EMIN, traps=[Inexact, InvalidOperation, Overflow]
+    )
+
+
+def _payment(principal: Decimal, rate: Decimal, years: int) -> tuple[Decimal, Decimal]:
+    """The exact annual payment as numerator / denominator: principal × rate × s^n / (s^n − 12^n), s = 12 + rate.
 
     The equivalent form principal × m / (1 − (1 + m)^−n) × 12, with m = rate / 12, needs 1 + m, which has
-    no exact decimal. Here every intermediate is an exact Decimal (Inexact is trapped) and only the final
-    division is rounded, so money() of the result equals the exact payment rounded half-even to cents.
+    no exact decimal. Here both parts are exact Decimals; only their quotient needs rounding.
     """
+    if not rate:
+        return principal, D(years)
+    n = years * 12
+    exact_digits = len(principal.as_tuple().digits) + 8
+    # A validated rate has at most 12 decimal places, so s has at most 14 digits and s^n at most 14n.
+    rate = rate.normalize(Context(prec=len(rate.as_tuple().digits)))
+    s_digits = max(rate.adjusted() + 2, 3) + max(-rate.as_tuple().exponent, 0)
+    ctx = _exact_context(exact_digits + len(rate.as_tuple().digits) + s_digits * n)
+    growth = ctx.power(ctx.add(D(12), rate), n)
+    numerator = ctx.multiply(ctx.multiply(principal, rate), growth)
+    return numerator, ctx.subtract(growth, ctx.power(D(12), n))
+
+
+def _rounded(numerator: Decimal, denominator: Decimal) -> Decimal:
+    # Round once, keeping at least 28 digits and three below the cent, so money() of the result equals the
+    # exact quotient rounded half-even to cents.
+    magnitude = numerator.adjusted() - denominator.adjusted() + 2
+    digits = max(DEBT_SERVICE_DIGITS, magnitude + 3)
+    context = Context(prec=digits, rounding=ROUND_05UP, Emax=MAX_EMAX, Emin=MIN_EMIN)
+    return context.divide(numerator, denominator)
+
+
+def _times(a: Decimal, b: Decimal) -> Decimal:
+    return _exact_context(len(a.as_tuple().digits) + len(b.as_tuple().digits)).multiply(a, b)
+
+
+def _plus(a: Decimal, b: Decimal) -> Decimal:
+    # Enough digits to span both values from the highest digit to the lowest, plus one for a carry.
+    top, bottom = max(a.adjusted(), b.adjusted()), min(a.as_tuple().exponent, b.as_tuple().exponent)
+    return _exact_context(top - bottom + 2).add(a, b)
+
+
+def annual_debt_service(principal: Decimal, rate: Decimal, years: int) -> Decimal:
+    """Level monthly payment of one loan, annualized, rounded once from its exact value."""
     if not principal:
         return ZERO
-    n = years * 12
-    with localcontext() as ctx:
-        ctx.prec, ctx.Emax, ctx.Emin = 28, MAX_EMAX, MIN_EMIN
-        ctx.traps[Inexact] = True
-        exact_digits = len(principal.as_tuple().digits) + 8
-        if rate:
-            # A validated rate has at most 12 decimal places, so s has at most 14 digits and s^n at most 14n.
-            rate = rate.normalize(Context(prec=len(rate.as_tuple().digits)))
-            s_digits = max(rate.adjusted() + 2, 3) + max(-rate.as_tuple().exponent, 0)
-            ctx.prec = exact_digits + len(rate.as_tuple().digits) + s_digits * n
-            growth = (12 + rate) ** n
-            numerator, denominator = principal * rate * growth, growth - D(12) ** n
-        else:
-            ctx.prec = exact_digits
-            numerator, denominator = principal, D(years)
-        magnitude = numerator.adjusted() - denominator.adjusted() + 2
-        digits = max(DEBT_SERVICE_DIGITS, magnitude + 3)
-        return Context(prec=digits, rounding=ROUND_05UP).divide(numerator, denominator)
+    return _rounded(*_payment(principal, rate, years))
+
+
+def total_annual_debt_service(*loans: tuple[Decimal, Decimal, int]) -> Decimal:
+    """Total annualized level payment of several (principal, rate, years) loans.
+
+    The loans' exact payments are added as one exact fraction and rounded once, as annual_debt_service rounds
+    one payment, so money() of the total equals the exact total rounded half-even to cents.
+    """
+    parts = [_payment(p, r, y) for p, r, y in loans if p]
+    if not parts:
+        return ZERO
+    numerator, denominator = parts[0]
+    for num, den in parts[1:]:
+        numerator = _plus(_times(numerator, den), _times(num, denominator))
+        denominator = _times(denominator, den)
+    return _rounded(numerator, denominator)
 
 
 def acquisition(inputs: DealInputs, verified_evidence: set[str]):
@@ -273,9 +319,9 @@ def acquisition(inputs: DealInputs, verified_evidence: set[str]):
         else:
             excluded.append({**row, "reason": "A reviewed evidence record is required."})
     uses = a.purchase_price + a.fees + a.working_capital + a.integration_cost
-    senior_service = annual_debt_service(a.senior_debt, a.debt_rate, a.debt_years)
-    seller_service = annual_debt_service(a.seller_note, a.seller_rate, a.seller_years)
-    service = senior_service + seller_service
+    service = total_annual_debt_service(
+        (a.senior_debt, a.debt_rate, a.debt_years), (a.seller_note, a.seller_rate, a.seller_years)
+    )
     debt_interest = a.senior_debt * a.debt_rate + a.seller_note * a.seller_rate
     scenarios = {}
     for name, earnings in [
