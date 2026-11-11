@@ -82,6 +82,7 @@ JSON export is a portable inspection artifact containing records, events, docume
 - `src/foundry/documents.py`: grounded working documents.
 - `src/foundry/catalog.py`: versioned work and reference sources.
 - `src/foundry/api.py`, `cli.py`, `mcp_server.py`: three interfaces over the same rules.
+- `src/foundry/desktop.py`: the desktop window. It runs `api.py` in-process on a held loopback socket with a per-user data folder, and signs the window in with a single-use launch code.
 - `src/foundry/ai.py`: optional provider review and request accounting.
 - `src/foundry/static/`: responsive, dependency-free browser interface.
 - `tests/`: independent financial expectations, authority and workflow failures, persistence and provider tests.

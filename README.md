@@ -27,6 +27,15 @@ The Polymer Geospatial example is **explicitly synthetic**. Its concept, custome
 
 Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `foundry` directly.
 
+### Desktop window (preview)
+
+```sh
+uv sync --locked --extra desktop
+uv run foundry-desktop
+```
+
+This opens the same interface in a native window and signs you in automatically: there is no key to paste. Records are kept in your per-user application data folder (`~/Library/Application Support/Business Foundry` on macOS, `%LOCALAPPDATA%\Business Foundry` on Windows), not in the folder you launched from. The command-line tools can use that database with `--db`. Windows needs the Microsoft Edge WebView2 Runtime. Only one copy of the app can be open at a time. If you choose **Sign out** inside the window, the sign-in screen appears; quit and reopen the app to sign in again. There is no installer, code signing or automatic update yet, and the app has been run on macOS only, not yet on Windows. See [security](SECURITY.md#desktop-app) for how the window signs in.
+
 ## What works
 
 - Separate business workspaces, scoped access keys, human review roles and an agent role that cannot approve evidence or attest external execution.
@@ -52,7 +61,7 @@ uv run ruff format --check .
 
 The OpenAPI schema is served at `/api/openapi.json`; load it into any OpenAPI viewer you run yourself. No interactive documentation page is served, because one would need third-party scripts that the content security policy forbids. Authenticated requests use `Authorization: Bearer <access-key>`; such requests need no `Origin` header. Business writes require an `Idempotency-Key`; reuse it only when retrying the identical request. Access-key creation returns a new key once and is intentionally not cached.
 
-Private state lives in `.foundry/` and is ignored by Git. No telemetry, remote databases, third-party fonts or analytics are required. Software is MIT licensed; your business data stays yours.
+The command line keeps private state in `.foundry/` (relative to where you run it), which is ignored by Git. The desktop app uses the per-user application data folder instead. No telemetry, remote databases, third-party fonts or analytics are required. Software is MIT licensed; your business data stays yours.
 
 ## Scope of this release
 
