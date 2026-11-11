@@ -41,6 +41,127 @@ def test_demo_is_end_to_end_idempotent_and_all_records_survive_restart(setup):
     assert service.audit(actor, bid)["integrity"]["valid"]
 
 
+def startup_tasks(service, actor, bid):
+    return {
+        t["data"]["key"]: t
+        for t in service.snapshot(actor, bid)["objects"]
+        if t["kind"] == "task" and not t["data"]["deal_id"]
+    }
+
+
+def deal_tasks(service, actor, bid):
+    return {
+        t["id"]: t
+        for t in service.snapshot(actor, bid)["objects"]
+        if t["kind"] == "task" and t["data"]["deal_id"]
+    }
+
+
+def reopen(service, actor, bid, task):
+    return service.transition(
+        actor,
+        bid,
+        task["id"],
+        key(),
+        dump(
+            models.TaskTransition,
+            state="needs_review",
+            expected_version=task["version"],
+            note="A person reopened this step.",
+            evidence_ids=[],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("reopened", "expected"),
+    [
+        ("bank", {"invoice", "collection", "close"}),
+        ("acceptance", {"invoice", "collection", "close"}),
+        ("tax", {"invoice", "collection", "close"}),
+        ("agreement", {"acceptance", "invoice", "collection", "close"}),
+        ("offer", {"delivery", "agreement", "acceptance", "invoice", "collection", "close"}),
+        (
+            "structure",
+            {
+                "founders",
+                "registration",
+                "tax",
+                "bank",
+                "permissions",
+                "agreement",
+                "acceptance",
+                "invoice",
+                "collection",
+                "close",
+            },
+        ),
+        ("demand", set()),
+    ],
+)
+def test_manual_reopen_reopens_only_completed_dependents(setup, reopened, expected):
+    _, service, actor, _, _ = setup
+    bid = seed(service, actor)["id"]
+    before = startup_tasks(service, actor, bid)
+    assert {t["state"] for t in before.values()} == {"verified"}
+    reopen(service, actor, bid, before[reopened])
+    after = startup_tasks(service, actor, bid)
+    assert after[reopened]["state"] == "needs_review"
+    reopened_now = {k for k, t in after.items() if t["state"] == "needs_review" and k != reopened}
+    assert reopened_now == expected
+
+
+def test_manual_reopen_of_bank_leaves_unrelated_work_untouched(setup):
+    _, service, actor, _, _ = setup
+    bid = seed(service, actor)["id"]
+    before = startup_tasks(service, actor, bid)
+    deals_before = deal_tasks(service, actor, bid)
+    assert len(deals_before) == 7
+    reopen(service, actor, bid, before["bank"])
+    after = startup_tasks(service, actor, bid)
+    expected = {"invoice", "collection", "close"}
+    for k, t in after.items():
+        if k == "bank" or k in expected:
+            continue
+        assert t["state"] == "verified", k
+        assert t["version"] == before[k]["version"], k
+    for k in expected:
+        last = after[k]["data"]["history"][-1]
+        assert after[k]["state"] == "needs_review"
+        assert last["to"] == "needs_review"
+        assert last["note"] == "Reopened: " + before["bank"]["title"]
+        assert after[k]["version"] == before[k]["version"] + 1
+    assert deal_tasks(service, actor, bid) == deals_before
+    assert service.audit(actor, bid)["integrity"]["valid"]
+
+
+def test_manual_reopen_leaves_unfinished_dependents_alone(setup):
+    _, service, actor, bid, _ = setup
+    before = startup_tasks(service, actor, bid)
+    assert {t["state"] for t in before.values()} == {"pending"}
+    structure = service.transition(
+        actor,
+        bid,
+        before["structure"]["id"],
+        key(),
+        dump(
+            models.TaskTransition,
+            state="in_progress",
+            expected_version=before["structure"]["version"],
+            note="Started the structure decision.",
+            evidence_ids=[],
+        ),
+    )
+    reopen(service, actor, bid, structure)
+    after = startup_tasks(service, actor, bid)
+    assert after["structure"]["state"] == "needs_review"
+    for k, t in after.items():
+        if k == "structure":
+            continue
+        assert t["state"] == "pending", k
+        assert t["version"] == before[k]["version"], k
+
+
 def test_idempotency_and_revision_conflicts(setup):
     _, service, actor, bid, _ = setup
     payload = dump(models.RecordCreate, kind="customer", title="One buyer")
