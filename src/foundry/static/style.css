@@ -8,13 +8,32 @@
   Colour means line. Teal means selection and focus. Shape means state: every state glyph is an
   ink shape, and amber is reserved for "needs review".
 
-  Line colours and the measured contrast of each bullet's two-letter code against its disc:
-    navy   #0E2350  white 15.27     red    #AD1125  white 7.28     green  #1B8441  white 4.75
-    blue   #2496D4  #111 5.74       yellow #F7C600  #111 11.72
-  Further lines, for catalogs with more than five groups:
-    purple #6B3FA0  white 7.38      orange #E0701A  #111 5.85       brown  #7A4A1E  white 7.43
-    plum   #B0267A  white 6.17      slate  #4A5563  white 7.58
-  Navy takes a pale casing on dark, and yellow a dark casing on light, so both lines stay visible.
+  The line colours sit on a lightness ladder: any two differ by at least 6 L*, so they stay
+  apart in greyscale and for colour-blind readers, and the colour is never a line's only label.
+  The two-letter bullet and the line's name carry it in text. A line too faint against a theme's
+  surface takes a casing in that theme. tests/palette.cjs (run by npm run check) enforces all of
+  this from the custom properties below, and the block that follows is its output.
+  ---- measured by tests/palette.cjs (npm run palette -- --write): begin ----
+  Lines, darkest first: CIE L* and the contrast of the two-letter code on its disc.
+    navy    --l-s  #0E2350  L* 14.8  code #FFFFFF 15.27:1  cased on dark #A9B8DA
+    brown   --l-b  #5B2201  L* 21.5  code #FFFFFF 12.54:1  cased on dark #E8AB8E
+    purple  --l-v  #5A268E  L* 28.1  code #FFFFFF  9.99:1  cased on dark #CDACE9
+    red     --l-p  #AD1125  L* 36.8  code #FFFFFF  7.28:1
+    green   --l-m  #1B8441  L* 48.4  code #FFFFFF  4.75:1
+    blue    --l-e  #2496D4  L* 58.9  code #111111  5.74:1
+    orange  --l-o  #F97C2C  L* 65.5  code #111111  7.15:1
+    pink    --l-r  #FF9AD2  L* 75.5  code #111111  9.72:1  cased on light #BC3E8B
+    yellow  --l-c  #F7C600  L* 81.9  code #111111 11.72:1  cased on light #8A6E00
+    lime    --l-t  #C5FD72  L* 93.2  code #111111 15.89:1  cased on light #527B17
+  Closest lightness between any two lines: 6.5 L* (yellow, pink).
+  Closest CIEDE2000 between any two lines under simulated colour vision deficiency
+  (Machado, Oliveira and Fernandes 2009, full severity):
+    protanopia    7.9  (red, brown)
+    deuteranopia  7.8  (green, red)
+    tritanopia   11.5  (yellow, pink)
+  Lowest text contrast, light: 4.71:1 (--sel on --source-hover).
+  Lowest text contrast, dark: 4.71:1 (--sel-ink-2 on --sel).
+  ---- measured by tests/palette.cjs: end ----
 */
 :root {
   color-scheme: light;
@@ -53,19 +72,37 @@
   --tag-bg: #1a1d21;
   --tag-ink: #ffffff;
 
-  /* the lines */
-  --l-s: #0e2350;
-  --l-m: #1b8441;
-  --l-p: #ad1125;
-  --l-c: #f7c600;
-  --l-e: #2496d4;
-  --l-v: #6b3fa0;
-  --l-o: #e0701a;
-  --l-b: #7a4a1e;
-  --l-r: #b0267a;
-  --l-t: #4a5563;
+  /* the lines: each line's colour, the ink of its two-letter code, and its casing */
+  --l-s: #0e2350; /* navy */
+  --l-m: #1b8441; /* green */
+  --l-p: #ad1125; /* red */
+  --l-c: #f7c600; /* yellow */
+  --l-e: #2496d4; /* blue */
+  --l-v: #5a268e; /* purple */
+  --l-o: #f97c2c; /* orange */
+  --l-b: #5b2201; /* brown */
+  --l-r: #ff9ad2; /* pink */
+  --l-t: #c5fd72; /* lime */
+  --l-s-ink: #ffffff;
+  --l-m-ink: #ffffff;
+  --l-p-ink: #ffffff;
+  --l-c-ink: #111111;
+  --l-e-ink: #111111;
+  --l-v-ink: #ffffff;
+  --l-o-ink: #111111;
+  --l-b-ink: #ffffff;
+  --l-r-ink: #111111;
+  --l-t-ink: #111111;
   --case-s: transparent;
+  --case-m: transparent;
+  --case-p: transparent;
   --case-c: #8a6e00;
+  --case-e: transparent;
+  --case-v: transparent;
+  --case-o: transparent;
+  --case-b: transparent;
+  --case-r: #bc3e8b;
+  --case-t: #527b17;
 
   --s1: 4px;
   --s2: 8px;
@@ -93,7 +130,7 @@
     --ink: #e7e8ea;
     --ink-2: #a6abb2;
     --faint: #71767e;
-    --sel: #12807b;
+    --sel: #0e7570;
     --sel-ink: #ffffff;
     --sel-ink-2: #dcf1ef;
     --sel-soft: #1f3d3c;
@@ -120,6 +157,10 @@
     --tag-ink: #17181a;
     --case-s: #a9b8da;
     --case-c: transparent;
+    --case-v: #cdace9;
+    --case-b: #e8ab8e;
+    --case-r: transparent;
+    --case-t: transparent;
   }
 }
 
@@ -185,52 +226,52 @@ code {
 .lc-s {
   --lc: var(--l-s);
   --lcase: var(--case-s);
-  --bul-ink: #ffffff;
+  --bul-ink: var(--l-s-ink);
 }
 .lc-m {
   --lc: var(--l-m);
-  --lcase: transparent;
-  --bul-ink: #ffffff;
+  --lcase: var(--case-m);
+  --bul-ink: var(--l-m-ink);
 }
 .lc-p {
   --lc: var(--l-p);
-  --lcase: transparent;
-  --bul-ink: #ffffff;
+  --lcase: var(--case-p);
+  --bul-ink: var(--l-p-ink);
 }
 .lc-c {
   --lc: var(--l-c);
   --lcase: var(--case-c);
-  --bul-ink: #111111;
+  --bul-ink: var(--l-c-ink);
 }
 .lc-e {
   --lc: var(--l-e);
-  --lcase: transparent;
-  --bul-ink: #111111;
+  --lcase: var(--case-e);
+  --bul-ink: var(--l-e-ink);
 }
 .lc-v {
   --lc: var(--l-v);
-  --lcase: transparent;
-  --bul-ink: #ffffff;
+  --lcase: var(--case-v);
+  --bul-ink: var(--l-v-ink);
 }
 .lc-o {
   --lc: var(--l-o);
-  --lcase: transparent;
-  --bul-ink: #111111;
+  --lcase: var(--case-o);
+  --bul-ink: var(--l-o-ink);
 }
 .lc-b {
   --lc: var(--l-b);
-  --lcase: transparent;
-  --bul-ink: #ffffff;
+  --lcase: var(--case-b);
+  --bul-ink: var(--l-b-ink);
 }
 .lc-r {
   --lc: var(--l-r);
-  --lcase: transparent;
-  --bul-ink: #ffffff;
+  --lcase: var(--case-r);
+  --bul-ink: var(--l-r-ink);
 }
 .lc-t {
   --lc: var(--l-t);
-  --lcase: transparent;
-  --bul-ink: #ffffff;
+  --lcase: var(--case-t);
+  --bul-ink: var(--l-t-ink);
 }
 .bul {
   display: inline-grid;
@@ -923,8 +964,32 @@ code {
 .mp .case-s {
   stroke: var(--case-s);
 }
+.mp .case-m {
+  stroke: var(--case-m);
+}
+.mp .case-p {
+  stroke: var(--case-p);
+}
 .mp .case-c {
   stroke: var(--case-c);
+}
+.mp .case-e {
+  stroke: var(--case-e);
+}
+.mp .case-v {
+  stroke: var(--case-v);
+}
+.mp .case-o {
+  stroke: var(--case-o);
+}
+.mp .case-b {
+  stroke: var(--case-b);
+}
+.mp .case-r {
+  stroke: var(--case-r);
+}
+.mp .case-t {
+  stroke: var(--case-t);
 }
 .mp .bd {
   stroke: var(--surface);
@@ -950,27 +1015,57 @@ code {
 }
 .mp .bd-v {
   fill: var(--l-v);
+  stroke: var(--case-v);
 }
 .mp .bd-o {
   fill: var(--l-o);
 }
 .mp .bd-b {
   fill: var(--l-b);
+  stroke: var(--case-b);
 }
 .mp .bd-r {
   fill: var(--l-r);
+  stroke: var(--case-r);
+  stroke-width: 1;
 }
 .mp .bd-t {
   fill: var(--l-t);
+  stroke: var(--case-t);
+  stroke-width: 1;
 }
 .mp .bt {
   font-weight: 700;
-  fill: #ffffff;
 }
-.mp .bt-c,
-.mp .bt-e,
+.mp .bt-s {
+  fill: var(--l-s-ink);
+}
+.mp .bt-m {
+  fill: var(--l-m-ink);
+}
+.mp .bt-p {
+  fill: var(--l-p-ink);
+}
+.mp .bt-c {
+  fill: var(--l-c-ink);
+}
+.mp .bt-e {
+  fill: var(--l-e-ink);
+}
+.mp .bt-v {
+  fill: var(--l-v-ink);
+}
 .mp .bt-o {
-  fill: #111111;
+  fill: var(--l-o-ink);
+}
+.mp .bt-b {
+  fill: var(--l-b-ink);
+}
+.mp .bt-r {
+  fill: var(--l-r-ink);
+}
+.mp .bt-t {
+  fill: var(--l-t-ink);
 }
 .mp .plate {
   fill: var(--surface);

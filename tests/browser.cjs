@@ -73,6 +73,26 @@ async function main() {
     await signIn(page, origin, join(temp, 'owner.key'));
     await page.locator('#list .today-head').waitFor();
     assert.equal(await page.locator('#list-title').innerText(), 'Today');
+    // Today mixes steps from several lines under shared headings, so each step row names its
+    // line in text, matching the source list; the spine's colour is never the only cue.
+    const lineNames = await page.evaluate(() =>
+      Object.fromEntries(
+        [...document.querySelectorAll('#src-nav .src')]
+          .filter((s) => s.querySelector('.bul'))
+          .map((s) => [
+            [...s.querySelector('.bul').classList].find((c) => c.startsWith('lc-')).slice(3),
+            s.querySelector('.lbl').textContent,
+          ]),
+      ),
+    );
+    const todayRows = await page.locator('#list .row.ln').all();
+    assert(todayRows.length > 0, 'Today shows step rows');
+    for (const r of todayRows) {
+      const name = lineNames[await r.getAttribute('data-line')];
+      assert(name, 'each Today row belongs to a line in the source list');
+      const sub = await r.locator('.r-sub').innerText();
+      assert(sub.startsWith(`${name} line`), `Today row names its line: "${sub}"`);
+    }
     mkdirSync('test-results', { recursive: true });
     await page.screenshot({ path: 'test-results/overview-desktop.png', fullPage: true });
     if (process.env.FOUNDRY_UPDATE_DOCS_IMAGE) {

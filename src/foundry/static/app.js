@@ -494,9 +494,10 @@ function rpath(pts, R) {
 }
 function linePath(l, pts, R, sw) {
   const d = rpath(pts, R);
-  const cased = l.k === 's' || l.k === 'c';
+  // Every line carries a casing path; the stylesheet leaves it transparent unless the line
+  // needs an edge to stand off the surface in the current theme.
   return (
-    (cased ? `<path class="case case-${l.k}" d="${d}" stroke-width="${sw + 3}"/>` : '') +
+    `<path class="case case-${l.k}" d="${d}" stroke-width="${sw + 3}"/>` +
     `<path class="ln ln-${l.k}" d="${d}" stroke-width="${sw}"/>`
   );
 }
@@ -1033,16 +1034,20 @@ function stepSub(s) {
   if (!FINISHED.has(t.state) && t.blockers?.length) return t.blockers[0];
   return '';
 }
-const stepRow = (s, sub, prefix = 'step') =>
-  row({
+/* Under a line's own header the header names the line. Where steps from several lines share a
+   heading, as on Today, the row names its line in text, so colour is never the only cue. */
+const stepRow = (s, sub, prefix = 'step', named = false) => {
+  const text = sub === undefined ? stepSub(s) : sub;
+  return row({
     key: prefix + ':' + s.id,
     glyph: taskGlyph(s.task),
     num: s.n,
     title: h(s.task.title),
     right: stateOf(s.task).label,
-    sub: h(sub === undefined ? stepSub(s) : sub),
+    sub: h(named ? [`${s.line.name} line`, text].filter(Boolean).join(' · ') : text),
     line: s.line,
   });
+};
 const grp = (name, n, note) =>
   `<div class="grp" role="presentation"><span>${name}</span>${n !== undefined && n !== '' ? `<span class="grp-n">${n}</span>` : ''}</div>${note ? `<div class="grp-note">${note}</div>` : ''}`;
 const grpLine = (l, text, n) =>
@@ -1120,20 +1125,25 @@ function renderList() {
         review.length,
         'What these relied on changed. Earlier decisions stay in their history.',
       );
-      for (const s of review) out += stepRow(s);
+      for (const s of review) out += stepRow(s, undefined, 'step', true);
     }
     if (decide.length) {
       out += grp('Waiting on you', decide.length);
-      for (const s of decide) out += stepRow(s);
+      for (const s of decide) out += stepRow(s, undefined, 'step', true);
     }
     if (away.length) {
       out += grp('Waiting on someone else', away.length);
       for (const s of away)
-        out += stepRow(s, 'With the outside body · add their receipt when it arrives');
+        out += stepRow(
+          s,
+          'With the outside body · add their receipt when it arrives',
+          'step',
+          true,
+        );
     }
     if (ready.length) {
       out += grp('Ready to start', ready.length, 'Every prerequisite for these is complete.');
-      for (const s of ready) out += stepRow(s, s.task.data.description || '');
+      for (const s of ready) out += stepRow(s, s.task.data.description || '', 'step', true);
     }
     out += moneyRows(true);
     const changed = changedRows();

@@ -83,3 +83,5 @@ npm run test:browser
 ```
 
 The test starts an isolated local server with a temporary synthetic database, exercises real browser forms, the Journey map and the state glyphs, withdraws evidence to check that dependent work reopens, checks desktop, medium and phone layouts and an empty first run, and tears it down. Screenshots go to the ignored `test-results/` directory. `FOUNDRY_UPDATE_DOCS_IMAGE=1 npm run test:browser` also regenerates `docs/images/workspace.png` from the synthetic demo workspace.
+
+`npm run check` also runs `tests/palette.cjs`, which reads the stylesheet's custom properties and fails if any two line colours come within 6 L* of each other, if a line's two-letter code falls below 4.5:1 on its disc, if lines collide under simulated protanopia, deuteranopia or tritanopia, if a faint line lacks a casing, or if a main text role falls below 4.5:1 in either theme. After changing a colour, `npm run palette -- --write` regenerates the measured figures in the stylesheet's header comment; the check fails while they are stale.
