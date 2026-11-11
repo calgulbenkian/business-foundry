@@ -8,8 +8,8 @@ import pytest
 
 from foundry import models
 from foundry.demo import seed
-from foundry.service import Service, read_json
-from foundry.store import Store, canonical
+from foundry.service import Service, read_json, same_json, stored_literal
+from foundry.store import Store, canonical, digest
 
 
 def key():
@@ -892,3 +892,497 @@ def test_any_value_in_any_revision_column_is_reported_without_raising(
     other_result = service.audit(actor, other)["integrity"]
     assert other_result["valid"], other_result["record_errors"]
     assert other_result["record_errors"] == []
+
+
+# A version is recorded by the first chained event for it. "Appended" below means one new event row
+# written with SQL whose prev_hash is the current head and whose hash is right for the new row; no
+# earlier row changes, so the chain itself still verifies.
+
+APPENDED_AT = "2026-01-01T00:00:00+00:00"
+
+
+def append_event(store, bid, object_id, payload, action="record.updated"):
+    """Append one correctly chained event whose stored payload is the text ``payload``."""
+    with store.write() as con:
+        prev = con.execute(
+            "SELECT hash FROM events WHERE business_id=? ORDER BY seq DESC LIMIT 1", (bid,)
+        ).fetchone()[0]
+        chained = {
+            "business_id": bid,
+            "actor_id": "principal_appender",
+            "action": action,
+            "object_id": object_id,
+            "payload": json.loads(payload),
+            "created_at": APPENDED_AT,
+            "prev_hash": prev,
+        }
+        con.execute(
+            "INSERT INTO events(business_id,actor_id,action,object_id,payload,created_at,prev_hash,hash) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                bid,
+                chained["actor_id"],
+                action,
+                object_id,
+                payload,
+                APPENDED_AT,
+                prev,
+                digest(canonical(chained)),
+            ),
+        )
+
+
+def stored_snapshot_text(store, object_id, version):
+    with store.read() as con:
+        return con.execute(
+            "SELECT snapshot FROM revisions WHERE object_id=? AND version=?", (object_id, version)
+        ).fetchone()[0]
+
+
+def event_hashes(store, bid):
+    with store.read() as con:
+        return [r[0] for r in con.execute("SELECT hash FROM events WHERE business_id=? ORDER BY seq", (bid,))]
+
+
+def assert_clean(service, actor, bid):
+    result = service.audit(actor, bid)["integrity"]
+    assert result["record_errors"] == []
+    assert result["valid"]
+
+
+def test_rewritten_past_revision_is_not_hidden_by_appended_events(setup):
+    # The fixture's business is the second business in this database.
+    store, service, actor, other, _ = setup
+    revise_other = service.add_record(actor, other, key(), record(title="Other buyer"))
+    revise(service, actor, other, revise_other, "Other buyer revision 2")
+    bid = seed(service, actor)["id"]
+    with store.read() as con:
+        oid = con.execute(
+            "SELECT id FROM objects WHERE business_id=? AND version=2 ORDER BY id LIMIT 1", (bid,)
+        ).fetchone()[0]
+    clean = service.audit(actor, bid)["integrity"]
+    assert clean["record_errors"] == [] and clean["valid"] and clean["events_checked"] == 100
+    anchored = event_hashes(store, bid)
+    current = stored_snapshot_text(store, oid, 2)
+    altered = canonical({**snapshot(store, oid, 1), "title": "Rewritten past"})
+
+    # 1. The past revision row is rewritten.
+    with store.write() as con:
+        con.execute("UPDATE revisions SET snapshot=? WHERE object_id=? AND version=1", (altered, oid))
+    result = service.audit(actor, bid)["integrity"]
+    assert result["record_errors"] == [f"Historical revision differs from history: {oid} version 1"]
+    assert not result["valid"]
+
+    # 2. An event recording version 1 with the altered snapshot is appended.
+    append_event(store, bid, oid, altered)
+    result = service.audit(actor, bid)["integrity"]
+    assert result["record_errors"] == [
+        f"Current record differs from history: {oid}",
+        f"Version recorded more than once in history: {oid} version 1",
+        f"Historical revision differs from history: {oid} version 1",
+    ]
+    assert not result["valid"]
+    assert result["events_checked"] == 101
+
+    # 3. An event repeating the current version 2 snapshot is appended.
+    append_event(store, bid, oid, current)
+    result = service.audit(actor, bid)["integrity"]
+    assert result["record_errors"] == [
+        f"Version recorded more than once in history: {oid} version 1",
+        f"Version recorded more than once in history: {oid} version 2",
+        f"Historical revision differs from history: {oid} version 1",
+    ]
+    assert not result["valid"]
+    assert result["events_checked"] == 102
+    # Documented: appending changed no earlier hash, so the head hash anchored before is still there.
+    assert event_hashes(store, bid)[:100] == anchored
+    assert event_hashes(store, bid)[99] == clean["head_hash"]
+    assert_clean(service, actor, other)
+
+
+def test_appended_copy_of_current_version_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    append_event(store, bid, item["id"], stored_snapshot_text(store, item["id"], 2))
+    result = integrity(setup)
+    assert result["record_errors"] == [f"Version recorded more than once in history: {item['id']} version 2"]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+def test_appended_copy_of_past_version_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=3)
+    append_event(store, bid, item["id"], stored_snapshot_text(store, item["id"], 1))
+    result = integrity(setup)
+    # The newest chained snapshot is now version 1, so the current record no longer equals it.
+    assert result["record_errors"] == [
+        f"Current record differs from history: {item['id']}",
+        f"Version recorded more than once in history: {item['id']} version 1",
+    ]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+def test_version_repeated_many_times_is_reported_once(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    for _ in range(3):
+        append_event(store, bid, item["id"], stored_snapshot_text(store, item["id"], 2))
+    result = integrity(setup)
+    assert result["record_errors"] == [f"Version recorded more than once in history: {item['id']} version 2"]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+def business_versions(setup):
+    store, service, actor, bid, _ = setup
+    first = service.audit(actor, bid)["events"][0]["payload"]
+    assert first["id"] == bid and first["version"] == 1
+    current = service.update_business(
+        actor,
+        bid,
+        key(),
+        models.BusinessUpdate(
+            name="Test business renamed",
+            concept="A synthetic business for independent tests.",
+            expected_version=1,
+        ).model_dump(mode="json"),
+    )
+    assert current["version"] == 2
+    return first, current
+
+
+def test_business_profile_repeated_current_version_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    _, current = business_versions(setup)
+    assert_clean(service, actor, bid)
+    append_event(store, bid, bid, canonical(current), "business.updated")
+    result = integrity(setup)
+    assert result["record_errors"] == [f"Version recorded more than once in history: {bid} version 2"]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+def test_business_profile_repeated_past_version_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    first, _ = business_versions(setup)
+    append_event(store, bid, bid, canonical(first), "business.updated")
+    append_event(store, bid, bid, canonical(first), "business.updated")
+    result = integrity(setup)
+    assert result["record_errors"] == [
+        f"Current record differs from history: {bid}",
+        f"Version recorded more than once in history: {bid} version 1",
+    ]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+UNUSABLE_VERSIONS = [
+    pytest.param("2.0", id="float-2.0"),
+    pytest.param("2e0", id="exponent-2e0"),
+    pytest.param("true", id="true"),
+    pytest.param('"2"', id="text-2"),
+    pytest.param("null", id="null"),
+    pytest.param("[2]", id="list"),
+    pytest.param('{"n":2}', id="object"),
+]
+
+
+def with_version(text, version):
+    assert text.count('"version":2') == 1
+    return text.replace('"version":2', '"version":' + version)
+
+
+@pytest.mark.parametrize("version", UNUSABLE_VERSIONS)
+def test_appended_event_with_unusable_version_is_reported_without_raising(setup, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    append_event(store, bid, item["id"], with_version(stored_snapshot_text(store, item["id"], 2), version))
+    result = integrity(setup)
+    assert result["record_errors"] == [
+        f"Current record differs from history: {item['id']}",
+        f"History records an unusable version: {item['id']}",
+    ]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("version", ["3.0", "3e0", '"3"', "true", "null", "[3]", '{"n":3}'])
+def test_unusable_version_is_reported_once_and_stands_for_no_version(setup, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    current = stored_snapshot_text(store, item["id"], 2)
+    append_event(store, bid, item["id"], with_version(current, version))
+    append_event(store, bid, item["id"], with_version(current, version))
+    append_event(store, bid, item["id"], current)
+    result = integrity(setup)
+    # Not "Historical revision missing ... version 3", and true does not stand for version 1.
+    assert result["record_errors"] == [
+        f"History records an unusable version: {item['id']}",
+        f"Version recorded more than once in history: {item['id']} version 2",
+    ]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+def test_business_profile_unusable_version_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    _, current = business_versions(setup)
+    append_event(store, bid, bid, canonical({**current, "version": "2"}), "business.updated")
+    result = integrity(setup)
+    assert result["record_errors"] == [
+        f"Current record differs from history: {bid}",
+        f"History records an unusable version: {bid}",
+    ]
+    assert not result["valid"]
+    assert_clean(service, actor, other)
+
+
+def test_integer_spelled_minus_zero_records_version_zero(setup):
+    # -0 is a JSON integer: it records version 0, which has no revision row.
+    store, service, actor, bid, _ = setup
+    item = history(setup, versions=2)
+    append_event(store, bid, item["id"], with_version(stored_snapshot_text(store, item["id"], 2), "-0"))
+    assert integrity(setup)["record_errors"] == [
+        f"Current record differs from history: {item['id']}",
+        f"Historical revision missing: {item['id']} version 0",
+    ]
+
+
+def test_history_messages_follow_chain_order(setup):
+    store, service, actor, bid, _ = setup
+    a = history(setup, versions=2)["id"]
+    b = service.add_record(actor, bid, key(), record(title="Second buyer"))["id"]
+    b1 = stored_snapshot_text(store, b, 1)
+    assert b1.count('"version":1') == 1
+    append_event(store, bid, b, b1.replace('"version":1', '"version":"x"'))
+    append_event(store, bid, a, stored_snapshot_text(store, a, 1))
+    append_event(store, bid, b, b1)
+    append_event(store, bid, a, stored_snapshot_text(store, a, 2))
+    append_event(store, bid, b, b1.replace('"version":1', '"version":1.0'))
+    result = integrity(setup)
+    # Current-record messages first, in record order; then history messages in chain order.
+    assert result["record_errors"] == [
+        f"Current record differs from history: {b}",
+        f"History records an unusable version: {b}",
+        f"Version recorded more than once in history: {a} version 1",
+        f"Version recorded more than once in history: {b} version 1",
+        f"Version recorded more than once in history: {a} version 2",
+    ]
+
+
+def test_export_carries_repeated_version_errors(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    append_event(store, bid, item["id"], stored_snapshot_text(store, item["id"], 2))
+    export = service.audit(actor, bid, True)
+    assert export["integrity"] == integrity(setup)
+    assert export["integrity"]["record_errors"] == [
+        f"Version recorded more than once in history: {item['id']} version 2"
+    ]
+    assert not export["integrity"]["valid"]
+    assert export["events"][-1]["actor_id"] == "principal_appender"
+    assert_clean(service, actor, other)
+
+
+def test_documented_limit_appended_new_version_verifies(setup):
+    # An appended event recording a new version, with a matching current record and revision row,
+    # is indistinguishable from an application write: the chain shows only that it came last.
+    store, service, actor, bid, _ = setup
+    item = history(setup, versions=2)
+    forged = {**item, "title": "Never approved", "version": 3}
+    with store.write() as con:
+        con.execute("UPDATE objects SET title=?,version=3 WHERE id=?", (forged["title"], item["id"]))
+        con.execute(
+            "INSERT INTO revisions VALUES(?,?,?,?,?)",
+            (item["id"], 3, canonical(forged), "principal_appender", APPENDED_AT),
+        )
+    append_event(store, bid, item["id"], canonical(forged))
+    assert_clean(service, actor, bid)
+
+
+def test_documented_limit_altered_ai_review_with_appended_event_verifies(setup):
+    store, service, actor, bid, _ = setup
+    run_id = "review_synthetic"
+    data = {"note": "Synthetic run written for this test.", "response": None}
+    with store.write() as con:
+        con.execute(
+            "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
+            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), "unknown", APPENDED_AT),
+        )
+        store.event(
+            con,
+            bid,
+            actor,
+            "ai.unknown",
+            run_id,
+            {"run_id": run_id, "state": "unknown", "data_sha256": digest(canonical(data))},
+        )
+    assert_clean(service, actor, bid)
+    changed = {**data, "advice": {"summary": "Advice that was never returned."}}
+    with store.write() as con:
+        con.execute("UPDATE ai_calls SET data=?,state='succeeded' WHERE id=?", (canonical(changed), run_id))
+    assert integrity(setup)["record_errors"] == [f"AI review differs from history: {run_id}"]
+    append_event(
+        store,
+        bid,
+        run_id,
+        canonical({"run_id": run_id, "state": "succeeded", "data_sha256": digest(canonical(changed))}),
+        "ai.succeeded",
+    )
+    assert_clean(service, actor, bid)
+
+
+# Gaps named in review: literals that run back as SQL, number and key spellings, REAL and NaN versions.
+
+LITERAL_VALUES = [
+    "NULL",
+    "X''",
+    "X'FF7B'",
+    "X'" + "AB" * 16 + "'",
+    "''",
+    "'word'",
+    "'it''s'",
+    "'" + "a" * 32 + "'",
+    "'tab' || char(9)",
+    "'é'",
+    "CAST(X'00' AS TEXT)",
+    "CAST(X'FF7B' AS TEXT)",
+    "CAST(X'EDA080' AS TEXT)",
+]
+
+
+@pytest.mark.parametrize("encoding", ["UTF-8", "UTF-16le", "UTF-16be"])
+def test_stored_literal_selects_the_same_value_in_sql(encoding):
+    con = sqlite3.connect(":memory:")
+    con.execute(f"PRAGMA encoding='{encoding}'")
+    con.execute("CREATE TABLE t(v)")
+    for expression in LITERAL_VALUES + ["'" + "a" * 33 + "'", "X'" + "AB" * 17 + "'"]:
+        rowid = con.execute(f"INSERT INTO t VALUES({expression})").lastrowid
+        storage, value = con.execute(
+            "SELECT typeof(v), CASE typeof(v) WHEN 'text' THEN CAST(v AS BLOB) ELSE v END FROM t WHERE rowid=?",
+            (rowid,),
+        ).fetchone()
+        shown = stored_literal(storage, value, encoding)
+        assert all(" " <= c <= "~" for c in shown) and len(shown) <= 52, shown
+        if "..." in shown:
+            assert len(value) > 16
+            continue
+        # The literal selects this row's value; in UTF-16, CAST(X'00' AS TEXT) stores '' (an odd
+        # trailing byte is dropped), and the literal shows what is stored.
+        assert con.execute(
+            f"SELECT v IS {shown} AND typeof(v)=typeof({shown}) FROM t WHERE rowid=?", (rowid,)
+        ).fetchone() == (1,), (expression, shown)
+    con.close()
+
+
+def test_snapshot_with_repeated_key_is_read_by_its_last_value(setup):
+    # Documented: a repeated key keeps only its last value, so an earlier one is not compared.
+    store = setup[0]
+    item = history(setup)
+    text = stored_snapshot_text(store, item["id"], 1)
+    assert text.count('"title":') == 1
+    hidden = text.replace('"title":', '"title":"Rewritten past","title":')
+    shown = text.replace('"title":"Example buyer"', '"title":"Example buyer","title":"Rewritten past"')
+    assert shown != text
+    with store.write() as con:
+        con.execute("UPDATE revisions SET snapshot=? WHERE object_id=? AND version=1", (hidden, item["id"]))
+    assert integrity(setup)["record_errors"] == []
+    with store.write() as con:
+        con.execute("UPDATE revisions SET snapshot=? WHERE object_id=? AND version=1", (shown, item["id"]))
+    assert integrity(setup)["record_errors"] == [
+        f"Historical revision differs from history: {item['id']} version 1"
+    ]
+
+
+def test_integer_minus_zero_is_the_same_value_as_zero(setup):
+    store = setup[0]
+    item = typed_history(setup)
+    with store.write() as con:
+        text = stored_snapshot_text(store, item["id"], 1)
+        con.execute(
+            "UPDATE revisions SET snapshot=? WHERE object_id=? AND version=1",
+            (retype(text, '"zero":0', '"zero":-0'), item["id"]),
+        )
+    result = integrity(setup)
+    assert result["record_errors"] == []
+    assert result["valid"]
+
+
+def test_float_minus_zero_differs_from_zero():
+    assert same_json({"a": -0}, {"a": 0})
+    assert not same_json({"a": -0.0}, {"a": 0.0})
+    assert not same_json({"a": 0.0}, {"a": 0})
+
+
+def test_real_whole_number_versions_count_as_integers(setup):
+    store = setup[0]
+    item = history(setup)
+    untyped_column(store, "version")
+    with store.write() as con:
+        for version in (1, 3):
+            con.execute(
+                "UPDATE revisions SET version=? WHERE object_id=? AND version=?",
+                (float(version), item["id"], version),
+            )
+        stored = con.execute(
+            "SELECT typeof(version) FROM revisions WHERE object_id=? ORDER BY version", (item["id"],)
+        ).fetchall()
+    assert [row[0] for row in stored] == ["real", "integer", "real"]
+    result = integrity(setup)
+    assert result["record_errors"] == []
+    assert result["valid"]
+
+
+def test_nan_bound_as_version_is_stored_as_null(setup):
+    store = setup[0]
+    item = history(setup)
+    with store.write() as con, pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "UPDATE revisions SET version=? WHERE object_id=? AND version=1", (float("nan"), item["id"])
+        )
+    untyped_column(store, "version")
+    with store.write() as con:
+        con.execute(
+            "UPDATE revisions SET version=? WHERE object_id=? AND version=1", (float("nan"), item["id"])
+        )
+        assert (
+            con.execute(
+                "SELECT count(*) FROM revisions WHERE object_id=? AND version IS NULL", (item["id"],)
+            ).fetchone()[0]
+            == 1
+        )
+    assert integrity(setup)["record_errors"] == [
+        f"Revision has no recorded history: {item['id']} version NULL",
+        f"Historical revision missing: {item['id']} version 1",
+    ]
+
+
+def test_removing_the_newest_event_keeps_the_chain_valid_but_is_reported(setup):
+    # Documented: the chain alone does not show that its newest events were removed.
+    store, service, actor, bid, _ = setup
+    item = history(setup, versions=2)
+    before = integrity(setup)
+    with store.write() as con:
+        newest = con.execute(
+            "SELECT seq,object_id FROM events WHERE business_id=? ORDER BY seq DESC LIMIT 1", (bid,)
+        ).fetchone()
+        assert newest["object_id"] == item["id"]
+        con.execute("DELETE FROM events WHERE seq=?", (newest["seq"],))
+    with store.read() as con:
+        chain = store.verify_chain(con, bid)
+    assert chain["valid"] and chain["events_checked"] == before["events_checked"] - 1
+    assert integrity(setup)["record_errors"] == [
+        f"Current record differs from history: {item['id']}",
+        f"Revision has no recorded history: {item['id']} version 2",
+    ]

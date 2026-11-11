@@ -675,14 +675,14 @@ class Service:
             # TEXT as its bytes in the database encoding, BLOB unchanged, a number as its text
             # and NULL as NULL; read_json decodes those bytes in this encoding, or reports them.
             encoding = con.execute("PRAGMA encoding").fetchone()[0]
-            errors, latest, ai_latest, versions = [], {}, {}, {}
+            errors, latest, ai_latest = [], {}, {}
             for event in events:
                 p = event["payload"]
                 if p.get("id") == event["object_id"] and "version" in p and "data" in p:
                     latest[p["id"]] = p
-                    versions[(p["id"], p["version"])] = p
                 if p.get("run_id") and p.get("data_sha256"):
                     ai_latest[p["run_id"]] = p
+            versions, history_errors = self._recorded_versions(events)
             objects = self.store.objects(con, bid)
             for obj in [business] + objects:
                 if not same_json(obj, latest.pop(obj["id"], None)):
@@ -700,6 +700,7 @@ class Service:
                     if not revision or not same_json(read_json(revision["snapshot"], encoding), obj):
                         errors.append(f"Revision mismatch: {obj['id']}")
             errors.extend(f"Historical record missing: {oid}" for oid in latest)
+            errors.extend(history_errors)
             errors.extend(self._revision_errors(con, bid, versions, encoding))
             for run in con.execute("SELECT * FROM ai_calls WHERE business_id=?", (bid,)):
                 recorded = ai_latest.pop(run["id"], {})
@@ -739,8 +740,39 @@ class Service:
             return {"integrity": integrity, "events": events}
 
     @staticmethod
+    def _recorded_versions(events):
+        """Map (id, version) to the chained event that records that version, and report history faults.
+
+        An event records a version when its payload's id equals the event's object_id, the payload
+        has data, and its version is a JSON integer (not a boolean, a float such as 2.0, text, null,
+        a list or an object). Walking events in chain order, the first event that records a given
+        id and version stands for it; a later one cannot replace it and is reported once per id and
+        version. An event that would record a version but whose version is not a JSON integer is
+        reported once per id and never stands for any version. Messages follow chain order of the
+        event that first causes each one.
+        """
+        recorded, repeated, unusable, errors = {}, set(), set(), []
+        for event in events:
+            p = event["payload"]
+            if not (p.get("id") == event["object_id"] and "version" in p and "data" in p):
+                continue
+            oid, version = p["id"], p["version"]
+            if type(version) is not int:
+                if oid not in unusable:
+                    unusable.add(oid)
+                    errors.append(f"History records an unusable version: {oid}")
+            elif (oid, version) not in recorded:
+                recorded[(oid, version)] = p
+            elif (oid, version) not in repeated:
+                repeated.add((oid, version))
+                errors.append(f"Version recorded more than once in history: {oid} version {version}")
+        return recorded, errors
+
+    @staticmethod
     def _revision_errors(con, bid, recorded, encoding):
-        """Compare every stored revision with the chained event that recorded that version.
+        """Compare every stored revision with the chained event that stands for that version.
+
+        ``recorded`` comes from _recorded_versions: integer versions only, the first event for each.
 
         Store.add/update write one revision row and one event per object version. The
         business record itself is versioned through events only and never has revisions.
