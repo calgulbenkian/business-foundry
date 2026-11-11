@@ -24,7 +24,8 @@ def test_api_auth_session_csrf_and_security_headers(setup):
         )
         assert response.status_code == 403
         assert c.get("/").headers["content-security-policy"].startswith("default-src 'self'")
-        c.post("/api/logout")
+        # A cookie-authenticated write must carry same-origin evidence, as a browser does.
+        assert c.post("/api/logout", headers={"Origin": "http://testserver"}).status_code == 200
         assert c.get("/api/businesses").status_code == 401
         assert c.get("/api/health", headers={"Host": "evil.example"}).status_code == 400
 

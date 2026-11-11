@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import httpx
 from pydantic import Field, ValidationError
@@ -22,6 +23,27 @@ class Advice(Model):
     summary: str = Field(max_length=6000)
     recommendations: list[Recommendation] = Field(max_length=20)
     unknowns: list[str] = Field(max_length=30)
+
+
+MAX_DAILY_CALLS = 100_000
+
+
+def daily_call_limit():
+    """Read FOUNDRY_AI_DAILY_CALLS strictly; a malformed limit fails closed rather than crashing.
+
+    After surrounding whitespace is removed, the value must be ``0`` or a run of ASCII digits
+    with no leading zero, and at most MAX_DAILY_CALLS. The length is bounded before conversion,
+    so no value reaches Python's long-integer conversion limit.
+    """
+    raw = os.getenv("FOUNDRY_AI_DAILY_CALLS", "20").strip()
+    if not re.fullmatch(r"0|[1-9][0-9]{0,5}", raw) or int(raw) > MAX_DAILY_CALLS:
+        raise DomainError(
+            "FOUNDRY_AI_DAILY_CALLS on the server must be a whole number of 0 or greater and at most "
+            f"{MAX_DAILY_CALLS}, written in plain ASCII digits with no sign, separator, exponent or leading zero "
+            "(for example 20); AI reviews are disabled until it is corrected.",
+            503,
+        )
+    return int(raw)
 
 
 class Adviser:
@@ -64,7 +86,7 @@ class Adviser:
                 raise DomainError(
                     "Set OPENAI_API_KEY and FOUNDRY_OPENAI_MODEL on the server to enable AI reviews.", 503
                 )
-            limit = int(os.getenv("FOUNDRY_AI_DAILY_CALLS", "20"))
+            limit = daily_call_limit()
             used = con.execute("SELECT COUNT(*) FROM ai_calls WHERE created_at>=?", (now()[:10],)).fetchone()[
                 0
             ]
