@@ -4,6 +4,8 @@ import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
+from types import UnionType
+from typing import Annotated, Union, get_args, get_origin
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -11,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import catalog, models
@@ -18,41 +21,134 @@ from .ai import Adviser
 from .service import Service
 from .store import DomainError, Store, digest
 
-LOCATION_ROOTS = {"body", "query", "path", "header", "cookie"}
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    ),
+    "Cache-Control": "no-store",
+}
 
 
-def defined_names():
-    names = set(LOCATION_ROOTS)
-    for value in vars(models).values():
-        if isinstance(value, type) and issubclass(value, BaseModel):
-            for name, field in value.model_fields.items():
-                names.add(name)
-                if field.alias:
-                    names.add(field.alias)
-    return names
+class SecurityHeaders:
+    """Add the security headers to every HTTP response that passes through the application.
+
+    A pure ASGI wrapper placed outside every other application middleware, so early refusals
+    (host, origin, size) carry the headers as well as routed responses.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in SECURITY_HEADERS.items():
+                    headers[name] = value
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
-DEFINED_NAMES = defined_names()
+def _unwrap(annotation):
+    """Strip Annotated metadata and Optional; a union of several real types is left as is."""
+    while True:
+        origin = get_origin(annotation)
+        if origin is Annotated:
+            annotation = get_args(annotation)[0]
+        elif origin in (Union, UnionType):
+            members = [a for a in get_args(annotation) if a is not type(None)]
+            if len(members) != 1:
+                return annotation
+            annotation = members[0]
+        else:
+            return annotation
 
 
-def validation_message(error):
+def _model_field(model, part):
+    if not isinstance(part, str):
+        return None
+    for name, field in model.model_fields.items():
+        if part == name or (field.alias and part == field.alias):
+            return field
+    return None
+
+
+def defined_path(annotation, parts):
+    """Keep the leading location parts that the declared type itself defines.
+
+    Model field names and list positions are kept. The walk stops at anything else: a
+    dictionary (its keys are chosen by the client, whatever their spelling), a union member
+    tag, a scalar, or a name the model does not declare. The decision is made from the type
+    structure, never from the spelling of the client's input.
+    """
+    kept = []
+    for part in parts:
+        annotation = _unwrap(annotation)
+        origin = get_origin(annotation)
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            field = _model_field(annotation, part)
+            if field is None:
+                break
+            kept.append(part)
+            annotation = field.annotation
+        elif origin in (list, tuple, set, frozenset) and isinstance(part, int) and not isinstance(part, bool):
+            args = [a for a in get_args(annotation) if a is not Ellipsis]
+            if origin is tuple and len(args) != 1:
+                break
+            kept.append(str(part))
+            annotation = args[0] if args else object
+        else:
+            break
+    return kept
+
+
+def _route_params(dependant, kind):
+    params = list(getattr(dependant, kind))
+    for sub in dependant.dependencies:
+        params.extend(_route_params(sub, kind))
+    return params
+
+
+def defined_location(route, loc):
+    """The application-defined part of a validation error location, as a list of strings."""
+    if not loc or loc[0] not in {"body", "query", "path", "header", "cookie"}:
+        return []
+    root, rest = loc[0], list(loc[1:])
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return [root]
+    params = _route_params(dependant, root + "_params")
+    if root == "body" and len(params) == 1 and not getattr(params[0].field_info, "embed", False):
+        # A single, non-embedded body model: the location after "body" is the model's own path.
+        return [root, *defined_path(params[0].field_info.annotation, rest)]
+    if not rest:
+        return [root]
+    for param in params:
+        if rest[0] == param.alias:
+            return [root, param.alias, *defined_path(param.field_info.annotation, rest[1:])]
+    return [root]
+
+
+def validation_message(error, route=None):
     """Describe a validation error by locations the application defines, never by client input.
 
-    The location is cut at the first segment that is not an application-defined field name
-    (for example a client-chosen dictionary key or an unexpected property), so client-invented
-    names are never echoed. List positions are kept.
+    The location is cut where the route's declared request types stop defining it: at a
+    client-chosen dictionary key (whatever its spelling), an unexpected property, or a union
+    member tag. Model field names and list positions are kept.
     """
     loc = list(error.get("loc", ()))
     extra = error.get("type") == "extra_forbidden"
     if extra:
         loc = loc[:-1]
-    kept = []
-    for part in loc:
-        if isinstance(part, int) or (isinstance(part, str) and part in DEFINED_NAMES):
-            kept.append(str(part))
-        else:
-            break
-    where = ".".join(kept) or "request"
+    where = ".".join(defined_location(route, loc)) or "request"
     return where + ": " + ("an unexpected field was sent" if extra else error["msg"])
 
 
@@ -86,7 +182,7 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
         # Values are never included, and neither are names the client invented.
         messages = []
         for error in exc.errors():
-            message = validation_message(error)
+            message = validation_message(error, request.scope.get("route"))
             if message not in messages:
                 messages.append(message)
         return JSONResponse({"detail": "; ".join(messages)}, status_code=422)
@@ -94,6 +190,16 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
     @app.middleware("http")
     async def boundaries(request: Request, call_next):
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            # Two Origin (or Sec-Fetch-Site) headers are ambiguous: a browser never sends them,
+            # and judging by whichever comes first would let one value hide the other.
+            if (
+                len(request.headers.getlist("origin")) > 1
+                or len(request.headers.getlist("sec-fetch-site")) > 1
+            ):
+                return JSONResponse(
+                    {"detail": "Writes with more than one Origin or Sec-Fetch-Site header are not accepted."},
+                    status_code=403,
+                )
             origin = request.headers.get("origin")
             expected = os.getenv("FOUNDRY_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
             if origin and origin != expected:
@@ -127,15 +233,22 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
                     return JSONResponse({"detail": "Request exceeds the 2 MB limit."}, status_code=413)
                 chunks.append(chunk)
             request._body = b"".join(chunks)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        return await call_next(request)
+
+    # Added last, so it wraps the boundary checks and the host check: their refusals carry the
+    # security headers too.
+    app.add_middleware(SecurityHeaders)
+
+    @app.exception_handler(Exception)
+    async def server_error(request, exc):
+        # Starlette sends unhandled errors from its outermost error middleware, outside
+        # SecurityHeaders, so this response sets the headers itself. The exception is still
+        # re-raised to the server for logging; no exception text reaches the client.
+        return JSONResponse(
+            {"detail": "The server could not complete this request."},
+            status_code=500,
+            headers=SECURITY_HEADERS,
         )
-        response.headers["Cache-Control"] = "no-store"
-        return response
 
     def actor(request: Request):
         auth = request.headers.get("authorization", "")

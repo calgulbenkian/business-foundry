@@ -25,12 +25,21 @@ class Advice(Model):
     unknowns: list[str] = Field(max_length=30)
 
 
+MAX_DAILY_CALLS = 100_000
+
+
 def daily_call_limit():
-    """Read FOUNDRY_AI_DAILY_CALLS strictly; a malformed limit fails closed rather than crashing."""
+    """Read FOUNDRY_AI_DAILY_CALLS strictly; a malformed limit fails closed rather than crashing.
+
+    After surrounding whitespace is removed, the value must be ``0`` or a run of ASCII digits
+    with no leading zero, and at most MAX_DAILY_CALLS. The length is bounded before conversion,
+    so no value reaches Python's long-integer conversion limit.
+    """
     raw = os.getenv("FOUNDRY_AI_DAILY_CALLS", "20").strip()
-    if not re.fullmatch(r"[0-9]+", raw):
+    if not re.fullmatch(r"0|[1-9][0-9]{0,5}", raw) or int(raw) > MAX_DAILY_CALLS:
         raise DomainError(
-            "FOUNDRY_AI_DAILY_CALLS on the server must be a whole number of 0 or greater "
+            "FOUNDRY_AI_DAILY_CALLS on the server must be a whole number of 0 or greater and at most "
+            f"{MAX_DAILY_CALLS}, written in plain ASCII digits with no sign, separator, exponent or leading zero "
             "(for example 20); AI reviews are disabled until it is corrected.",
             503,
         )
