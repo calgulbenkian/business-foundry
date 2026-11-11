@@ -142,6 +142,14 @@ async function main() {
     await page.getByLabel('Forecast months', { exact: true }).fill('12');
     await submit('Calculate and save');
     await page.getByText('All three statements balance.', { exact: false }).waitFor();
+    await page.getByRole('button', { name: '+ New version', exact: true }).click();
+    await page.getByLabel('Version name').fill('Browser retention forecast');
+    await page.getByLabel('Monthly unit retention', { exact: true }).fill('0.5');
+    await page.getByLabel('Monthly fixed-cost step', { exact: true }).fill('500');
+    await page.getByLabel('Fixed-cost step start month', { exact: true }).fill('2');
+    await submit('Calculate and save');
+    await page.getByText('2 saved versions', { exact: false }).waitFor();
+    await page.getByText('All three statements balance.', { exact: false }).waitFor();
     await nav('Acquisitions');
     await page.getByRole('button', { name: '+ Analyze a business', exact: true }).click();
     await page.getByLabel('Target business', { exact: true }).fill('Browser synthetic target');

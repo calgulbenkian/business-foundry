@@ -559,6 +559,9 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     assert table_rows(plan, "| Revenue ") == ["Revenue", "6,000.00"]
     assert table_rows(plan, "| Cash  ") == ["Cash", "5,200.00"]
     assert table_rows(plan, "| Monthly growth ") == ["Monthly growth", "0.00%"]
+    assert table_rows(plan, "| Monthly unit retention ") == ["Monthly unit retention", "0.00%"]
+    assert table_rows(plan, "| Fixed-cost step per month ") == ["Fixed-cost step per month", "0.00"]
+    assert table_rows(plan, "| Fixed-cost step start month ") == ["Fixed-cost step start month", "None"]
     assert "| ---------------------- | " in plan and "-------: |" in plan
     assert table_rows(plan, "| Base     |")[1].startswith("Not available — needs at least 12 months")
     assert "DCF basis:" not in plan
@@ -604,6 +607,15 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     del plan_obj["data"]["inputs"]["excess_cash"]
     _, legacy_plan = render_document("business_plan", legacy)
     assert "| Excess cash" not in legacy_plan and "| Discount rate" in legacy_plan
+    v1_plan = copy.deepcopy(snapshot)
+    v1_obj = next(o for o in v1_plan["objects"] if o["kind"] == "financial_plan")
+    v1_obj["data"]["model_version"] = "1.0.0"
+    for field in ("monthly_retention", "fixed_cost_step", "fixed_cost_step_month"):
+        del v1_obj["data"]["inputs"][field]
+    _, v1_content = render_document("business_plan", v1_plan)
+    assert "| Monthly unit retention" not in v1_content
+    assert "| Fixed-cost step" not in v1_content
+    assert table_rows(v1_content, "| Monthly growth ") == ["Monthly growth", "0.00%"]
 
     s.review_evidence(
         a,
@@ -615,6 +627,27 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     )
     stale_memo = generate("investment_memo", deal["id"])
     assert "WARNING: Supporting evidence has changed since this deal analysis was saved." in stale_memo
+
+
+def test_business_plan_renders_retention_and_fixed_cost_step_inputs(setup):
+    _, s, a, bid, _ = setup
+    inputs = dict(
+        months=3,
+        monthly_units=10,
+        unit_price=100,
+        monthly_growth=0,
+        monthly_retention="0.5",
+        fixed_costs=100,
+        fixed_cost_step=50,
+        fixed_cost_step_month=2,
+    )
+    s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Step plan", inputs=inputs))
+    doc = s.generate_document(a, bid, key(), dump(models.DocumentCreate, template="business_plan"))
+    plan = doc["data"]["content"]
+    assert table_rows(plan, "| Monthly unit retention ") == ["Monthly unit retention", "50.00%"]
+    assert table_rows(plan, "| Fixed-cost step per month ") == ["Fixed-cost step per month", "50.00"]
+    assert table_rows(plan, "| Fixed-cost step start month ") == ["Fixed-cost step start month", "Month 2"]
+    assert any("Monthly retention carries" in line for line in plan.splitlines())
 
 
 def test_maximum_bound_forecast_generates_business_plan(setup):

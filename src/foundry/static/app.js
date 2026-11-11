@@ -770,7 +770,10 @@ const financeFields = [
   ['unit_price', 'Price per unit', 2000],
   ['unit_cost', 'Cost per unit', 300],
   ['monthly_growth', 'Monthly unit growth', 0.03],
+  ['monthly_retention', 'Monthly unit retention', 0],
   ['fixed_costs', 'Monthly fixed costs', 6000],
+  ['fixed_cost_step', 'Monthly fixed-cost step', 0],
+  ['fixed_cost_step_month', 'Fixed-cost step start month', ''],
   ['receivable_days', 'Collection delay (days)', 30],
   ['monthly_capex', 'Monthly capital spending', 0],
   ['asset_life_months', 'Asset life (months)', 36],
@@ -789,22 +792,38 @@ function forecastDialog() {
       evidenceSelect() +
       financeFields
         .map(([k, t, v]) =>
-          input(
-            k,
-            t,
-            p[k] ?? v,
-            'number',
-            k.includes('rate') || k.includes('growth') ? 'Decimal rate: 0.20 means 20%.' : '',
-            'step="any" required',
-          ),
+          k === 'fixed_cost_step_month'
+            ? input(
+                k,
+                t,
+                p[k] ?? v,
+                'number',
+                'Optional month (1–60) when fixed-cost step begins.',
+                'min="1" max="60" step="1"',
+              )
+            : input(
+                k,
+                t,
+                p[k] ?? v,
+                'number',
+                k.includes('rate') || k.includes('growth') || k.includes('retention')
+                  ? 'Decimal rate: 0.20 means 20%.'
+                  : '',
+                'step="any" required',
+              ),
         )
         .join(''),
     async (f, key) => {
       const inputs = {};
-      for (const [k] of financeFields)
-        inputs[k] = ['months', 'receivable_days', 'asset_life_months'].includes(k)
-          ? Number(f.get(k))
-          : f.get(k);
+      for (const [k] of financeFields) {
+        if (k === 'fixed_cost_step_month') {
+          const raw = String(f.get(k) ?? '').trim();
+          inputs[k] = raw === '' ? null : Number(raw);
+        } else
+          inputs[k] = ['months', 'receivable_days', 'asset_life_months'].includes(k)
+            ? Number(f.get(k))
+            : f.get(k);
+      }
       await post(
         '/forecasts',
         { title: f.get('title'), inputs, evidence_ids: f.getAll('evidence_ids') },
