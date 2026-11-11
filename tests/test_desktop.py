@@ -136,6 +136,70 @@ def test_mount_points_with_escaped_characters_are_matched():
         assert desktop._linux_filesystem(Path(path), mounts) == kind, repr(path)
 
 
+@pytest.mark.parametrize(
+    ("point", "path"),
+    [
+        (r"/mnt/a\043b", "/mnt/a#b/data"),
+        ("/mnt/a\u00a0b", "/mnt/a\u00a0b/data"),  # no-break space
+        # ideographic space, in a Japanese name
+        ("/mnt/\u5171\u6709\u3000\u30c7\u30fc\u30bf", "/mnt/\u5171\u6709\u3000\u30c7\u30fc\u30bf/data"),
+        ("/mnt/a\u2028b", "/mnt/a\u2028b/data"),  # line separator
+        ("/mnt/a\u000cb", "/mnt/a\u000cb/data"),  # form feed
+        ("/mnt/a\u0085b", "/mnt/a\u0085b/data"),  # next line
+    ],
+)
+def test_mount_points_are_split_and_decoded_the_way_the_kernel_writes_them(point, path):
+    # Only "\n" ends a line and only an ASCII space or tab separates fields; any other character
+    # is part of the name, and any \ooo escape is decoded.
+    mounts = f"/dev/sda1 / ext4 rw 0 0\n//srv/share {point} cifs rw 0 0\n"
+    assert desktop._linux_filesystem(Path(path), mounts) == "cifs"
+
+
+def test_every_octal_escape_in_a_mount_point_is_decoded():
+    mounts = "\n".join(
+        [
+            "/dev/sda1 / ext4 rw 0 0",
+            r"//nas/a /mnt/a\040b\011c\012d\134e\043f cifs rw 0 0",  # several kinds at once
+            r"//nas/b /mnt/hash\043tag nfs rw 0 0",  # a character outside space, tab, newline, \
+            r"//nas/c /mnt/short\04 smb3 rw 0 0",  # a backslash with only two digits after it
+            r"//nas/d /mnt/caf\303\251 nfs4 rw 0 0",  # escaped UTF-8 bytes of one character
+        ]
+    )
+    expected = {
+        "/mnt/a b\tc\nd\\e#f/data": "cifs",
+        "/mnt/hash#tag/data": "nfs",
+        "/mnt/short\\04/data": "smb3",
+        "/mnt/caf\u00e9/data": "nfs4",
+    }
+    for path, kind in expected.items():
+        assert desktop._linux_filesystem(Path(path), mounts) == kind, repr(path)
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u0085"])  # line separator, next line
+def test_a_line_after_a_unicode_line_separator_is_still_read(separator):
+    # The second line is one local mount whose name contains the separator, and whose second
+    # half (with no-break spaces in it) looks like a line of its own. Read as one line, it does
+    # not cover /mnt/nas/data, so the network line after it still decides.
+    tail = "\u00a0".join(["x", "/mnt/nas/data", "ext4"])
+    mounts = "\n".join(
+        [
+            "/dev/sda1 / ext4 rw 0 0",
+            f"/dev/sdb1 /mnt/notes{separator}{tail} ext4 rw 0 0",
+            f"//nas/notes /mnt/team{separator}share smb3 rw 0 0",
+            "//nas/share /mnt/nas cifs rw 0 0",
+        ]
+    )
+    assert desktop._linux_filesystem(Path("/mnt/nas/data"), mounts) == "cifs"
+    assert desktop._linux_filesystem(Path(f"/mnt/team{separator}share/data"), mounts) == "smb3"
+    assert desktop._linux_filesystem(Path(f"/mnt/notes{separator}{tail}/db"), mounts) == "ext4"
+
+
+def test_a_tab_between_fields_separates_them():
+    mounts = "/dev/sda1\t/\text4 rw 0 0\n//nas/share\t/mnt/nas\tcifs\trw 0 0\n"
+    assert desktop._linux_filesystem(Path("/mnt/nas/data"), mounts) == "cifs"
+    assert desktop._linux_filesystem(Path("/home/founder"), mounts) == "ext4"
+
+
 def test_the_linux_check_reads_the_mount_table_as_bytes(tmp_path, monkeypatch):
     # A mount point that is not valid UTF-8 must not stop the check, and the data folder's own
     # network mount is still found.

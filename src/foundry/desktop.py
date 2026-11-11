@@ -189,22 +189,29 @@ def _mac_filesystem(path: Path) -> tuple[str, bool]:
     return result.f_fstypename.decode(errors="replace"), bool(result.f_flags & MNT_LOCAL)
 
 
-# /proc/self/mounts writes these four characters of a mount point as octal escapes.
-_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
-_MOUNT_ESCAPE = re.compile(r"\\(040|011|012|134)")
+# /proc/self/mounts ends each line with "\n" only and separates its fields with an ASCII space
+# (a tab is accepted too); no other character ends a line or a field.
+# Inside a field the kernel writes a byte as a backslash and three octal digits (a space as
+# \040, a tab as \011, a newline as \012, a backslash as \134, "#" as \043 on current kernels).
+# Every such escape that names a byte (\000 to \377) is decoded, as util-linux does; a backslash
+# without three octal digits after it is kept as it is. Escapes stand for bytes, so they are
+# decoded on the field's bytes, which are then decoded the way the path being compared is.
+_MOUNT_ESCAPES = re.compile(rb"\\([0-3][0-7][0-7])")
+_MOUNT_FIELDS = re.compile(r"[^ \t]+")
 
 
 def _mount_point(field: str) -> str:
     """Decode a mount point field in one pass, so that an escaped backslash followed by digits
     (``\\134040``) stays a backslash followed by digits instead of becoming a space."""
-    return _MOUNT_ESCAPE.sub(lambda match: _MOUNT_ESCAPES[match.group(1)], field)
+    raw = _MOUNT_ESCAPES.sub(lambda match: bytes([int(match.group(1), 8)]), os.fsencode(field))
+    return os.fsdecode(raw)
 
 
 def _linux_filesystem(path: Path, mounts: str) -> str:
     best, kind = "", ""
     target = str(path)
-    for line in mounts.splitlines():
-        fields = line.split()
+    for line in mounts.split("\n"):
+        fields = _MOUNT_FIELDS.findall(line)
         if len(fields) < 3:
             continue
         point = _mount_point(fields[1])
