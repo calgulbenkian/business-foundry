@@ -32,12 +32,19 @@ def _forecast(a: ForecastInputs, volume_factor=ONE, fixed_factor=ONE):
         for index in range(a.months):
             month = index + 1
             new_units = a.monthly_units * volume_factor * (1 + a.monthly_growth) ** index
-            units = new_units + a.monthly_retention * prior_units
+            # Disabled features add no Decimal operations, so v1.0.0 rounding is preserved exactly.
+            units = (
+                new_units + a.monthly_retention * prior_units
+                if (a.monthly_retention and prior_units)
+                else new_units
+            )
             prior_units = units
-            step_active = a.fixed_cost_step_month is not None and month >= a.fixed_cost_step_month
-            step = a.fixed_cost_step if step_active else ZERO
+            step_active = (
+                a.fixed_cost_step and a.fixed_cost_step_month is not None and month >= a.fixed_cost_step_month
+            )
+            fixed_base = a.fixed_costs + a.fixed_cost_step if step_active else a.fixed_costs
             revenue = units * a.unit_price
-            cogs, fixed = units * a.unit_cost, (a.fixed_costs + step) * fixed_factor
+            cogs, fixed = units * a.unit_cost, fixed_base * fixed_factor
             revenues.append(revenue)
 
             def billed(i):

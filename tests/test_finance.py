@@ -186,6 +186,22 @@ def test_default_neutrality_preserves_v1_rounding_tie_breaks():
     assert base["summary"]["ending_cash"] == "106211231444.47"
 
 
+def test_disabled_features_do_not_round_long_operands_before_scenario_factors():
+    long_value = "1.00476190476190476190476190476190476190436"
+    fixed_case = forecast(ForecastInputs(months=1, monthly_units=0, fixed_costs=long_value))
+    upside = fixed_case["scenarios"]["upside"]["months"][0]
+    assert upside["fixed_costs"] == "1.06"
+    assert upside["net_income"] == "-1.06"
+    assert upside["net_cash_flow"] == "-1.06"
+
+    unit_case = forecast(
+        ForecastInputs(
+            months=1, monthly_units=long_value, unit_price=1, unit_cost=0, fixed_costs=0, tax_rate=0
+        )
+    )
+    assert unit_case["scenarios"]["upside"]["months"][0]["revenue"] == "1.26"
+
+
 @pytest.mark.parametrize(
     "changes",
     [
