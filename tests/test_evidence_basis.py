@@ -239,3 +239,121 @@ def test_reopening_withdrawal_keeps_audit_valid_and_replays_idempotently(setup):
     ]
     # Exactly one event per reopened task: structure and its completed dependent.
     assert sorted(e["payload"]["data"]["key"] for e in reopened) == ["registration", "structure"]
+
+
+def rewrite(setup, task, state, data):
+    """Store a task in `state` with hand-written data, bypassing transitions. Ordinary transitions
+    never produce these histories; the cases stand in for older or damaged stored workspaces."""
+    store, _, actor, _, _ = setup
+    with store.write() as con:
+        return store.update(con, task, {**task["data"], **data}, state, actor, task["version"])
+
+
+def incomplete_histories(state, current):
+    """Four stored histories from which the history-derived basis cannot recover `current`."""
+    return {
+        "empty": [],
+        "entries_without_evidence_ids": [
+            {"from": "pending", "to": "prepared", "note": "Synthetic.", "actor_id": "x", "at": "t"},
+            {"from": "prepared", "to": state, "note": "Synthetic.", "actor_id": "x", "at": "t"},
+        ],
+        "missing_preparation": [
+            {"from": "pending", "to": "in_progress", "evidence_ids": [current], "actor_id": "x", "at": "t"},
+            {"from": "in_progress", "to": state, "evidence_ids": [], "actor_id": "x", "at": "t"},
+        ],
+        "only_reopening": [
+            {"from": state, "to": "needs_review", "note": "Synthetic reopen.", "actor_id": "x", "at": "t"},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "shape", ["empty", "entries_without_evidence_ids", "missing_preparation", "only_reopening"]
+)
+@pytest.mark.parametrize("state", ["approved", "submitted", "verified", "not_applicable"])
+def test_currently_attached_evidence_reopens_despite_incomplete_history(setup, state, shape):
+    x = source(setup, "Attached source")
+    t = tasks(setup)["jurisdiction"]
+    assert (t["state"], t["version"]) == ("pending", 1)
+    history = incomplete_histories(state, x["id"])[shape]
+    t = rewrite(setup, t, state, {"evidence_ids": [x["id"]], "history": history})
+    assert (t["state"], t["version"]) == (state, 2)
+    withdraw(setup, x)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Attached source"
+
+
+def test_evidence_from_before_a_manual_reopen_still_reopens_through_a_record(setup):
+    """The earlier-round exclusion covers only the step's own history. Evidence that still supports
+    a record of a kind the step requires reopens it through that record."""
+    _, service, actor, bid, _ = setup
+    a, b = source(setup, "Source A"), source(setup, "Source B")
+    service.add_record(
+        actor,
+        bid,
+        key(),
+        dump(models.RecordCreate, kind="decision", title="Entity decision", evidence_ids=[a["id"]]),
+    )
+    t = move(setup, tasks(setup)["structure"], "prepared", [a])
+    t = move(setup, t, "approved", [a])
+    t = move(setup, t, "verified", [a])
+    t = move(setup, t, "needs_review")
+    t = move(setup, t, "prepared", [b])
+    t = move(setup, t, "approved", [b])
+    t = move(setup, t, "verified", [b])
+    assert (t["state"], t["version"]) == ("verified", 8)
+    withdraw(setup, a)
+    after = tasks(setup)["structure"]
+    assert (after["state"], after["version"]) == ("needs_review", 9)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Source A"
+
+
+def test_withdrawing_preparation_evidence_reopens_step_resting_in_approved(setup):
+    prepared, approval = source(setup, "Preparation source"), source(setup, "Approval source")
+    t = move(setup, tasks(setup)["jurisdiction"], "prepared", [prepared])
+    t = move(setup, t, "approved", [approval])
+    assert (t["state"], t["version"]) == ("approved", 3)
+    withdraw(setup, prepared)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 4)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Preparation source"
+
+
+def test_withdrawing_approval_evidence_reopens_step_resting_in_submitted(setup):
+    finish_structure(setup, source(setup, "Structure decision"))
+    draft = source(setup, "Registration draft")
+    filed = source(setup, "Filing receipt", "external_receipt")
+    t = move(setup, tasks(setup)["registration"], "prepared", [draft])
+    t = move(setup, t, "approved", [draft])
+    t = move(setup, t, "submitted", [filed])
+    assert (t["state"], t["version"]) == ("submitted", 4)
+    withdraw(setup, draft)
+    after = tasks(setup)["registration"]
+    assert (after["state"], after["version"]) == ("needs_review", 5)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Registration draft"
+
+
+def test_preparation_citing_no_evidence_keeps_later_evidence_in_the_basis(setup):
+    approval, check = source(setup, "Approval source"), source(setup, "Verification source")
+    t = move(setup, tasks(setup)["jurisdiction"], "prepared")
+    assert t["data"]["history"][-1]["evidence_ids"] == []
+    t = move(setup, t, "approved", [approval])
+    t = move(setup, t, "verified", [check])
+    assert (t["state"], t["version"]) == ("verified", 4)
+    withdraw(setup, approval)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 5)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Approval source"
+
+
+def test_preparation_citing_no_evidence_replaces_earlier_citations(setup):
+    early, check = source(setup, "Early source"), source(setup, "Verification source")
+    t = move(setup, tasks(setup)["jurisdiction"], "in_progress", [early])
+    t = move(setup, t, "prepared")
+    t = move(setup, t, "approved", [check])
+    t = move(setup, t, "verified", [check])
+    assert (t["state"], t["version"]) == ("verified", 5)
+    withdraw(setup, early)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("verified", 5)

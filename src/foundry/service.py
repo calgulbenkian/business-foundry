@@ -227,9 +227,12 @@ class Service:
             for obj in self.store.objects(con, bid):
                 data = obj["data"]
                 if obj["kind"] == "task" and obj["state"] in COMPLETED:
-                    # A completed task relies on everything cited since its latest preparation, not
-                    # only the evidence attached at its most recent transition.
-                    refs = list(evidence_basis(data.get("history", [])))
+                    # A completed task relies on its currently attached evidence and on everything
+                    # cited since its latest preparation. The current ids always count, so a task
+                    # whose stored history is missing or incomplete reopens at least as before.
+                    refs = list(data.get("evidence_ids", [])) + sorted(
+                        evidence_basis(data.get("history", []))
+                    )
                 else:
                     refs = data.get("evidence_ids", [])
                 refs = refs + [
