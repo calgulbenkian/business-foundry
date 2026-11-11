@@ -30,6 +30,32 @@ def read_json(value, encoding="utf-8"):
         return None
 
 
+def stored_literal(storage, value, encoding="utf-8"):
+    """Show a stored TEXT, BLOB or NULL value in an error message, as an SQLite literal.
+
+    ``storage`` is the value's typeof() and ``value`` is it as fetched, TEXT as its bytes in
+    ``encoding``. NULL is ``NULL`` and a BLOB is ``X'<hex>'``. TEXT that decodes strictly in
+    ``encoding`` to printable ASCII is quoted, ``'two'``, quotes doubled, while the quoted form
+    is at most 34 characters; any other TEXT is ``CAST(X'<hex>' AS TEXT)`` of its bytes. Hex
+    shows at most the first 16 bytes, then ``...``. The result is always printable ASCII of
+    at most 52 characters, holds no undecoded byte, and when not cut short selects the same
+    value in SQL.
+    """
+    if value is None:
+        return "NULL"
+    if storage == "text":
+        try:
+            text = value.decode(encoding)
+        except UNREADABLE:
+            text = None
+        if text is not None and all(" " <= c <= "~" for c in text):
+            quoted = "'" + text.replace("'", "''") + "'"
+            if len(quoted) <= 34:
+                return quoted
+    shown = "X'" + value[:16].hex().upper() + ("..." if len(value) > 16 else "") + "'"
+    return f"CAST({shown} AS TEXT)" if storage == "text" else shown
+
+
 def same_json(stored, recorded):
     """Equal by JSON type and value: false and 0, true and 1, 1 and 1.0 are different.
 
@@ -680,10 +706,19 @@ class Service:
         business record itself is versioned through events only and never has revisions.
         Revisions carry no business id, so rows are attributed to this business through
         its current objects and the object ids named by its events, in one query.
+
+        A version stored as INTEGER or REAL is used as fetched. A TEXT version is selected as
+        its bytes, since sqlite3 raises while fetching TEXT that is not valid UTF-8; a TEXT,
+        BLOB or NULL version matches no chained event and is shown by stored_literal(). The
+        object_id column is fetched as is: a row is only selected when its object_id equals
+        this business's id or an id in its objects or events, so it holds the same text as
+        that id, or a number whose text it is, and fails to decode only if that id does.
         """
         errors = []
         rows = con.execute(
-            "SELECT object_id,version,CAST(snapshot AS BLOB) AS snapshot FROM revisions WHERE object_id=? "
+            "SELECT object_id,typeof(version) AS version_type,"
+            "CASE typeof(version) WHEN 'text' THEN CAST(version AS BLOB) ELSE version END AS stored_version,"
+            "CAST(snapshot AS BLOB) AS snapshot FROM revisions WHERE object_id=? "
             "OR object_id IN (SELECT id FROM objects WHERE business_id=?) "
             "OR object_id IN (SELECT object_id FROM events WHERE business_id=?) "
             "ORDER BY object_id,version",
@@ -691,12 +726,16 @@ class Service:
         ).fetchall()
         stored = {}
         for row in rows:
-            oid, version = row["object_id"], row["version"]
-            stored[(oid, version)] = True
+            oid, version = row["object_id"], row["stored_version"]
+            numeric = row["version_type"] in {"integer", "real"}
+            if numeric:
+                stored[(oid, version)] = True
+            else:
+                version = stored_literal(row["version_type"], version, encoding)
             if oid == bid:
                 errors.append(f"Unexpected revision for business record: {oid} version {version}")
                 continue
-            event = recorded.get((oid, version))
+            event = recorded.get((oid, version)) if numeric else None
             if event is None:
                 errors.append(f"Revision has no recorded history: {oid} version {version}")
                 continue

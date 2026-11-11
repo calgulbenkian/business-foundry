@@ -432,23 +432,39 @@ def test_tampered_business_does_not_affect_another_business(setup, tamper):
 # with SQL expressions and their storage class is checked before the audit runs.
 
 
-def untyped_snapshot_column(store):
-    """Rewrite the revisions schema so snapshot has no type affinity and accepts NULL.
+REVISION_COLUMNS = {
+    "object_id": "TEXT",
+    "version": "INTEGER",
+    "snapshot": "TEXT",
+    "actor_id": "TEXT",
+    "created_at": "TEXT",
+}
 
-    With the shipped schema (snapshot TEXT NOT NULL) an INTEGER or REAL is stored as TEXT
-    and NULL is refused, so INTEGER, REAL and NULL storage only exist after a rewrite.
+
+def untyped_column(store, column):
+    """Rewrite the revisions schema so one column has no type affinity and accepts NULL.
+
+    With the shipped schema (every column declared with a type and NOT NULL) a TEXT column
+    stores an INTEGER or REAL as TEXT, the INTEGER version column stores numeric TEXT as a
+    number, and NULL is refused, so those storage classes only exist after a rewrite.
     """
+    declared = f"{column} {REVISION_COLUMNS[column]} NOT NULL"
     con = sqlite3.connect(store.path, isolation_level=None)
     try:
         con.execute("PRAGMA writable_schema=ON")
         changed = con.execute(
-            "UPDATE sqlite_schema SET sql=replace(sql,'snapshot TEXT NOT NULL','snapshot') "
-            "WHERE type='table' AND name='revisions'"
+            "UPDATE sqlite_schema SET sql=replace(sql,?,?) WHERE type='table' AND name='revisions' "
+            "AND instr(sql,?)",
+            (declared, column, declared),
         ).rowcount
         con.execute("PRAGMA writable_schema=OFF")
     finally:
         con.close()
     assert changed == 1
+
+
+def untyped_snapshot_column(store):
+    untyped_column(store, "snapshot")
 
 
 def test_shipped_schema_stores_numbers_as_text_and_refuses_null(setup):
@@ -660,3 +676,219 @@ def test_read_json_reads_utf8_bytes_and_text_alike():
     assert read_json('{"a": [1, 2.5, true]}') == {"a": [1, 2.5, True]}
     assert read_json('{"a":"é"}'.encode()) == {"a": "é"}
     assert read_json('{"a":"é"}'.encode("utf-16-le"), "UTF-16le") == {"a": "é"}
+
+
+# Revision versions that are not integers. A TEXT version that is not valid UTF-8 could not be
+# fetched by sqlite3 at all; a TEXT, BLOB or NULL version matches no chained event and is shown
+# as an SQLite literal, so the message stays printable ASCII.
+
+INVALID_UTF8_VERSIONS = [
+    pytest.param("CAST(X'FF7B' AS TEXT)", id="invalid-utf8-text"),
+    pytest.param("CAST(X'EDA080' AS TEXT)", id="lone-surrogate-utf8-text"),
+]
+
+
+def store_version(store, object_id, version, expression):
+    with store.write() as con:
+        changed = con.execute(
+            f"UPDATE revisions SET version={expression} WHERE object_id=? AND version=?",
+            (object_id, version),
+        ).rowcount
+        stored = con.execute(
+            f"SELECT typeof(version) FROM revisions WHERE object_id=? AND version={expression}",
+            (object_id,),
+        ).fetchone()[0]
+    assert changed == 1
+    assert stored == "text"
+
+
+def test_invalid_utf8_text_version_could_not_be_fetched_by_sqlite3(setup):
+    # The failure this change avoids: fetching the version column itself raises in sqlite3.
+    store = setup[0]
+    item = history(setup)
+    store_version(store, item["id"], 1, "CAST(X'FF7B' AS TEXT)")
+    with store.read() as con, pytest.raises(sqlite3.OperationalError, match="UTF-8"):
+        con.execute("SELECT version FROM revisions WHERE object_id=?", (item["id"],)).fetchall()
+
+
+def test_invalid_utf8_text_current_version_is_reported_without_raising(setup):
+    store = setup[0]
+    item = history(setup)
+    store_version(store, item["id"], 3, "CAST(X'FF7B' AS TEXT)")
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision mismatch: {item['id']}",
+        f"Revision has no recorded history: {item['id']} version CAST(X'FF7B' AS TEXT)",
+        f"Historical revision missing: {item['id']} version 3",
+    ]
+
+
+def test_invalid_utf8_text_historical_version_is_reported_without_raising(setup):
+    store = setup[0]
+    item = history(setup)
+    store_version(store, item["id"], 1, "CAST(X'FF7B' AS TEXT)")
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision has no recorded history: {item['id']} version CAST(X'FF7B' AS TEXT)",
+        f"Historical revision missing: {item['id']} version 1",
+    ]
+
+
+def test_lone_surrogate_text_current_version_is_reported_without_raising(setup):
+    store = setup[0]
+    item = history(setup)
+    store_version(store, item["id"], 3, "CAST(X'EDA080' AS TEXT)")
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision mismatch: {item['id']}",
+        f"Revision has no recorded history: {item['id']} version CAST(X'EDA080' AS TEXT)",
+        f"Historical revision missing: {item['id']} version 3",
+    ]
+
+
+def test_lone_surrogate_text_historical_version_is_reported_without_raising(setup):
+    store = setup[0]
+    item = history(setup)
+    store_version(store, item["id"], 1, "CAST(X'EDA080' AS TEXT)")
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision has no recorded history: {item['id']} version CAST(X'EDA080' AS TEXT)",
+        f"Historical revision missing: {item['id']} version 1",
+    ]
+
+
+@pytest.mark.parametrize("expression", INVALID_UTF8_VERSIONS)
+def test_invalid_utf8_text_version_under_untyped_schema_is_reported_without_raising(setup, expression):
+    store = setup[0]
+    item = history(setup)
+    untyped_column(store, "version")
+    store_version(store, item["id"], 2, expression)
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision has no recorded history: {item['id']} version {expression}",
+        f"Historical revision missing: {item['id']} version 2",
+    ]
+
+
+def test_version_text_is_shown_short_and_printable(setup):
+    store = setup[0]
+    item = history(setup, versions=4)
+    long_word = "'" + "a" * 40 + "'"
+    long_blob = "X'" + "AB" * 20 + "'"
+    for version, expression in [(1, "'it''s'"), (2, long_word), (3, long_blob)]:
+        with store.write() as con:
+            con.execute(
+                f"UPDATE revisions SET version={expression} WHERE object_id=? AND version=?",
+                (item["id"], version),
+            )
+    result = integrity(setup)
+    # Rows are read in stored version order: TEXT bytewise, then BLOB.
+    assert result["record_errors"] == [
+        f"Revision has no recorded history: {item['id']} version "
+        "CAST(X'61616161616161616161616161616161...' AS TEXT)",
+        f"Revision has no recorded history: {item['id']} version 'it''s'",
+        f"Revision has no recorded history: {item['id']} version X'ABABABABABABABABABABABABABABABAB...'",
+        f"Historical revision missing: {item['id']} version 1",
+        f"Historical revision missing: {item['id']} version 2",
+        f"Historical revision missing: {item['id']} version 3",
+    ]
+
+
+# One damaged column of one revision row, in each SQLite storage class. The column's declared
+# type and NOT NULL are dropped only when the shipped schema would convert or refuse the value.
+
+STORED_VALUES = [
+    # expression, storage class, how the value is shown when stored as a version
+    pytest.param("CAST(X'FF7B' AS TEXT)", "text", "CAST(X'FF7B' AS TEXT)", id="invalid-utf8-text"),
+    pytest.param("CAST(X'EDA080' AS TEXT)", "text", "CAST(X'EDA080' AS TEXT)", id="lone-surrogate-text"),
+    pytest.param("CAST(X'00' AS TEXT)", "text", "CAST(X'00' AS TEXT)", id="nul-text"),
+    pytest.param("X'FF7B'", "blob", "X'FF7B'", id="blob"),
+    pytest.param("X''", "blob", "X''", id="empty-blob"),
+    pytest.param("''", "text", "''", id="empty-text"),
+    pytest.param("'word'", "text", "'word'", id="word"),
+    pytest.param("5", "integer", "5", id="integer"),
+    pytest.param("9223372036854775807", "integer", "9223372036854775807", id="integer-maximum"),
+    pytest.param("-1", "integer", "-1", id="negative-integer"),
+    pytest.param("2.5", "real", "2.5", id="real"),
+    pytest.param("9e999", "real", "inf", id="real-infinity"),
+    pytest.param("NULL", "null", "NULL", id="null"),
+]
+
+
+def store_in_storage_class(store, column, object_id, version, expression, storage):
+    with store.read() as con:
+        rowid = con.execute(
+            "SELECT rowid FROM revisions WHERE object_id=? AND version=?", (object_id, version)
+        ).fetchone()[0]
+    update = f"UPDATE revisions SET {column}={expression} WHERE rowid=?"
+    held = f"SELECT typeof({column}) FROM revisions WHERE rowid=?"
+    con = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute(update, (rowid,))
+            fits = con.execute(held, (rowid,)).fetchone()[0] == storage
+        except sqlite3.IntegrityError:
+            fits = False
+        con.execute("COMMIT" if fits else "ROLLBACK")
+    finally:
+        con.close()
+    if not fits:
+        untyped_column(store, column)
+        with store.write() as con:
+            assert con.execute(update, (rowid,)).rowcount == 1
+    with store.read() as con:
+        assert con.execute(held, (rowid,)).fetchone()[0] == storage
+
+
+def second_business(setup):
+    store, service, actor, _, _ = setup
+    other = service.create_business(
+        actor,
+        key(),
+        models.BusinessCreate(name="Second business", concept="Another synthetic business.").model_dump(
+            mode="json"
+        ),
+    )
+    item = service.add_record(actor, other["id"], key(), record(title="Other buyer"))
+    revise(service, actor, other["id"], item, "Other buyer revision 2")
+    return other["id"]
+
+
+@pytest.mark.parametrize("version", [pytest.param(3, id="current"), pytest.param(1, id="historical")])
+@pytest.mark.parametrize(("expression", "storage", "shown"), STORED_VALUES)
+@pytest.mark.parametrize("column", list(REVISION_COLUMNS))
+def test_any_value_in_any_revision_column_is_reported_without_raising(
+    setup, column, expression, storage, shown, version
+):
+    store, service, actor, _, _ = setup
+    other = second_business(setup)
+    item = history(setup)
+    store_in_storage_class(store, column, item["id"], version, expression, storage)
+    result = integrity(setup)
+    oid = item["id"]
+    current = [f"Revision mismatch: {oid}"] if version == 3 else []
+    expected = {
+        "snapshot": current + [f"Historical revision differs from history: {oid} version {version}"],
+        "version": current
+        + [
+            f"Revision has no recorded history: {oid} version {shown}",
+            f"Historical revision missing: {oid} version {version}",
+        ],
+        # The row no longer names this object, so it is not attributed to this business.
+        "object_id": current + [f"Historical revision missing: {oid} version {version}"],
+        # Documented limit (docs/ARCHITECTURE.md, Integrity and recovery): the actor_id and
+        # created_at columns of a revision row are not compared with anything.
+        "actor_id": [],
+        "created_at": [],
+    }[column]
+    assert result["record_errors"] == expected
+    assert result["valid"] is (column in {"actor_id", "created_at"})
+    other_result = service.audit(actor, other)["integrity"]
+    assert other_result["valid"], other_result["record_errors"]
+    assert other_result["record_errors"] == []
