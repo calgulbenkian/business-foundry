@@ -10,12 +10,50 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import catalog, models
 from .ai import Adviser
 from .service import Service
 from .store import DomainError, Store, digest
+
+LOCATION_ROOTS = {"body", "query", "path", "header", "cookie"}
+
+
+def defined_names():
+    names = set(LOCATION_ROOTS)
+    for value in vars(models).values():
+        if isinstance(value, type) and issubclass(value, BaseModel):
+            for name, field in value.model_fields.items():
+                names.add(name)
+                if field.alias:
+                    names.add(field.alias)
+    return names
+
+
+DEFINED_NAMES = defined_names()
+
+
+def validation_message(error):
+    """Describe a validation error by locations the application defines, never by client input.
+
+    The location is cut at the first segment that is not an application-defined field name
+    (for example a client-chosen dictionary key or an unexpected property), so client-invented
+    names are never echoed. List positions are kept.
+    """
+    loc = list(error.get("loc", ()))
+    extra = error.get("type") == "extra_forbidden"
+    if extra:
+        loc = loc[:-1]
+    kept = []
+    for part in loc:
+        if isinstance(part, int) or (isinstance(part, str) and part in DEFINED_NAMES):
+            kept.append(str(part))
+        else:
+            break
+    where = ".".join(kept) or "request"
+    return where + ": " + ("an unexpected field was sent" if extra else error["msg"])
 
 
 def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
@@ -25,7 +63,9 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
         FastAPI(
             title="Business Foundry",
             version="0.1.0",
-            docs_url="/api/docs",
+            # The Swagger page needs third-party scripts and an inline script, which the
+            # content security policy forbids; publish the schema only.
+            docs_url=None,
             openapi_url="/api/openapi.json",
             redoc_url=None,
         ),
@@ -43,10 +83,13 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
         # Do not echo submitted credentials, evidence text, or other request bodies into errors.
-        return JSONResponse(
-            {"detail": "; ".join(".".join(str(x) for x in e["loc"]) + ": " + e["msg"] for e in exc.errors())},
-            status_code=422,
-        )
+        # Values are never included, and neither are names the client invented.
+        messages = []
+        for error in exc.errors():
+            message = validation_message(error)
+            if message not in messages:
+                messages.append(message)
+        return JSONResponse({"detail": "; ".join(messages)}, status_code=422)
 
     @app.middleware("http")
     async def boundaries(request: Request, call_next):
@@ -55,8 +98,27 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
             expected = os.getenv("FOUNDRY_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
             if origin and origin != expected:
                 return JSONResponse({"detail": "Cross-origin writes are not accepted."}, status_code=403)
-            if request.headers.get("sec-fetch-site") == "cross-site":
+            fetch_site = request.headers.get("sec-fetch-site")
+            if fetch_site == "cross-site":
                 return JSONResponse({"detail": "Cross-site writes are not accepted."}, status_code=403)
+            # A cookie is sent by the browser automatically, so a cookie-authenticated write must
+            # carry affirmative same-origin evidence. Bearer callers present their credential
+            # deliberately; sign-in without a session has no cookie to abuse.
+            bearer = request.headers.get("authorization", "").startswith("Bearer ")
+            if (
+                "foundry_session" in request.cookies
+                and not bearer
+                and origin != expected
+                and fetch_site != "same-origin"
+            ):
+                return JSONResponse(
+                    {
+                        "detail": "Browser-session writes must come from this application's own "
+                        "pages (same-origin Origin or Sec-Fetch-Site header). API callers should "
+                        "use Authorization: Bearer."
+                    },
+                    status_code=403,
+                )
             size = 0
             chunks = []
             async for chunk in request.stream():
