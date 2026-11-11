@@ -89,6 +89,15 @@ def _open_quietly(opener, url):
         pass  # The address is already on screen; the person can open it by hand.
 
 
+def _say(text, stream):
+    # A closed or broken output (for example, piped into a program that has exited) must
+    # not stop the server.
+    try:
+        print(text, file=stream, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def _is_terminal(stream):
     try:
         return stream.isatty()
@@ -210,7 +219,7 @@ def start_foundry(
                 await super().startup(sockets=sockets)
                 # The event loop is now serving the bound socket.
                 if self.started and not self.should_exit:
-                    print(block, file=out, flush=True)
+                    _say(block, out)
                     if browser and terminal:
                         threading.Thread(target=_open_quietly, args=(opener, url), daemon=True).start()
                     if on_started:
@@ -229,7 +238,7 @@ def start_foundry(
         except KeyboardInterrupt:
             pass
         if server.started:
-            print(f"\nFoundry has stopped. Your workspace is saved in {db_path.parent}", file=out, flush=True)
+            _say(f"\nFoundry has stopped. Your workspace is saved in {db_path.parent}", out)
         return 0
     except KeyboardInterrupt:
         return 0
