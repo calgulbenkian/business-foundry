@@ -266,7 +266,7 @@ def _payment(principal: Decimal, rate: Decimal, years: int) -> tuple[Decimal, De
 
 
 def _rounded(numerator: Decimal, denominator: Decimal) -> Decimal:
-    # Round once, keeping at least 28 digits and three below the cent, so money() of the result equals the
+    # Round once, keeping at least 28 digits and two below the cent, so money() of the result equals the
     # exact quotient rounded half-even to cents.
     magnitude = numerator.adjusted() - denominator.adjusted() + 2
     digits = max(DEBT_SERVICE_DIGITS, magnitude + 3)
