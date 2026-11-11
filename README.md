@@ -34,7 +34,7 @@ Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `fou
 - Immutable evidence bodies, human review notes, versioned records, optimistic concurrency and idempotent write requests.
 - Linked monthly income statement, cash flow and balance sheet; collection delays, debt, taxes, capex, three scenarios and DCF.
 - Acquisition screening with evidence-supported earnings adjustments, replacement management, valuation ranges, sources and uses, amortizing debt service and downside coverage.
-- Draft business plans, structure decision briefs, contract briefs, operating manuals, readiness reports and investment memos tied to their source versions.
+- Draft business plans, structure decision briefs, contract briefs, operating manuals, readiness reports and investment memos tied to their source versions, written in plain words with machine identifiers kept to a closing reference index. The readiness report audits what needs a person now, what is ready, what is blocked and what is still an assumption.
 - Invoice drafts, recorded issue, partial/full payment reconciliation and duplicate-payment protection.
 - A reviewable event history, local integrity checks, portable JSON exports and consistent database backups/restores.
 - Optional OpenAI reviews with explicit sharing, recorded prompts/results, limits and validated citations; an MCP adapter for compatible AI clients.

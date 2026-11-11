@@ -132,7 +132,7 @@ def financial_section(p, currency) -> list[str]:
     data = p["data"]
     scenarios = data["scenarios"]
     out = [
-        f"Model: {cell(p['title'])} ({p['id']}). Currency: {currency}. "
+        f"Model: {cell(p['title'])}. Currency: {currency}. "
         f"Horizon: {data['inputs']['months']} months. These are forecasts, not booked actuals.",
         "",
         "### Scenario comparison",
@@ -205,7 +205,8 @@ def financial_section(p, currency) -> list[str]:
     out += [f"- {a}" for a in data.get("assumptions", [])]
     out += [
         "",
-        f"Full monthly statements are stored in financial plan {p['id']} (Financial model view and JSON export).",
+        f"Full monthly statements are stored in the financial plan {cell(p['title'])} "
+        "(Financial model view and JSON export; see the reference index).",
         "",
     ]
     return out
@@ -222,7 +223,7 @@ def coverage(value) -> str:
     return "No debt service" if value is None else f"{Decimal(str(value)):.2f}x"
 
 
-def deal_section(deal, snapshot, currency) -> list[str]:
+def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> list[str]:
     a, inp = deal["data"]["analysis"], deal["data"]["inputs"]
     snap_deal = next((o for o in snapshot["objects"] if o["id"] == deal["id"]), None)
     out = []
@@ -238,7 +239,11 @@ def deal_section(deal, snapshot, currency) -> list[str]:
         ["Less: replacement management", fmt_money(inp["replacement_management"]), ""],
     ]
     rows += [
-        [f"Add: {item['label']}", fmt_money(item["amount"]), item.get("evidence_id") or ""]
+        [
+            f"Add: {item['label']}",
+            fmt_money(item["amount"]),
+            evidence_name(item["evidence_id"]) if item.get("evidence_id") else "",
+        ]
         for item in a["accepted_adjustments"]
     ]
     rows.append(["Normalized EBITDA", fmt_money(a["normalized_ebitda"]), ""])
@@ -248,7 +253,12 @@ def deal_section(deal, snapshot, currency) -> list[str]:
         out += fmt_table(
             ["Adjustment", "Amount", "Evidence", "Reason"],
             [
-                [x["label"], fmt_money(x["amount"]), x.get("evidence_id") or "None", x["reason"]]
+                [
+                    x["label"],
+                    fmt_money(x["amount"]),
+                    evidence_name(x["evidence_id"]) if x.get("evidence_id") else "None",
+                    x["reason"],
+                ]
                 for x in a["excluded_adjustments"]
             ],
             {1},
@@ -320,22 +330,399 @@ def deal_section(deal, snapshot, currency) -> list[str]:
     return out
 
 
+def inline(value) -> str:
+    """Make user text safe on one Markdown line: no line breaks, no pipes, no leading heading marker."""
+    text = " ".join(cell(value).split())
+    return "\\" + text if text.startswith("#") else text
+
+
+KIND_LABELS = {
+    "customer": "Customer",
+    "offer": "Offer",
+    "asset": "Resource or right",
+    "contract": "Contract",
+    "obligation": "Obligation",
+    "role": "Role",
+    "entity": "Entity",
+    "person": "Person",
+    "ownership": "Ownership",
+    "decision": "Decision",
+    "risk": "Risk",
+}
+OTHER_KIND_LABELS = {
+    "business": "Business",
+    "task": "Step",
+    "evidence": "Evidence",
+    "financial_plan": "Financial plan",
+    "deal": "Acquisition analysis",
+    "invoice": "Invoice",
+    "payment": "Payment",
+    "document": "Document",
+}
+
+CERTAINTY = {
+    "assumption": "Assumption — a working belief that nobody has confirmed yet.",
+    "reported": "Reported — stated by the business or a source, not yet confirmed against reviewed evidence.",
+    "verified": "Verified — a person confirmed it against reviewed evidence.",
+}
+
+# Step states in the order they are counted. Finished states first, then open work.
+FINISHED_STATES = {"verified": "Verified as done", "not_applicable": "Confirmed not applicable"}
+OPEN_STATES = {
+    "needs_review": "Sent back for review",
+    "submitted": "Submitted, waiting for confirmation",
+    "approved": "Approved, waiting for the next action",
+    "prepared": "Prepared, waiting for approval",
+    "in_progress": "In progress",
+    "pending": "Not started",
+}
+REPLACED_STATE = "superseded"
+READY_STATES = {"pending", "in_progress", "needs_review"}
+
+CHECKLIST_LIMITATION = (
+    "A completed checklist reflects recorded reviews. It does not establish legal compliance, "
+    "commercial viability or an independently audited result."
+)
+
+
+def upper_first(text) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def kind_label(kind) -> str:
+    return KIND_LABELS.get(kind) or OTHER_KIND_LABELS.get(kind) or inline(kind)
+
+
+def state_label(state) -> str:
+    known = FINISHED_STATES.get(state) or OPEN_STATES.get(state)
+    return known or f'In a state this version does not recognise ("{inline(state)}")'
+
+
+def step_class(state) -> str:
+    if state in FINISHED_STATES:
+        return "finished"
+    if state in OPEN_STATES:
+        return "open"
+    return "replaced" if state == REPLACED_STATE else "unknown"
+
+
+def review_standing(evidence) -> str:
+    """Plain-words review standing of one evidence item; None means it is not in the snapshot."""
+    if evidence is None:
+        return "unknown — this evidence is not in the snapshot"
+    review = evidence["data"].get("review") or {}
+    who = inline(review.get("actor_name") or "a reviewer")
+    when = str(review.get("at") or "")[:10]
+    on = f" on {when}" if when else ""
+    if evidence["state"] == "verified":
+        return f"reviewed by {who}{on}"
+    if evidence["state"] == "rejected":
+        return f"rejected on review by {who}{on}"
+    if evidence["state"] == "unverified":
+        return "not yet reviewed"
+    return f'in the unrecognised review state "{inline(evidence["state"])}"'
+
+
+def latest_reopen_reason(task):
+    history = task["data"].get("history")
+    for entry in reversed(history if isinstance(history, list) else []):
+        if isinstance(entry, dict) and entry.get("to") == "needs_review":
+            return entry.get("note") or None
+    return None
+
+
+class Render:
+    """Collects the ids a document mentions so the reference index can trace every one."""
+
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+        self.objects = snapshot["objects"]
+        self.by_id = {o["id"]: o for o in self.objects}
+        self.mentioned = {}
+
+    def mention(self, object_id, kind="evidence"):
+        """Record a mention; kind labels an id that is missing from the snapshot."""
+        self.mentioned.setdefault(object_id, kind)
+        return self.by_id.get(object_id)
+
+    def evidence_name(self, evidence_id) -> str:
+        evidence = self.mention(evidence_id)
+        return evidence["title"] if evidence else "Unknown evidence (not in this snapshot)"
+
+    def step_name(self, task) -> str:
+        self.mention(task["id"])
+        name = inline(task["title"])
+        deal_id = task["data"].get("deal_id")
+        if deal_id:
+            deal = self.mention(deal_id, "deal")
+            name += f" (acquisition: {inline(deal['title'])})" if deal else " (acquisition)"
+        return name
+
+    def record_block(self, o) -> list[str]:
+        self.mention(o["id"])
+        data = o["data"]
+        out = [f"### {inline(o['title'])}", "Certainty: " + CERTAINTY.get(o["state"], inline(o["state"]))]
+        if inline(data.get("details", "")):
+            out.append(inline(data["details"]))
+        out.append(
+            f"Owner: {inline(data.get('owner') or 'Unassigned')}. Due: {inline(data.get('due_date') or 'Not set')}."
+        )
+        evidence_ids = data.get("evidence_ids") or []
+        if not evidence_ids:
+            out.append("Evidence: None attached.")
+        else:
+            out.append("Evidence:")
+            for eid in evidence_ids:
+                evidence = self.mention(eid)
+                name = inline(evidence["title"]) if evidence else "Unknown evidence"
+                out.append(f"- {name}: {review_standing(evidence)}.")
+        return out + [""]
+
+    def reference_index(self) -> list[str]:
+        business = self.snapshot["business"]
+        rows = [[business["data"]["name"], "Business", business["id"], business["version"], "—", "—"]]
+        known = [o for o in self.objects if o["id"] in self.mentioned]
+        missing = [i for i in self.mentioned if i not in self.by_id]
+        for o in known:
+            evidence = o["kind"] == "evidence"
+            rows.append(
+                [
+                    o["title"],
+                    kind_label(o["kind"]),
+                    o["id"],
+                    o["version"],
+                    upper_first(review_standing(o)) if evidence else "—",
+                    (o["data"].get("content_sha256") or "")[:12] or "—" if evidence else "—",
+                ]
+            )
+        for i in missing:
+            kind = self.mentioned[i]
+            review = "Not in this snapshot" if kind == "evidence" else "—"
+            rows.append([f"Unknown {kind_label(kind).lower()}", kind_label(kind), i, "—", review, "—"])
+        return [
+            "## Reference index",
+            "",
+            "Machine identifiers for every item this document mentions, for tracing it back to the workspace.",
+            "",
+            *fmt_table(["Title", "Kind", "Id", "Version", "Evidence review", "Content hash (start)"], rows),
+        ]
+
+
+def step_overview(r, tasks) -> list[str]:
+    """Plain-words counts of steps by state. Replaced steps are listed, never counted."""
+    counted = [t for t in tasks if step_class(t["state"]) != "replaced"]
+    replaced = [t for t in tasks if step_class(t["state"]) == "replaced"]
+    for t in tasks:
+        r.mention(t["id"])
+    out = []
+    if not counted:
+        out.append("No steps are recorded.")
+    else:
+        groups = {
+            c: sum(step_class(t["state"]) == c for t in counted) for c in ("finished", "open", "unknown")
+        }
+        tracked = "1 step is tracked" if len(counted) == 1 else f"{len(counted)} steps are tracked"
+        summary = f"{tracked}: {groups['finished']} finished and {groups['open']} still open"
+        if groups["unknown"]:
+            summary += f", plus {groups['unknown']} in a state this version does not recognise"
+        out += [summary + ".", ""]
+        states = list(FINISHED_STATES) + list(OPEN_STATES)
+        states += sorted({t["state"] for t in counted} - set(states), key=str)
+        for state in states:
+            n = sum(t["state"] == state for t in counted)
+            if n:
+                out.append(f"- {state_label(state)}: {n}")
+    if replaced:
+        out += [
+            "",
+            "Replaced steps (no longer part of this plan): "
+            + "; ".join(r.step_name(t) for t in replaced)
+            + ".",
+        ]
+    return out + [""]
+
+
+def sentence(value) -> str:
+    text = inline(value)
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def needs_first(task) -> str:
+    """A step's blockers in plain words: "Complete: X" names the unfinished step X."""
+    return "; ".join(inline(b.removeprefix("Complete: ")) for b in task["blockers"])
+
+
+def bullets(items, empty) -> list[str]:
+    return [*(f"- {x}" for x in items), ""] if items else [empty, ""]
+
+
+def readiness_audit(r, tasks, currency) -> list[str]:
+    stats = r.snapshot.get("stats") or {}
+    out = ["## Where things stand", ""] + step_overview(r, tasks)
+
+    def of(*states):
+        return [t for t in tasks if t["state"] in states]
+
+    waiting = [o for o in r.objects if o["kind"] == "evidence" and o["state"] == "unverified"]
+    for e in waiting:
+        r.mention(e["id"])
+    out += ["## What needs a person now", "", "### Evidence waiting for review", ""]
+    out += bullets([inline(e["title"]) for e in waiting], "No evidence is waiting for review.")
+    out += ["### Steps prepared and waiting for approval", ""]
+    out += bullets([r.step_name(t) for t in of("prepared")], "No step is waiting for approval.")
+    out += ["### Steps waiting for the next human action", ""]
+    actions = []
+    for t in of("approved", "submitted"):
+        if t["state"] == "submitted":
+            action = "submitted; confirm the result against the reviewed receipt"
+        elif t["data"].get("external"):
+            action = "approved; record the external submission with its receipt"
+        else:
+            action = "approved; confirm it as verified"
+        actions.append(f"{r.step_name(t)} — {action}.")
+    out += bullets(actions, "No approved or submitted step is waiting.")
+    out += ["### Steps sent back for review", ""]
+    out += bullets(
+        [
+            f"{r.step_name(t)} — reason: {sentence(latest_reopen_reason(t) or 'no reason was recorded')}"
+            for t in of("needs_review")
+        ],
+        "No step has been sent back for review.",
+    )
+    unknown = [t for t in tasks if step_class(t["state"]) == "unknown"]
+    if unknown:
+        out += ["### Steps in a state this version does not recognise", ""]
+        out += bullets(
+            [f"{r.step_name(t)} — {state_label(t['state'])}. Check it by hand." for t in unknown], ""
+        )
+
+    out += ["## What can be worked on next", ""]
+    out += bullets(
+        [r.step_name(t) for t in tasks if t["state"] in READY_STATES and not t.get("blockers")],
+        "No open step is free of prerequisites right now.",
+    )
+    out += ["## What is blocked", ""]
+    out += bullets(
+        [
+            f"{r.step_name(t)} — needs first: {needs_first(t)}."
+            for t in tasks
+            if step_class(t["state"]) == "open" and t.get("blockers")
+        ],
+        "No open step is blocked.",
+    )
+
+    records = [o for o in r.objects if o["kind"] in KIND_LABELS]
+    records.sort(key=lambda o: list(KIND_LABELS).index(o["kind"]))
+    for o in records:
+        r.mention(o["id"])
+    none_yet = "No business records have been added yet."
+    out += ["## What is still an assumption", "", "### Records marked as assumptions", ""]
+    out += bullets(
+        [f"{kind_label(o['kind'])}: {inline(o['title'])}" for o in records if o["state"] == "assumption"],
+        none_yet if not records else "No record is marked as an assumption.",
+    )
+    out += ["### Records with no evidence attached", ""]
+    out += bullets(
+        [
+            f"{kind_label(o['kind'])}: {inline(o['title'])}"
+            for o in records
+            if not o["data"].get("evidence_ids")
+        ],
+        none_yet if not records else "Every record has evidence attached.",
+    )
+
+    out += ["## Money and deadlines", ""]
+    money = []
+    if Decimal(str(stats.get("outstanding_invoices") or 0)):
+        money.append(f"Outstanding invoice balance: {fmt_money(stats['outstanding_invoices'])} {currency}.")
+    if Decimal(str(stats.get("cash_collected") or 0)):
+        money.append(f"Cash collected: {fmt_money(stats['cash_collected'])} {currency}.")
+    if stats.get("overdue_obligations"):
+        money.append(f"Obligations past their due date: {stats['overdue_obligations']}.")
+    out += bullets(money, "No outstanding invoices, collected payments or overdue obligations are recorded.")
+
+    out += ["## Every step", ""]
+    listed = [t for t in tasks if step_class(t["state"]) != "replaced"]
+    if not listed:
+        out += ["No steps are recorded.", ""]
+    for t in listed:
+        out += [f"- {r.step_name(t)} — {state_label(t['state']).lower()}"]
+        if inline(t["data"].get("description", "")):
+            out.append(f"  {inline(t['data']['description'])}")
+        if step_class(t["state"]) == "open" and t.get("blockers"):
+            out.append(f"  Needs first: {needs_first(t)}")
+    if listed:
+        out.append("")
+    return out + [CHECKLIST_LIMITATION, ""]
+
+
+def open_work(r, tasks, heading) -> list[str]:
+    out = [f"## {heading}", ""] + step_overview(r, tasks)
+    unfinished = [t for t in tasks if step_class(t["state"]) in {"open", "unknown"}]
+    if unfinished:
+        out += ["Unfinished steps:", ""]
+        out += bullets([f"{r.step_name(t)} — {state_label(t['state']).lower()}" for t in unfinished], "")
+    elif tasks:
+        out += ["No step is unfinished.", ""]
+    return out + [
+        "The readiness report lists what needs a person now, what can be worked on next and what is blocked.",
+        "",
+        CHECKLIST_LIMITATION,
+        "",
+    ]
+
+
+def cited_sources(r, tasks, catalog) -> list[str]:
+    cited = {}
+    for t in tasks:
+        if step_class(t["state"]) != "replaced" and t["data"].get("source_uri"):
+            cited.setdefault(t["data"]["source_uri"], []).append(t)
+    if not cited:
+        return ["These steps cite no external sources.", ""]
+    versions = sorted(
+        {
+            str(t["data"].get("pack_version") or catalog.get("version") or "unknown")
+            for ts in cited.values()
+            for t in ts
+        }
+    )
+    checked = sorted(
+        {
+            str(t["data"].get("source_checked_on") or catalog.get("source_checked_on") or "unknown")
+            for ts in cited.values()
+            for t in ts
+        }
+    )
+    out = [
+        f"Sources cited by these steps (planning guide {', '.join(versions)}; sources checked on {', '.join(checked)}):",
+        "",
+    ]
+    for uri, ts in cited.items():
+        out.append(f"- {inline(uri)} — cited by: " + "; ".join(r.step_name(t) for t in ts))
+    return out + [""]
+
+
 def render_document(template, snapshot, deal=None):
     business = snapshot["business"]["data"]
-    objects = snapshot["objects"]
+    r = Render(snapshot)
+    objects = r.objects
+    currency = business["currency"]
     title = f"{business['name']} — {TITLES[template]}"
-    lines = [f"# {title}", "", "Status: DRAFT — human review required.", ""]
+    lines = [f"# {inline(title)}", "", "Status: DRAFT — human review required.", ""]
     if business["is_demo"]:
         lines += [
             "SYNTHETIC DEMONSTRATION. Names, commercial assumptions and receipts in this workspace are examples, not evidence of a real business.",
             "",
         ]
     lines += [
-        f"Concept: {business['concept']}",
-        f"Entry path: {business['route']}. Planning jurisdiction: {business['jurisdiction']}. Currency: {business['currency']}.",
-        f"Intended customer: {business['customer'] or 'Unknown — research required.'}",
+        f"Concept: {inline(business['concept'])}",
+        f"Entry path: {business['route']}. Planning jurisdiction: {business['jurisdiction']}. Currency: {currency}.",
+        f"Intended customer: {inline(business['customer']) or 'Unknown — research required.'}",
         "",
     ]
+    tasks = [o for o in objects if o["kind"] == "task"]
+    if template == "investment_memo":
+        tasks = [t for t in tasks if t["data"].get("deal_id") == deal["id"]]
 
     def records(kind, heading):
         lines.extend([f"## {heading}", ""])
@@ -343,16 +730,7 @@ def render_document(template, snapshot, deal=None):
         if not found:
             lines.extend(["Unknown — add a record and supporting evidence.", ""])
         for o in found:
-            lines.extend(
-                [
-                    f"### {o['title']}",
-                    f"Status: {o['state']}. Record: {o['id']} (version {o['version']}).",
-                    o["data"].get("details", ""),
-                    f"Owner: {o['data'].get('owner', 'Unassigned')}. Due: {o['data'].get('due_date') or 'Not set'}.",
-                    f"Evidence: {', '.join(o['data'].get('evidence_ids', [])) or 'None attached.'}",
-                    "",
-                ]
-            )
+            lines.extend(r.record_block(o))
 
     def finances():
         lines.extend(["## Financial scenarios", ""])
@@ -360,7 +738,8 @@ def render_document(template, snapshot, deal=None):
         if not plans:
             lines.extend(["No financial model has been saved. Revenue, costs and funding are untested.", ""])
         for p in plans[-1:]:
-            lines.extend(financial_section(p, business["currency"]))
+            r.mention(p["id"])
+            lines.extend(financial_section(p, currency))
 
     if template == "business_plan":
         for kind, heading in [
@@ -368,6 +747,8 @@ def render_document(template, snapshot, deal=None):
             ("offer", "Offer, price and acceptance"),
             ("asset", "Resources and rights"),
             ("role", "Delivery and accountability"),
+            ("decision", "Decisions made"),
+            ("obligation", "Commitments and duties"),
             ("risk", "Risks and experiments"),
         ]:
             records(kind, heading)
@@ -417,40 +798,33 @@ def render_document(template, snapshot, deal=None):
             "",
         ]
     elif template == "investment_memo":
+        r.mention(deal["id"])
         lines += [
-            f"## Target: {cell(deal['title'])}",
-            deal["data"]["inputs"]["thesis"],
+            f"## Target: {inline(deal['title'])}",
+            inline(deal["data"]["inputs"]["thesis"]),
             "",
             "## Screening analysis",
             "These values are input-dependent scenarios. Multiples are user assumptions, not fetched market comparables.",
             "",
         ]
-        lines += deal_section(deal, snapshot, business["currency"])
+        lines += deal_section(deal, snapshot, currency, r.evidence_name)
         lines += [
             "## Conditions before commitment",
             "Reconcile seller earnings to independent records; assess concentration and owner dependence; verify transferable rights, liabilities and required consents; validate financing terms and downside liquidity; document legal structure, specialist reviews and a funded transition plan.",
             "",
         ]
-    if template in {"readiness_report", "business_plan", "operating_manual", "investment_memo"}:
-        lines += ["## Work and unresolved requirements", ""]
-        for o in objects:
-            if o["kind"] == "task" and (
-                template != "investment_memo" or o["data"].get("deal_id") == deal["id"]
-            ):
-                lines += [f"- [{o['state']}] {o['title']} — {o['id']}", f"  {o['data']['description']}"]
-                if o.get("blockers"):
-                    lines.append("  Requires: " + "; ".join(o["blockers"]))
-        lines += [
-            "",
-            "A completed checklist reflects recorded reviews. It does not establish legal compliance, commercial viability or an independently audited result.",
-            "",
-        ]
+    if template == "readiness_report":
+        lines += readiness_audit(r, tasks, currency)
+    elif template in {"business_plan", "operating_manual"}:
+        lines += open_work(r, tasks, "Open work")
+    elif template == "investment_memo":
+        lines += open_work(r, tasks, "Open work on this acquisition")
     lines += [
         "## Source and review trail",
         f"Business version: {snapshot['business']['version']}. Source fingerprint: {snapshot['source_fingerprint']}.",
         "This document is an immutable snapshot. Generate a new version when inputs change; retain signed external documents as evidence.",
         "",
     ]
-    for name, url in snapshot["catalog"]["sources"].items():
-        lines.append(f"- {name}: {url}")
-    return title, "\n".join(lines)
+    lines += cited_sources(r, tasks, snapshot.get("catalog") or {})
+    lines += r.reference_index()
+    return title, "\n".join(lines).rstrip("\n")
