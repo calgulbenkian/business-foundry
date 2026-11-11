@@ -12,6 +12,23 @@ from .store import DomainError, Store, canonical, digest, now, uid
 REVIEWERS = {"owner", "reviewer"}
 WRITERS = {"owner", "operator", "reviewer", "agent"}
 FINISHED = {"verified", "not_applicable"}
+COMPLETED = {"approved", "submitted", "verified", "not_applicable"}
+
+
+def evidence_basis(history):
+    """Evidence ids that a task's current standing relies on, derived from its history.
+
+    The current cycle is everything after the most recent move to needs_review. Within it, the basis
+    is the most recent move to prepared and every later entry; with no such move, the last entry.
+    Entries written by invalidation carry no evidence_ids and contribute nothing.
+    """
+    starts = [i for i, entry in enumerate(history) if entry.get("to") == "needs_review"]
+    cycle = history[starts[-1] + 1 :] if starts else history
+    if not cycle:
+        return set()
+    prepared = [i for i, entry in enumerate(cycle) if entry.get("to") == "prepared"]
+    basis = cycle[prepared[-1] :] if prepared else cycle[-1:]
+    return {eid for entry in basis for eid in entry.get("evidence_ids", [])}
 
 
 class Service:
@@ -209,7 +226,13 @@ class Service:
         if evidence_id:
             for obj in self.store.objects(con, bid):
                 data = obj["data"]
-                refs = data.get("evidence_ids", []) + [
+                if obj["kind"] == "task" and obj["state"] in COMPLETED:
+                    # A completed task relies on everything cited since its latest preparation, not
+                    # only the evidence attached at its most recent transition.
+                    refs = list(evidence_basis(data.get("history", [])))
+                else:
+                    refs = data.get("evidence_ids", [])
+                refs = refs + [
                     data.get(k)
                     for k in (
                         "contract_evidence_id",
@@ -233,7 +256,7 @@ class Service:
                     affected.add(t["id"])
                     changed = True
         for t in tasks:
-            if t["id"] in affected and t["state"] in {"approved", "submitted", "verified", "not_applicable"}:
+            if t["id"] in affected and t["state"] in COMPLETED:
                 history = t["data"]["history"] + [
                     {
                         "from": t["state"],
