@@ -6,7 +6,7 @@ The public repository includes a synthetic Polymer Geospatial demonstration so a
 
 Establish the founders and their residence/working locations; any existing entity, commitments or IP; the first buyer and paid problem; the intended delivery and data sources; available capital; responsibilities and review authority; the actual relevant jurisdictions; and whether acquisition is an active option or only a comparison.
 
-The system should surface missing facts, not manufacture a confident business plan. Record the initial assumptions and the decisions they affect. Select the applicable jurisdiction guide only after a qualified review of the operating footprint; retain the decision and its basis.
+The system should surface missing facts, not manufacture a confident business plan. Record the initial assumptions and the decisions they affect. Select the applicable jurisdiction guide only after a qualified review of the operating footprint; retain the decision and its basis. The jurisdiction change records the reason and reviewed evidence, keeps earlier guide steps as superseded history and reopens completed work.
 
 ## Smallest useful operating cycle
 
