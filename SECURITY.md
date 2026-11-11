@@ -24,7 +24,7 @@ Browser sessions are random, hashed, HttpOnly and SameSite=Strict, with an eight
 
 ## Private data
 
-`.foundry/`, `.env*` (except the template), databases, logs, build outputs and test artifacts are ignored by Git. There are no telemetry calls, remote fonts or automatic document fetches. Source URLs are retained as references and are not fetched by the server. The UI escapes business content and displays documents as text; it does not execute imported HTML or load remote resources embedded in evidence.
+`.foundry/`, `.env*` (except the template), databases, logs, build outputs and test artifacts are ignored by Git. There are no telemetry calls, remote fonts or automatic document fetches. Source URLs are retained as references and are not fetched by the server. The UI escapes business content and displays documents as text; it does not execute imported HTML or load remote resources embedded in evidence. It shows a stored source URL as a link only if it is an `http:` or `https:` address; anything else is shown as plain text, as a second line of defence behind the server's validation. Signing out, or a request refused because the session has ended, clears the previous person's records from the page and from the interface's memory.
 
 Private evidence and backups are not encrypted by the application. Use full-disk encryption, OS access controls and encrypted backup storage appropriate to the data. Anyone with filesystem access to the owner token can act as owner; anyone who can edit the database can rewrite authorization and history. The local event chain does not protect against that administrator. Do not expose this deployment to hostile multi-tenant workloads.
 

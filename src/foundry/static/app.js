@@ -8,8 +8,14 @@
   the Journey map draws every line converging on one interchange.
 
   Everything shown comes from the server: task states, prerequisites, reopen notes, evidence
-  reviews and withdrawals, staleness flags and every money figure. This file formats values; it
-  does not calculate money, and it never invents a state the records do not hold.
+  reviews and withdrawals, staleness flags and every money figure. Every figure shown as text is
+  the server's decimal string, formatted here and never recalculated. The one exception is
+  drawing: the cash chart converts figures to place its points and label its axis, and says that
+  it is approximate. This file never invents a state the records do not hold.
+
+  A response is applied, to the page or to anything kept in `state`, only if the business and the
+  load it was requested for are still the ones on screen (and, for something filled into the
+  inspector, only while the same item is still shown). Older responses are dropped.
 */
 
 /* ---------------- basics ---------------- */
@@ -42,10 +48,20 @@ const saved = {
   },
 };
 
+/* Every refresh, and every sign-out, starts a new load. A response that belongs to an older load
+   is dropped: it was requested for a business or a state of the records no longer on screen. */
+let loadSeq = 0;
+/* Every sign-out starts a new session; a late 401 from an earlier session is not acted on. */
+let sessionSeq = 0;
 const state = {
   actor: null,
   businesses: [],
+  // the business whose records are on screen; it changes only together with the snapshot
   bid: saved.get('foundry.business'),
+  // a business asked for (by the selector or by creating one) whose records have not arrived yet
+  wantBid: null,
+  // the load whose records are on screen
+  loaded: 0,
   snapshot: null,
   runs: [],
   principals: null,
@@ -66,36 +82,67 @@ const find = (id) => objs().find((o) => o.id === id);
 const currency = () => state.snapshot?.business.data.currency || 'USD';
 const businessName = () => state.snapshot?.business.data.name || '';
 
+/* Formatter output goes straight into innerHTML, so it must never carry markup. Intl output is
+   digits, separators and currency signs; this makes that a guarantee rather than an assumption.
+   An ASCII apostrophe (some locales group digits with one) becomes the typographic one. */
+const noMarkup = (s) =>
+  String(s)
+    .replace(/[&<>"]/g, '')
+    .replaceAll("'", '\u2019');
+const decimalText = (v) =>
+  new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(
+    String(v),
+  );
 /* Money arrives from the server as exact decimal strings. It is formatted here, never
    recalculated: Intl.NumberFormat formats a decimal string without converting the sum. */
 function money(v, cur = currency()) {
   if (v === null || v === undefined || v === '') return '—';
   try {
-    return new Intl.NumberFormat(undefined, {
-      style: 'currency',
-      currency: cur,
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(String(v));
+    return noMarkup(
+      new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency: cur,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(String(v)),
+    );
   } catch {
-    return `${v} ${cur}`;
+    // A currency code Intl rejects: the amount alone, and the code reduced to letters and digits.
+    const code = String(cur ?? '').replace(/[^A-Za-z0-9]/g, '');
+    return noMarkup(decimalText(v) + (code ? ' ' + code : ''));
   }
 }
 const ratio = (v, digits = 2) =>
   v === null || v === undefined
     ? '—'
-    : new Intl.NumberFormat(undefined, {
-        minimumFractionDigits: digits,
-        maximumFractionDigits: digits,
-      }).format(String(v));
+    : noMarkup(
+        new Intl.NumberFormat(undefined, {
+          minimumFractionDigits: digits,
+          maximumFractionDigits: digits,
+        }).format(String(v)),
+      );
 const percent = (v) =>
   v === null || v === undefined
     ? 'Not meaningful'
-    : new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 1 }).format(
-        String(v),
+    : noMarkup(
+        new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 1 }).format(
+          String(v),
+        ),
       );
+/* Axis labels for the cash chart only: approximate, from a converted number, never a figure. */
 const shortMoney = (v) =>
-  new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(v);
+  noMarkup(
+    new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(v),
+  );
+/* The sign of a decimal string (-1, 0 or 1), read from its digits. It is never converted to a
+   binary number, so no rounding can turn a small amount into zero or the reverse. Anything
+   that is not a decimal string counts as 0. */
+function decimalSign(v) {
+  const m = /^\s*([+-]?)(\d*)(?:\.(\d*))?(?:[eE][+-]?\d+)?\s*$/.exec(String(v ?? ''));
+  if (!m || !(m[2] || m[3])) return 0;
+  if (!/[1-9]/.test(m[2] + (m[3] || ''))) return 0;
+  return m[1] === '-' ? -1 : 1;
+}
 const dDay = (v) =>
   v ? new Date(v).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
 const dFull = (v) =>
@@ -1019,11 +1066,13 @@ function accountHTML() {
 }
 
 /* ---------------- middle list ---------------- */
+/* Each row is a native button inside its own list item, so it is announced as something that can
+   be activated, and the list still reports its length and position. */
 function row({ key, glyph, num = '', title, right = '', sub = '', fig = false, line = null }) {
-  return `<button type="button" role="listitem" class="row${sub ? ' two' : ''}${num ? '' : ' nonum'}${line ? ' ln lc-' + line.k : ''}"${line ? ` data-line="${line.k}"` : ''} data-key="${h(key)}" aria-current="${key === state.selected}">
+  return `<div class="ri" role="listitem"><button type="button" class="row${sub ? ' two' : ''}${num ? '' : ' nonum'}${line ? ' ln lc-' + line.k : ''}"${line ? ` data-line="${line.k}"` : ''} data-key="${h(key)}" aria-current="${key === state.selected}">
     <span class="r-g">${glyph}</span>
     <span class="r-main"><span class="r-l1"><span class="r-num">${h(num)}</span><span class="r-t">${title}</span><span class="r-right${fig ? ' fig' : ''}">${right}</span></span>${sub ? `<span class="r-sub">${sub}</span>` : ''}</span>
-  </button>`;
+  </button></div>`;
 }
 function stepSub(s) {
   const t = s.task;
@@ -1312,7 +1361,7 @@ function renderList() {
       title: 'Integrity check',
       sub: 'History against the current records',
     });
-    if (state.audit?.bid === state.bid) {
+    if (state.audit?.load === state.loaded) {
       const evs = state.audit.data.events.slice().reverse();
       out += grp('Events', evs.length, 'Newest first. Every change keeps its actor and sequence.');
       for (const e of evs)
@@ -1324,10 +1373,18 @@ function renderList() {
           sub: h(`${e.payload.title || e.payload.data?.name || e.object_id} · ${who(e.actor_id)}`),
         });
     } else {
-      out += `<p class="empty">Loading history…</p>`;
-      loadAudit().then(() => {
-        if (state.source === 'history') renderList();
-      });
+      out += `<p class="empty" data-audit-wait>Loading history…</p>`;
+      const load = state.loaded;
+      const current = () => state.loaded === load && state.source === 'history';
+      loadAudit().then(
+        () => {
+          if (current() && $('#list [data-audit-wait]')) rerender(renderList);
+        },
+        (e) => {
+          const wait = $('#list [data-audit-wait]');
+          if (current() && wait) wait.textContent = `The history could not be loaded: ${e.message}`;
+        },
+      );
     }
   } else if (src.id === 'access') {
     right = isOwner() ? headButton('+ Create access key', 'new-key') : '';
@@ -1426,7 +1483,7 @@ function moneyRows(today) {
     });
     out += row({
       key: 'money:needed',
-      glyph: Number(sum.additional_cash_needed) > 0 ? g('review') : dash,
+      glyph: decimalSign(sum.additional_cash_needed) > 0 ? g('review') : dash,
       title: 'Additional cash needed',
       right: money(sum.additional_cash_needed),
       fig: true,
@@ -1485,9 +1542,9 @@ function changedRows() {
 /* A line runs unbroken through consecutive rows of the same line (and up into its bullet);
    it stops short where the line changes, so two lines never touch. */
 function joinLines() {
-  const items = [...document.querySelectorAll('#list > .row, #list > .grp')].filter(
-    (el) => !el.hidden,
-  );
+  const items = [...document.querySelectorAll('#list > .ri, #list > .grp')]
+    .filter((el) => !el.hidden)
+    .map((el) => (el.classList.contains('ri') ? el.firstElementChild : el));
   items.forEach((el, i) => {
     if (!el.classList.contains('row') || !el.dataset.line) return;
     const prev = items[i - 1],
@@ -1534,11 +1591,24 @@ const props = (rows) =>
 const sec = (title, body, note = '') =>
   `<section class="i-sec"><h3>${title}${note}</h3>${body}</section>`;
 const head = ({ kicker, title, glyph = '', stateLabel, next, actions = '', extra = '' }) =>
-  `<div class="i-kicker">${kicker}</div><h2 class="i-title" id="insp-title">${title}</h2>
+  `<div class="i-kicker">${kicker}</div><h2 class="i-title" id="insp-title" tabindex="-1">${title}</h2>
    ${stateLabel ? `<div class="i-state">${glyph}<span class="st">${stateLabel}</span>${next ? `<span class="nx">${next}</span>` : ''}</div>` : ''}
    ${actions ? `<div class="i-actions">${actions}</div>` : ''}${extra}`;
 const btn = (text, attrs = '', primary = false, small = false, extraCls = '') =>
   `<button type="button" class="btn${primary ? ' primary' : ''}${small ? ' small' : ''}${extraCls ? ' ' + extraCls : ''}" ${attrs}>${h(text)}</button>`;
+/* A stored address becomes a link only if it is an http or https URL. Anything else, such as a
+   javascript: or data: address, is shown as plain text and cannot be followed. */
+function webLink(uri) {
+  let ok = false;
+  try {
+    ok = ['http:', 'https:'].includes(new URL(String(uri)).protocol);
+  } catch {
+    ok = false;
+  }
+  return ok
+    ? `<a href="${h(uri)}" target="_blank" rel="noopener noreferrer">${h(uri)}</a>`
+    : `<span class="uri">${h(uri)}</span>`;
+}
 const goAttr = (src, key) => `data-go="${h(src)}|${h(key)}"`;
 const flag = (body, neutral = false) =>
   `<div class="flag${neutral ? ' neutral' : ''}">${neutral ? '<span></span>' : g('review')}<div>${body}</div></div>`;
@@ -1899,7 +1969,7 @@ function inspStep(s) {
         t.data.source_uri
           ? [
               'Planning guide',
-              `<a href="${h(t.data.source_uri)}" target="_blank" rel="noopener noreferrer">${h(t.data.source_uri)}</a><span class="sub">Guide ${h(t.data.pack_version)}${t.data.source_checked_on ? `, checked ${h(plainDate(t.data.source_checked_on))}` : ''}. Planning guidance, not a compliance certificate.</span>`,
+              `${webLink(t.data.source_uri)}<span class="sub">Guide ${h(t.data.pack_version)}${t.data.source_checked_on ? `, checked ${h(plainDate(t.data.source_checked_on))}` : ''}. Planning guidance, not a compliance certificate.</span>`,
             ]
           : null,
         l.deal ? ['Part of', linkTo(l.deal)] : null,
@@ -2062,7 +2132,7 @@ function inspEvidence(o) {
         d.source_uri
           ? [
               'Source reference',
-              `<a href="${h(d.source_uri)}" target="_blank" rel="noopener noreferrer">${h(d.source_uri)}</a><span class="sub">A reference only; the server does not fetch it.</span>`,
+              `${webLink(d.source_uri)}<span class="sub">A reference only; the server does not fetch it.</span>`,
             ]
           : null,
         d.review
@@ -2084,25 +2154,46 @@ function inspEvidence(o) {
     )
   );
 }
+/* The history for the records on screen. It is cached against the load that requested it, so a
+   request made before a save cannot fill the cache after the save's refresh has started anew. */
 function loadAudit() {
-  const bid = state.bid;
-  if (state.audit?.bid === bid) return Promise.resolve(state.audit.data);
-  if (!state.auditPromise || state.auditPromise.bid !== bid) {
+  const load = state.loaded,
+    bid = state.bid;
+  if (state.audit?.load === load) return Promise.resolve(state.audit.data);
+  if (state.auditPromise?.load !== load) {
     const p = api(`/businesses/${bid}/audit`).then((data) => {
-      if (state.bid === bid) state.audit = { bid, data };
+      if (state.loaded === load) state.audit = { load, data };
       return data;
     });
-    p.bid = bid;
+    p.load = load;
     state.auditPromise = p;
-    p.catch(() => (state.auditPromise = null));
+    p.catch(() => {
+      if (state.auditPromise === p) state.auditPromise = null;
+    });
   }
   return state.auditPromise;
 }
+/* Fill a placeholder the inspector just drew, once the history arrives, but only while that same
+   placeholder is on screen: the same item, from the same load. Any re-render replaces it. */
+function fillFromAudit(el, fill, failed) {
+  const load = state.loaded,
+    key = state.selected;
+  const current = () => el.isConnected && state.loaded === load && state.selected === key;
+  loadAudit().then(
+    (a) => {
+      if (current()) fill(a);
+    },
+    (e) => {
+      if (current()) failed(e);
+    },
+  );
+}
 function fillVersions(oid) {
-  loadAudit()
-    .then((a) => {
-      const el = document.querySelector(`[data-versions="${CSS.escape(oid)}"]`);
-      if (!el) return;
+  const el = document.querySelector(`#insp [data-versions="${CSS.escape(oid)}"]`);
+  if (!el) return;
+  fillFromAudit(
+    el,
+    (a) => {
       const evs = a.events.filter(
         (e) => e.object_id === oid && e.payload && 'version' in e.payload,
       );
@@ -2128,11 +2219,11 @@ function fillVersions(oid) {
               '',
             )}</div><p class="fine">Each version is kept in the history. The original text is the same in every version.</p>`
         : '<p class="fine">No versions recorded.</p>';
-    })
-    .catch((e) => {
-      const el = document.querySelector(`[data-versions="${CSS.escape(oid)}"]`);
-      if (el) el.innerHTML = `<p class="fine">The history could not be loaded: ${h(e.message)}</p>`;
-    });
+    },
+    (e) => {
+      el.innerHTML = `<p class="fine">The history could not be loaded: ${h(e.message)}</p>`;
+    },
+  );
 }
 
 function inspRecord(o) {
@@ -2205,7 +2296,7 @@ function chart(scenarios) {
     bottom = 26;
   const y = (v) => top + ((high - v) / range) * (height - top - bottom);
   const n = scenarios.base.months.length;
-  let svg = `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Projected closing cash for the base, downside and upside cases, as calculated by Business Foundry">`;
+  let svg = `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Chart of projected closing cash for the base, downside and upside cases. The chart is drawn approximately; the exact monthly figures are in the cash flow table.">`;
   for (let i = 0; i < 4; i++) {
     const v = low + (range * i) / 3;
     svg += `<line class="grid-line" x1="${left}" x2="${width - right}" y1="${f(y(v))}" y2="${f(y(v))}"/><text x="${left - 8}" y="${f(y(v) + 3)}" text-anchor="end">${h(shortMoney(v))}</text>`;
@@ -2226,7 +2317,8 @@ function chart(scenarios) {
   svg += `<text x="${left}" y="${height - 6}">Month 1</text><text x="${width - right}" y="${height - 6}" text-anchor="end">Month ${n}</text></svg>`;
   return (
     svg +
-    '<div class="legend" aria-hidden="true"><span><i></i>Base</span><span><i class="l-downside"></i>Downside</span><span><i class="l-upside"></i>Upside</span></div>'
+    '<div class="legend" aria-hidden="true"><span><i></i>Base</span><span><i class="l-downside"></i>Downside</span><span><i class="l-upside"></i>Upside</span></div>' +
+    '<p class="fine">The chart is drawn approximately and its axis labels are rounded; the exact figures are in the tables.</p>'
   );
 }
 function inspMoney() {
@@ -2505,10 +2597,11 @@ function inspHistory(seq) {
   return `<div data-history="${h(seq || '')}"><p class="fine">Loading the history…</p></div>`;
 }
 function fillHistory(seq) {
-  loadAudit()
-    .then((a) => {
-      const el = document.querySelector('[data-history]');
-      if (!el) return;
+  const el = document.querySelector('#insp [data-history]');
+  if (!el) return;
+  fillFromAudit(
+    el,
+    (a) => {
       const ok = a.integrity.valid;
       let out;
       if (seq) {
@@ -2557,12 +2650,11 @@ function fillHistory(seq) {
           );
       }
       el.innerHTML = out;
-    })
-    .catch((e) => {
-      const el = document.querySelector('[data-history]');
-      if (el)
-        el.innerHTML = `<p class="empty">The history could not be loaded: ${h(e.message)}</p>`;
-    });
+    },
+    (e) => {
+      el.innerHTML = `<p class="empty">The history could not be loaded: ${h(e.message)}</p>`;
+    },
+  );
 }
 function inspAccess(kind, id) {
   const authority = flag(
@@ -2686,12 +2778,17 @@ function applySearch() {
   const term = q.value.trim().toLowerCase();
   const list = $('#list');
   const rows = [...list.querySelectorAll('.row')];
-  rows.forEach((r) => (r.hidden = Boolean(term) && !r.textContent.toLowerCase().includes(term)));
+  // The row and its list item are hidden together, so no empty list item is left announced.
+  rows.forEach(
+    (r) =>
+      (r.hidden = r.parentElement.hidden =
+        Boolean(term) && !r.textContent.toLowerCase().includes(term)),
+  );
   list.querySelectorAll('.grp').forEach((gh) => {
     let n = gh.nextElementSibling,
       any = false;
     while (n && !n.classList.contains('grp') && !n.classList.contains('list-key')) {
-      if (n.classList.contains('row') && !n.hidden) any = true;
+      if (n.classList.contains('ri') && !n.hidden) any = true;
       n = n.nextElementSibling;
     }
     gh.hidden = Boolean(term) && !any;
@@ -2719,13 +2816,75 @@ q.addEventListener('keydown', (e) => {
   }
 });
 
+/* ---------------- focus ---------------- */
+/* Rendering replaces the source list, the middle list and the inspector wholesale. When the
+   focused control was inside one of them, focus moves to the same control in the new markup
+   (the same source, row, action or link), or, if it is gone, to a deliberate place in the same
+   region: the current source, the selected row, or the inspector's heading. Focus elsewhere
+   (the toolbar, a dialog) is never touched. */
+const visible = (el) => Boolean(el && el.getClientRects().length);
+const focusFirst = (selectors) => {
+  for (const sel of selectors) {
+    const el = [...document.querySelectorAll(sel)].find(visible);
+    if (el) {
+      el.focus({ preventScroll: true });
+      return true;
+    }
+  }
+  return false;
+};
+const SELECTED_SOURCE = '#src-nav .src[aria-current="true"]';
+const SELECTED_ROW = '#list .row[aria-current="true"]';
+const FOCUS_FALLBACK = {
+  'src-nav': [SELECTED_SOURCE],
+  'src-foot': [SELECTED_SOURCE],
+  list: [SELECTED_ROW, '#list .row'],
+  'list-right': [SELECTED_ROW, '#list .row'],
+  insp: ['#insp-title', SELECTED_ROW],
+};
+const SAME_CONTROL = ['data-src', 'data-key', 'data-action', 'data-id', 'data-to', 'data-go'];
+function focusMemo() {
+  const el = document.activeElement;
+  const region =
+    el && el !== document.body
+      ? el.closest('#src-nav, #src-foot, #list-right, #list, #insp')
+      : null;
+  if (!region) return null;
+  let same = el.id ? '#' + CSS.escape(el.id) : '';
+  if (!same) {
+    const attrs = SAME_CONTROL.filter((a) => el.hasAttribute(a));
+    if (attrs.length)
+      same =
+        el.tagName.toLowerCase() +
+        attrs.map((a) => `[${a}="${CSS.escape(el.getAttribute(a))}"]`).join('');
+  }
+  return { el, region: region.id, same };
+}
+function rerender(render) {
+  const memo = focusMemo();
+  render();
+  restoreFocus(memo);
+}
+/* Disabling a focused button while it waits on the server drops focus to the page body, so a
+   save takes its memo before that and restores it once the new markup is in place. */
+function restoreFocus(memo) {
+  if (!memo || memo.el.isConnected) return;
+  if (document.activeElement && document.activeElement !== document.body) return;
+  focusFirst([
+    ...(memo.same ? [`#${memo.region} ${memo.same}`] : []),
+    ...FOCUS_FALLBACK[memo.region],
+  ]);
+}
+
 /* ---------------- navigation ---------------- */
 const app = $('#app');
 const isPhone = () => window.matchMedia('(max-width:699px)').matches;
 function renderAll() {
-  renderSources();
-  renderList();
-  renderInspector();
+  rerender(() => {
+    renderSources();
+    renderList();
+    renderInspector();
+  });
 }
 function setSource(id, key) {
   state.source = sourceById(id) ? id : 'today';
@@ -2741,11 +2900,23 @@ function select(key) {
   document
     .querySelectorAll('#list .row')
     .forEach((r) => r.setAttribute('aria-current', String(r.dataset.key === key)));
-  renderInspector();
+  rerender(renderInspector);
 }
+/* On a phone one pane shows at a time. A pane change that hides the focused control moves focus
+   into the pane that appears: its back control going forward, or, coming back, the place the
+   person left (the current source, the selected row). */
 function setLevel(level) {
+  const from = app.dataset.level;
   app.dataset.level = level;
-  if (isPhone()) window.scrollTo(0, 0);
+  if (!isPhone()) return;
+  window.scrollTo(0, 0);
+  if (visible(document.activeElement) && document.activeElement !== document.body) return;
+  const into = {
+    sources: [SELECTED_SOURCE, '#src-nav .src'],
+    list: from === 'detail' ? [SELECTED_ROW, '#back-src'] : ['#back-src'],
+    detail: ['#back-list'],
+  }[level];
+  if (into) focusFirst(into);
 }
 function pickStation(id) {
   if (state.source !== 'journey') setSource('journey', 'jr:' + id);
@@ -2781,6 +2952,7 @@ async function api(path, options = {}) {
   }
   if (options.method && !['GET', 'HEAD'].includes(options.method))
     headers['Idempotency-Key'] ||= crypto.randomUUID();
+  const session = sessionSeq;
   let response;
   try {
     response = await fetch('/api' + path, { ...options, headers, credentials: 'same-origin' });
@@ -2791,7 +2963,7 @@ async function api(path, options = {}) {
   }
   const data = await response.json().catch(() => ({ detail: 'Unexpected server response.' }));
   if (!response.ok) {
-    if (response.status === 401 && path !== '/login') showLogin();
+    if (response.status === 401 && path !== '/login' && session === sessionSeq) showLogin();
     throw new Error(data.detail || 'The request could not be completed.');
   }
   return data;
@@ -2802,34 +2974,99 @@ const post = (suffix, body, key) =>
     body,
     headers: { 'Idempotency-Key': key },
   });
+/* Sign-out, or a 401: the previous person's records leave memory and the page, not just the view.
+   Any request still in flight belongs to an older load and an older session, so it is dropped. */
+function forget() {
+  loadSeq += 1;
+  sessionSeq += 1;
+  Object.assign(state, {
+    actor: null,
+    businesses: [],
+    wantBid: null,
+    loaded: 0,
+    snapshot: null,
+    runs: [],
+    principals: null,
+    audit: null,
+    auditPromise: null,
+    source: 'today',
+    selected: null,
+    remembered: {},
+    scenario: 'base',
+    open: null,
+  });
+  M = buildModel(null);
+  if ($('#dialog').open) $('#dialog').close();
+  for (const id of ['#dialog-content', '#src-nav', '#src-foot', '#list', '#list-right', '#insp'])
+    $(id).innerHTML = '';
+  for (const id of ['#dialog-title', '#crumb', '#actor-name', '#tb-date']) $(id).textContent = '';
+  $('#list-title').textContent = 'Today';
+  $('#back-list-lbl').textContent = 'Today';
+  $('#business-select').innerHTML = '';
+  $('#demo-tag').hidden = true;
+  $('#toast').hidden = true;
+  q.value = '';
+  app.dataset.level = 'list';
+}
 function showLogin() {
+  forget();
   app.hidden = true;
   $('#login').hidden = false;
+  $('#login input[name="token"]').focus();
 }
+/* Load the businesses and the records of the one asked for, then show them. Returns false, and
+   changes nothing, when a newer refresh or a sign-out has started meanwhile; its errors are then
+   dropped too. */
 async function refresh() {
-  state.businesses = await api('/businesses');
-  if (!state.businesses.some((b) => b.id === state.bid))
-    state.bid = state.businesses[0]?.id || null;
-  if (state.bid) saved.set('foundry.business', state.bid);
+  const load = ++loadSeq;
+  const stale = () => load !== loadSeq;
+  const wanted = state.wantBid || state.bid;
+  let businesses, bid, snapshot, runs, principals;
+  try {
+    businesses = await api('/businesses');
+    if (stale()) return false;
+    bid = businesses.some((b) => b.id === wanted) ? wanted : businesses[0]?.id || null;
+    [snapshot, runs, principals] = await Promise.all([
+      bid ? api('/businesses/' + bid) : Promise.resolve(null),
+      bid ? api(`/businesses/${bid}/ai`).catch(() => []) : Promise.resolve([]),
+      isOwner() ? api('/principals').catch(() => null) : Promise.resolve(null),
+    ]);
+  } catch (error) {
+    if (stale()) return false;
+    throw error;
+  }
+  if (stale()) return false;
+  if (bid !== state.bid) {
+    // another business: start it from its Today list
+    Object.assign(state, {
+      source: 'today',
+      selected: null,
+      remembered: {},
+      open: null,
+      scenario: 'base',
+    });
+  }
+  Object.assign(state, {
+    businesses,
+    bid,
+    wantBid: null,
+    loaded: load,
+    snapshot,
+    runs: Array.isArray(runs) ? runs : [],
+    principals,
+    audit: null,
+    auditPromise: null,
+  });
+  if (bid) saved.set('foundry.business', bid);
   const select = $('#business-select');
   select.innerHTML =
-    state.businesses
+    businesses
       .map(
         (b) =>
-          `<option value="${h(b.id)}" ${b.id === state.bid ? 'selected' : ''}>${h(b.data.name)}</option>`,
+          `<option value="${h(b.id)}" ${b.id === bid ? 'selected' : ''}>${h(b.data.name)}</option>`,
       )
       .join('') || '<option value="">No businesses yet</option>';
-  select.disabled = !state.businesses.length;
-  const [snapshot, runs, principals] = await Promise.all([
-    state.bid ? api('/businesses/' + state.bid) : Promise.resolve(null),
-    state.bid ? api(`/businesses/${state.bid}/ai`).catch(() => []) : Promise.resolve([]),
-    isOwner() ? api('/principals').catch(() => null) : Promise.resolve(null),
-  ]);
-  state.snapshot = snapshot;
-  state.runs = Array.isArray(runs) ? runs : [];
-  state.principals = principals;
-  state.audit = null;
-  state.auditPromise = null;
+  select.disabled = !businesses.length;
   M = buildModel(snapshot);
   $('#demo-tag').hidden = !snapshot?.business.data.is_demo;
   $('#actor-name').textContent = state.actor.name + ' · ' + label(state.actor.role);
@@ -2842,6 +3079,7 @@ async function refresh() {
   });
   if (!state.snapshot) state.source = 'today';
   renderAll();
+  return true;
 }
 
 /* ---------------- forms ---------------- */
@@ -2902,14 +3140,25 @@ function formDialog(title, fields, submit, button = 'Save', intro = '', after = 
     const b = form.querySelector('[type=submit]');
     b.disabled = true;
     form.querySelector('.error').textContent = '';
+    const bid = state.bid,
+      session = sessionSeq;
     try {
       const result = await submit(new FormData(form), command);
-      $('#dialog').close();
-      if (after) after(result);
+      if (session !== sessionSeq) return;
+      // The dialog can be closed, and another opened, while a save is in flight; a late result
+      // closes only its own form, and moves the view only if the same business is still shown.
+      if (form.isConnected) $('#dialog').close();
+      if (after && state.bid === bid && !state.wantBid) after(result);
       await refresh();
       toast('Saved to the workspace.');
     } catch (error) {
-      form.querySelector('.error').textContent = error.message;
+      if (session !== sessionSeq) return;
+      if (form.isConnected) {
+        form.querySelector('.error').textContent = error.message;
+        // a failed save leaves focus on its button, which disabling had cleared
+        b.disabled = false;
+        if (document.activeElement === document.body) b.focus();
+      } else toast(error.message);
     } finally {
       b.disabled = false;
     }
@@ -2985,11 +3234,8 @@ function businessDialog(edit = false) {
       ? 'Changes reopen completed work for review. Jurisdiction is fixed in this release; use a new workspace for a reviewed jurisdiction change.'
       : 'A concept creates the workspace and its dependency-aware steps. Unknowns can stay unknown until you have evidence.',
     (result) => {
-      if (edit) return;
-      state.bid = result.id;
-      state.source = 'today';
-      state.selected = null;
-      state.remembered = {};
+      // the new business opens on its Today list once its records arrive
+      if (!edit) state.wantBid = result.id;
     },
   );
 }
@@ -3360,8 +3606,10 @@ function keyDialog() {
         method: 'POST',
         body: { name: f.get('name'), role: f.get('role'), business_ids: f.getAll('business_ids') },
       });
+      const session = sessionSeq;
       setTimeout(
         () =>
+          session === sessionSeq &&
           showDialog(
             'Save this access key',
             `<p>The server stores only a hash. Copy this key into a password manager or your client’s secret settings; it will not be shown again.</p><pre>${h(key.token)}</pre><p class="fine">${h(key.name)} · ${h(label(key.role))}. Never put the key in GitHub, a screenshot or a shared document.</p>`,
@@ -3407,9 +3655,12 @@ async function submitTransition(form) {
   const t = find(form.dataset.id);
   const f = new FormData(form);
   const b = form.querySelector('[type=submit]');
+  const memo = focusMemo();
   b.disabled = true;
   form.querySelector('.error').textContent = '';
   $('#toast').hidden = true;
+  const open = state.open,
+    session = sessionSeq;
   try {
     await post(
       `/tasks/${t.id}/transition`,
@@ -3419,14 +3670,21 @@ async function submitTransition(form) {
         evidence_ids: f.getAll('evidence_ids'),
         expected_version: t.version,
       },
-      state.open.key,
+      open.key,
     );
-    state.open = null;
+    if (session !== sessionSeq) return;
+    // close this decision's form only if it is still the one open
+    if (state.open === open) state.open = null;
     await refresh();
+    restoreFocus(memo);
     toast('Saved to the workspace.');
   } catch (error) {
-    form.querySelector('.error').textContent = error.message;
-    b.disabled = false;
+    if (session !== sessionSeq) return;
+    if (form.isConnected) {
+      form.querySelector('.error').textContent = error.message;
+      b.disabled = false;
+      if (memo?.el === b && document.activeElement === document.body) b.focus();
+    } else toast(error.message);
   }
 }
 
@@ -3435,11 +3693,10 @@ async function handle(a, el) {
   const id = el.dataset.id;
   if (a === 'scenario') {
     state.scenario = id;
-    renderInspector();
+    rerender(renderInspector);
   } else if (a === 'close-dialog') $('#dialog').close();
   else if (a === 'logout') {
     await api('/logout', { method: 'POST' });
-    state.actor = null;
     showLogin();
   } else if (a === 'new-business') businessDialog();
   else if (a === 'edit-business') businessDialog(true);
@@ -3453,8 +3710,12 @@ async function handle(a, el) {
     renderInspector();
     $('#tx-form textarea')?.focus();
   } else if (a === 'close-inline') {
+    const was = state.open;
     state.open = null;
-    renderInspector();
+    rerender(renderInspector);
+    // back to the move that opened the form
+    if (was?.kind === 'tx')
+      focusFirst([`#insp [data-action="tx"][data-to="${CSS.escape(was.to)}"]`, '#insp-title']);
   } else if (a === 'new-forecast') forecastDialog();
   else if (a === 'new-deal') dealDialog(id);
   else if (a === 'new-document') documentDialog();
@@ -3507,7 +3768,6 @@ document.addEventListener('click', (event) => {
   if (r) {
     select(r.dataset.key);
     setLevel('detail');
-    if (isPhone()) $('#back-list').focus();
     return;
   }
   const stn = event.target.closest('#insp .stn');
@@ -3546,13 +3806,14 @@ document.addEventListener('submit', (e) => {
 $('#back-src').addEventListener('click', () => setLevel('sources'));
 $('#back-list').addEventListener('click', () => setLevel('list'));
 $('#business-select').addEventListener('change', async (event) => {
-  state.bid = event.target.value;
-  state.source = 'today';
-  state.selected = null;
-  state.remembered = {};
+  // The records on screen stay those of the business they belong to until the chosen one's
+  // records arrive; refresh() then switches both together.
+  state.wantBid = event.target.value || null;
   try {
     await refresh();
   } catch (e) {
+    state.wantBid = null;
+    event.target.value = state.bid || '';
     toast(e.message);
   }
 });

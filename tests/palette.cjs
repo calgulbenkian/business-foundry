@@ -325,11 +325,27 @@ function measure(css, app) {
     }
   // 5. Every line is wired through its own tokens wherever the stylesheet paints it.
   const all = rules(css);
-  const ruleBody = (selector) => all.filter((r) => r.selector === selector).map((r) => r.body);
+  // Every declaration of the property in every rule whose selector list names this selector,
+  // inside a media query or not, must be the token: a later rule that sets the same property to
+  // anything else would win the cascade while an "any rule sets it" check still passed.
+  // (A more specific selector can still override it; tests/browser.cjs checks the computed colour.)
+  const declared = (selector, prop) =>
+    all
+      .filter((r) => r.selector.split(',').some((part) => part.trim() === selector))
+      .flatMap((r) =>
+        r.body
+          .split(';')
+          .map((d) => /^\s*([\w-]+)\s*:\s*([\s\S]*?)\s*$/.exec(d))
+          .filter((m) => m && m[1] === prop)
+          .map((m) => m[2]),
+      );
   const wants = (selector, prop, token) => {
-    const re = new RegExp(`(^|[;\\s])${prop}\\s*:\\s*var\\(--${token}\\)`);
-    if (!ruleBody(selector).some((b) => re.test(b)))
-      fail(`style.css: ${selector} must set ${prop}: var(--${token})`);
+    const values = declared(selector, prop);
+    const want = `var(--${token})`;
+    if (!values.length) fail(`style.css: ${selector} must set ${prop}: ${want}`);
+    for (const v of values)
+      if (v.replace(/\s*!important$/i, '') !== want)
+        fail(`style.css: ${selector} sets ${prop}: ${v}; every ${prop} there must be ${want}`);
   };
   for (const l of lines) {
     wants(`.lc-${l.k}`, '--lc', `l-${l.k}`);
