@@ -130,7 +130,7 @@ def column(result, scenario, key):
 def test_unit_retention_against_independent_hand_calculation():
     # Units: 10, 10 + 0.5*10 = 15, 10 + 0.5*15 = 17.5. Cash: 1000 + 700 + 1100 + 1300.
     result = forecast(simple(monthly_retention="0.5"))
-    assert result["model_version"] == "1.1.0"
+    assert result["model_version"] == "1.1.1"
     base = result["scenarios"]["base"]
     assert column(result, "base", "revenue") == ["1000.00", "1500.00", "1750.00"]
     assert column(result, "base", "units") == ["10.0000", "15.0000", "17.5000"]
@@ -186,16 +186,26 @@ def test_default_neutrality_preserves_v1_rounding_tie_breaks():
     assert base["summary"]["ending_cash"] == "106211231444.47"
 
 
+def saved_before_the_places_limit(**changes):
+    """Inputs as a plan saved before every decimal input was limited to 12 places could carry them."""
+    with pytest.raises(ValidationError):
+        ForecastInputs(**changes)
+    values = ForecastInputs().model_dump() | {
+        k: v if isinstance(v, int) else D(v) for k, v in changes.items()
+    }
+    return ForecastInputs.model_construct(**values)
+
+
 def test_disabled_features_do_not_round_long_operands_before_scenario_factors():
     long_value = "1.00476190476190476190476190476190476190436"
-    fixed_case = forecast(ForecastInputs(months=1, monthly_units=0, fixed_costs=long_value))
+    fixed_case = forecast(saved_before_the_places_limit(months=1, monthly_units=0, fixed_costs=long_value))
     upside = fixed_case["scenarios"]["upside"]["months"][0]
     assert upside["fixed_costs"] == "1.06"
     assert upside["net_income"] == "-1.06"
     assert upside["net_cash_flow"] == "-1.06"
 
     unit_case = forecast(
-        ForecastInputs(
+        saved_before_the_places_limit(
             months=1, monthly_units=long_value, unit_price=1, unit_cost=0, fixed_costs=0, tax_rate=0
         )
     )

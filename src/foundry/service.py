@@ -100,6 +100,18 @@ def evidence_basis(history):
     return set().union(*(cited(entry) for entry in basis))
 
 
+def evaluate(model, *args):
+    """Run a financial model; an arithmetic failure is a refusal of these inputs, not a server fault."""
+    try:
+        return model(*args)
+    except ArithmeticError as exc:
+        # Raised inside the command transaction, so nothing is stored and the idempotency key stays unused.
+        raise DomainError(
+            "The financial model cannot evaluate these inputs "
+            f"({type(exc).__name__}). Review unusually large or precise values and try again."
+        ) from None
+
+
 class Service:
     def __init__(self, store: Store):
         self.store = store
@@ -439,7 +451,7 @@ class Service:
     def save_forecast(self, actor, bid, key, payload):
         def run(con):
             self.references(con, bid, payload["evidence_ids"], "evidence")
-            result = finance.forecast(ForecastInputs.model_validate(payload["inputs"]))
+            result = evaluate(finance.forecast, ForecastInputs.model_validate(payload["inputs"]))
             item = self.store.add(
                 con,
                 bid,
@@ -463,7 +475,7 @@ class Service:
             ]
             evidence = self.references(con, bid, ids, "evidence")
             reviewed = {e["id"] for e in evidence if e["state"] == "verified"}
-            result = finance.acquisition(DealInputs.model_validate(payload), reviewed)
+            result = evaluate(finance.acquisition, DealInputs.model_validate(payload), reviewed)
             data = {
                 "inputs": payload,
                 "analysis": result,

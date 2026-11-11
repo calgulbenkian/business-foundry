@@ -144,7 +144,7 @@ def build_server():
     def build_forecast(
         business_id: str, command_key: str, title: str, inputs: dict, evidence_ids: list[str]
     ) -> dict:
-        """Run deterministic linked statements and scenarios. See API schema for ForecastInputs; monetary values are decimal strings."""
+        """Run deterministic linked statements and scenarios. See API schema for ForecastInputs; send every amount and rate as a decimal string with at most 12 decimal places."""
         return request(
             "POST",
             path(business_id) + "/forecasts",
@@ -154,7 +154,7 @@ def build_server():
 
     @server.tool()
     def analyze_acquisition(business_id: str, command_key: str, inputs: dict) -> dict:
-        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Creates diligence work."""
+        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work."""
         return request("POST", path(business_id) + "/deals", inputs, command_key)
 
     @server.tool()
