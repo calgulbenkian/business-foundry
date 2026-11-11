@@ -12,6 +12,27 @@ from .store import DomainError, Store, canonical, digest, now, uid
 REVIEWERS = {"owner", "reviewer"}
 WRITERS = {"owner", "operator", "reviewer", "agent"}
 FINISHED = {"verified", "not_applicable"}
+UNREADABLE = (TypeError, ValueError, RecursionError)
+
+
+def read_json(text):
+    """Parse a stored JSON column for verification; None when it cannot be read."""
+    try:
+        return json.loads(text)
+    except UNREADABLE:
+        return None
+
+
+def same_json(stored, recorded):
+    """Equal by JSON type and value: false and 0, true and 1, 1 and 1.0 are different.
+
+    Key order and whitespace are gone after parsing. A value canonical() cannot encode,
+    such as NaN or Infinity, is never equal to anything.
+    """
+    try:
+        return canonical(stored) == canonical(recorded)
+    except UNREADABLE:
+        return False
 
 
 class Service:
@@ -586,7 +607,7 @@ class Service:
                     ai_latest[p["run_id"]] = p
             objects = self.store.objects(con, bid)
             for obj in [business] + objects:
-                if latest.pop(obj["id"], None) != obj:
+                if not same_json(obj, latest.pop(obj["id"], None)):
                     errors.append(f"Current record differs from history: {obj['id']}")
                 if (
                     obj.get("kind") in {"evidence", "document"}
@@ -598,7 +619,7 @@ class Service:
                         "SELECT snapshot FROM revisions WHERE object_id=? AND version=?",
                         (obj["id"], obj["version"]),
                     ).fetchone()
-                    if not revision or json.loads(revision[0]) != obj:
+                    if not revision or not same_json(read_json(revision[0]), obj):
                         errors.append(f"Revision mismatch: {obj['id']}")
             errors.extend(f"Historical record missing: {oid}" for oid in latest)
             errors.extend(self._revision_errors(con, bid, versions))
@@ -667,11 +688,7 @@ class Service:
             if event is None:
                 errors.append(f"Revision has no recorded history: {oid} version {version}")
                 continue
-            try:
-                snapshot = json.loads(row["snapshot"])
-            except (TypeError, ValueError):
-                snapshot = None
-            if snapshot != event:
+            if not same_json(read_json(row["snapshot"]), event):
                 errors.append(f"Historical revision differs from history: {oid} version {version}")
         errors.extend(
             f"Historical revision missing: {oid} version {version}"
