@@ -508,11 +508,13 @@ def open_window(app: DesktopApp, start_url: str):
     gui = "edgechromium" if sys.platform == "win32" else None
     webview.start(
         gui=gui,
-        private_mode=True,  # no cookies or site data kept on disk
-        storage_path=str(app.data_dir / "webview"),  # never pywebview's shared default folder
+        # Clears the window's cookies and site data at startup (InPrivate on WebView2; on macOS
+        # pywebview clears WebKit's default store for the app instead).
+        private_mode=True,
+        # Used by WebView2, whose default folder is shared by every pywebview app; macOS
+        # ignores it.
+        storage_path=str(app.data_dir / "webview"),
     )
-    if sys.platform == "win32" and webview.renderer != "edgechromium":  # pragma: no cover
-        log.error("Window used renderer %s.", webview.renderer)
 
 
 def show_error(message: str):
