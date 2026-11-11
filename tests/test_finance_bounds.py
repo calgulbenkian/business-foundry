@@ -33,7 +33,7 @@ import pytest
 import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from foundry import cli, finance
 from foundry.api import create_app
@@ -640,12 +640,30 @@ PLACES_MESSAGE = "Decimal input should have no more than 12 decimal places"
 MODEL_MESSAGE = "The financial model cannot evaluate these inputs"
 
 
+def holds(annotation, kind) -> bool:
+    """Whether a field annotation is `kind` or contains it at any depth (Optional, list, Annotated...)."""
+    return annotation is kind or any(holds(arg, kind) for arg in typing.get_args(annotation))
+
+
 def decimal_fields(model):
-    return [
-        name
-        for name, field in model.model_fields.items()
-        if Decimal in (field.annotation, *typing.get_args(field.annotation))
-    ]
+    return [name for name, field in model.model_fields.items() if holds(field.annotation, Decimal)]
+
+
+def nested_models(model, found=None) -> list:
+    """`model` and every model reachable through its fields' annotations, to any depth, in first-seen order."""
+    found = [] if found is None else found
+    if model not in found:
+        found.append(model)
+
+        def visit(annotation):
+            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                nested_models(annotation, found)
+            for arg in typing.get_args(annotation):
+                visit(arg)
+
+        for field in model.model_fields.values():
+            visit(field.annotation)
+    return found
 
 
 def field_case(model, field, value):
@@ -657,6 +675,7 @@ def field_case(model, field, value):
         return {**inputs, field: value}, (field,)
     if model is Adjustment:
         return {**DEAL, "adjustments": [{"label": "Synthetic", field: value}]}, ("adjustments", 0, field)
+    assert model is DealInputs, f"No field case for {model.__name__}"
     body = {**DEAL, field: value}
     if field == "multiple_high":
         body["multiple_low"] = "0"
@@ -667,7 +686,14 @@ def field_case(model, field, value):
     return body, (field,)
 
 
-DECIMAL_FIELDS = [(m, f) for m in (ForecastInputs, DealInputs, Adjustment) for f in decimal_fields(m)]
+DECIMAL_MODELS = [m for top in (ForecastInputs, DealInputs) for m in nested_models(top) if decimal_fields(m)]
+DECIMAL_FIELDS = [(m, f) for m in DECIMAL_MODELS for f in decimal_fields(m)]
+
+
+def test_every_model_with_a_decimal_input_has_a_field_case():
+    # A decimal field in a further nested model joins DECIMAL_FIELDS and must be given a case in field_case.
+    assert DECIMAL_MODELS == [ForecastInputs, DealInputs, Adjustment]
+    assert holds(list[typing.Annotated[Decimal | None, "x"]], Decimal)
 
 
 def test_the_field_lists_find_every_known_decimal_input():
@@ -896,8 +922,10 @@ def test_api_evaluates_the_smallest_accepted_principal(client, setup):
 
 
 # Domain corners: the smallest positive and the largest accepted amounts evaluate, and every non-zero value
-# the models compute in the caller's context stays within 1E-100 <= |v| < 1E+46 (docs/FINANCE.md). The exact
-# debt-service fraction uses its own contexts and is checked against exact rationals instead.
+# the forecast computes in the caller's context, and every exact step of the acquisition screen, stays within
+# 1E-100 <= |v| < 1E+46 (docs/FINANCE.md). The exact fractions over the debt service (the payment's numerator and
+# denominator, and cash available scaled by that denominator) have no limit on size; they are checked against
+# exact rationals and the digit bounds of STEP_DIGITS instead.
 
 TINY = "1E-12"
 FORECAST_MAXIMA = {
@@ -1020,6 +1048,13 @@ def test_deal_corners_evaluate_within_the_stated_magnitudes(corner):
     loans = [(inputs.senior_debt, inputs.debt_rate, inputs.debt_years)]
     loans.append((inputs.seller_note, inputs.seller_rate, inputs.seller_years))
     assert result["annual_debt_service"] == half_even(exact_total(*loans))
+    # The acquisition screen calculates in its own exact contexts, so its steps are checked directly.
+    steps = finance._deal_values(inputs, {"reviewed"})
+    linear = [steps[k] for k in ("normalized", "uses", "buyer_equity", "interest")]
+    linear += [*steps.get("value_range", ()), *steps.get("equity_range", ())]
+    linear += [s[k] for s in steps["scenarios"].values() for k in ("earnings", "taxable", "tax", "available")]
+    assert all(v.is_zero() or D("1E-100") <= v.copy_abs() < D("1E+46") for v in linear)
+    assert_exact(inputs)
 
 
 def test_corner_outputs_match_the_stated_extremes():
@@ -1219,3 +1254,696 @@ def test_demo_seed_is_accepted(setup):
     _, service, actor, _, _ = setup
     business = seed(service, actor)
     assert service.audit(actor, business["id"])["integrity"]["valid"]
+
+
+# Every acquisition figure is the exact value of its formula rounded half-even once (docs/FINANCE.md).
+#
+# exact_figures is the independent calculation: fractions.Fraction, the level-payment formula of exact_payment
+# and half_even. The deals below are built to sit on, or one unit in the 24th or 36th decimal place either side
+# of, a rounding boundary of a displayed figure.
+
+TAX_STEP = Fraction(1, 10**12)  # A tax rate of 1E-12 moves the tax term 12 places below the earnings.
+FIGURES = (
+    "normalized_ebitda",
+    "enterprise_value_range",
+    "equity_value_range",
+    "sources_and_uses",
+    "annual_debt_service",
+    "scenarios",
+)
+REVIEWED = frozenset({"reviewed"})
+
+
+def exact_figures(inputs: DealInputs, verified=REVIEWED) -> dict:
+    f = {name: Fraction(getattr(inputs, name)) for name in decimal_fields(DealInputs)}
+    normalized = f["reported_ebitda"] - f["replacement_management"]
+    for item in inputs.adjustments:
+        if item.evidence_id and item.evidence_id in verified:
+            normalized += Fraction(item.amount)
+    service = exact_total(
+        (inputs.senior_debt, inputs.debt_rate, inputs.debt_years),
+        (inputs.seller_note, inputs.seller_rate, inputs.seller_years),
+    )
+    interest = f["senior_debt"] * f["debt_rate"] + f["seller_note"] * f["seller_rate"]
+    revenue = f["annual_revenue"]
+    scenarios = {}
+    for name, earnings in (
+        ("base", normalized),
+        ("downside", normalized - revenue / 10),
+        ("upside", normalized + revenue / 20),
+    ):
+        tax = max(earnings - interest, Fraction(0)) * f["tax_rate"]
+        available = earnings - tax - f["annual_capex"] - f["annual_working_capital_growth"]
+        after = available - service
+        scenarios[name] = {
+            "ebitda": half_even(earnings),
+            "cash_available_for_debt_service": half_even(available),
+            "cash_after_debt_service": half_even(after),
+            "coverage_ratio": half_even(available / service, 4) if service else None,
+            "cash_shortfall": after < 0,
+        }
+    values = [normalized * f["multiple_low"], normalized * f["multiple_high"]]
+    bridge = f["cash_acquired"] - f["debt_assumed"]
+    uses = f["purchase_price"] + f["fees"] + f["working_capital"] + f["integration_cost"]
+    return {
+        "normalized_ebitda": half_even(normalized),
+        "enterprise_value_range": [half_even(v) for v in values] if normalized > 0 else None,
+        "equity_value_range": [half_even(v + bridge) for v in values] if normalized > 0 else None,
+        "sources_and_uses": {
+            "purchase_price": half_even(f["purchase_price"]),
+            "fees": half_even(f["fees"]),
+            "working_capital": half_even(f["working_capital"]),
+            "integration_cost": half_even(f["integration_cost"]),
+            "total_uses": half_even(uses),
+            "senior_debt": half_even(f["senior_debt"]),
+            "seller_note": half_even(f["seller_note"]),
+            "buyer_equity_required": half_even(uses - f["senior_debt"] - f["seller_note"]),
+        },
+        "annual_debt_service": half_even(service),
+        "scenarios": scenarios,
+    }
+
+
+def assert_exact(inputs: DealInputs, verified=REVIEWED):
+    result = acquisition(inputs, set(verified))
+    assert {k: result[k] for k in FIGURES} == exact_figures(inputs, verified), inputs.model_dump(mode="json")
+    return result
+
+
+def significant(value: Decimal) -> int:
+    """Significant digits of a Decimal's value, from the first non-zero digit to the last."""
+    digits = value.as_tuple().digits  # A non-zero coefficient has no leading zero.
+    end = len(digits)
+    while end and not digits[end - 1]:
+        end -= 1
+    return end
+
+
+def dec(value: Fraction) -> Decimal:
+    """The Decimal equal to a rational whose denominator is a power of ten (written from integers)."""
+    for places in range(41):
+        scaled = value * 10**places
+        if scaled.denominator == 1:
+            return D(f"{scaled.numerator}E-{places}")
+    raise AssertionError(value)
+
+
+def random_loan(rng, rate: bool):
+    places = rng.choice([0, 2, 12])
+    principal = D(f"{rng.randint(1, 10**7 * 10**places)}E-{places}")
+    rate_value = D(f"{rng.randint(1, 25 * 10**10)}E-12") if rate else D(0)  # Up to 0.25, 12 places.
+    return principal, rate_value, rng.randint(1, 30)
+
+
+LOAN_KINDS = ("one at zero", "one at a rate", "two at zero", "two at rates", "one of each")
+
+
+def random_loans(rng, kind):
+    rates = {
+        "one at zero": [False],
+        "one at a rate": [True],
+        "two at zero": [False, False],
+        "two at rates": [True, True],
+        "one of each": [False, True],
+    }[kind]
+    loans = [random_loan(rng, r) for r in rates]
+    return loans + [(D(0), D("0.06"), 5)] * (2 - len(loans))
+
+
+def interest_of(loans) -> Fraction:
+    return sum((Fraction(p) * Fraction(r) for p, r, _ in loans), Fraction(0))
+
+
+def service_of(loans) -> Fraction:
+    return exact_total(*loans)
+
+
+def deal_with_available(rng, loans, target: Fraction, adjust: bool = False) -> DealInputs:
+    """A deal whose exact base cash available for debt service is `target`.
+
+    With a tax rate of 1E-12, cash available = R − (R − interest) × 1E-12 − capex for reported EBITDA R. The
+    last 12 places of R are chosen so that R − R × 1E-12 meets target − interest × 1E-12 in places 13 to 24;
+    capex takes the rest. target − interest × 1E-12 must have at most 24 places.
+    """
+    (s, r1, y1), (n, r2, y2) = loans
+    interest = interest_of(loans)
+    rest = (target - interest * TAX_STEP) * 10**24
+    assert rest.denominator == 1
+    rest = rest.numerator
+    whole = int(max(target, interest, Fraction(0))) + rng.randint(2, 1000)
+    reported = whole * 10**12 + (-rest) % 10**12
+    capex, remainder = divmod(reported * 10**12 - reported - rest, 10**12)
+    assert remainder == 0 and capex >= 0
+    reported = Fraction(reported, 10**12)
+    assert interest < reported <= 10**9
+    adjustments = []
+    if adjust:  # Part of the earnings arrives as an accepted adjustment; an unreviewed one is excluded.
+        amount = Fraction(rng.randint(-(10**20), 10**20), 10**12)
+        reported -= amount
+        adjustments = [
+            {"label": "Synthetic reviewed", "amount": dec(amount), "evidence_id": "reviewed"},
+            {"label": "Synthetic unreviewed", "amount": D(rng.randint(1, 10**6)), "evidence_id": "other"},
+        ]
+    deal = DealInputs(
+        **DEAL,
+        annual_revenue=D(max(whole, int(reported)) + 1 + rng.randint(0, 10**6)),
+        reported_ebitda=dec(reported),
+        adjustments=adjustments,
+        purchase_price=dec(Fraction(s) + Fraction(n)),
+        fees=0,
+        working_capital=0,
+        senior_debt=s,
+        debt_rate=r1,
+        debt_years=y1,
+        seller_note=n,
+        seller_rate=r2,
+        seller_years=y2,
+        annual_capex=dec(Fraction(capex, 10**12)),
+        tax_rate=D("1E-12"),
+    )
+    return deal
+
+
+def beside(boundary: Fraction, interest: Fraction) -> dict:
+    """Reachable cash available values one unit in the 24th place of R's term below and above `boundary`, and
+    on it when it is reachable."""
+    shift = interest * TAX_STEP
+    scaled = (boundary - shift) * 10**24
+    low = scaled.numerator // scaled.denominator
+    sides = (
+        {"below": low - 1, "on": low, "above": low + 1} if scaled == low else {"below": low, "above": low + 1}
+    )
+    return {side: Fraction(v, 10**24) + shift for side, v in sides.items()}
+
+
+def boundary_cases(seed, count, boundary_for):
+    """Deals on and either side of a boundary that `boundary_for(rng, service)` picks for random loans."""
+    rng = random.Random(seed)
+    cases = []
+    while len(cases) < count:
+        loans = random_loans(rng, LOAN_KINDS[len(cases) % len(LOAN_KINDS)])
+        boundary = boundary_for(rng, service_of(loans))
+        if boundary is None or abs(boundary) > 8 * 10**8:
+            continue
+        for side, target in beside(boundary, interest_of(loans)).items():
+            cases.append((side, target, deal_with_available(rng, loans, target, adjust=len(cases) % 3 == 0)))
+    return cases
+
+
+def check_cases(cases, check=None):
+    for side, target, deal in cases:
+        result = assert_exact(deal)
+        base = result["scenarios"]["base"]
+        assert base["cash_available_for_debt_service"] == half_even(target)
+        if check:
+            check(side, target, deal, base)
+
+
+def test_cash_after_debt_service_beside_a_half_cent_is_exact():
+    def half_cent(rng, service):
+        return service + Fraction(2 * rng.randint(-(10**9), 10**9) + 1, 200)
+
+    check_cases(boundary_cases(20261201, 120, half_cent))
+
+
+def test_shortfall_flag_beside_the_exact_payment_is_exact():
+    def check(side, target, deal, base):
+        assert base["cash_shortfall"] is (side == "below")
+
+    check_cases(boundary_cases(20261202, 120, lambda rng, service: service), check)
+
+
+def test_coverage_beside_a_tie_is_exact():
+    def tie(rng, service):
+        return service * Fraction(2 * rng.randint(-40000, 200000) + 1, 20000)
+
+    check_cases(boundary_cases(20261203, 120, tie))
+
+
+def test_coverage_exactly_on_a_tie_rounds_half_even():
+    # Zero-rate loans whose payment has no finite decimal, with a coverage whose cash available does.
+    rng = random.Random(20261204)
+    cases = 0
+    while cases < 60:
+        loans = random_loans(rng, ("one at zero", "two at zero")[cases % 2])
+        service = service_of(loans)
+        odd = service.denominator
+        for prime in (2, 5):
+            while odd % prime == 0:
+                odd //= prime
+        if odd == 1:
+            continue
+        limit = 8 * 10**8 * 20000 // (service * odd)
+        if limit < 1:
+            continue
+        coverage = Fraction(odd * (2 * rng.randint(0, min(limit, 10**6) // 2) + 1), 20000)
+        coverage *= rng.choice([1, -1])
+        target = service * coverage
+        if (target * 10**24).denominator != 1 or abs(target) > 8 * 10**8:
+            continue
+        deal = deal_with_available(rng, loans, target, adjust=cases % 3 == 0)
+        base = assert_exact(deal)["scenarios"]["base"]
+        assert base["coverage_ratio"] == half_even(coverage, 4)
+        assert base["coverage_ratio"][-1] in "02468"  # A tie rounds to the even fourth place.
+        cases += 1
+
+
+def test_cash_available_of_more_than_28_digits_beside_a_half_cent_is_exact():
+    def half_cent(rng, service):
+        return Fraction(2 * rng.randint(10**7, 8 * 10**10) + 1, 200) * rng.choice([1, -1])
+
+    rng = random.Random(20261205)
+    cases = []
+    while len(cases) < 120:
+        kinds = ("no loan", *LOAN_KINDS)
+        kind = kinds[len(cases) % len(kinds)]
+        loans = random_loans(rng, kind) if kind != "no loan" else [(D(0), D(0), 1)] * 2
+        boundary = half_cent(rng, None)
+        for side, target in beside(boundary, interest_of(loans)).items():
+            cases.append((side, target, deal_with_available(rng, loans, target, adjust=len(cases) % 3 == 0)))
+    assert all(significant(dec(target)) > 28 for side, target, _ in cases if side != "on")
+    check_cases(cases)
+
+
+def deal_with_value_beside_a_half_cent(rng, side) -> tuple[DealInputs, Fraction]:
+    """A deal whose enterprise value at one multiple is one to 10,000 units in the 24th place below, on or above
+    a half cent: normalized × multiple has 34 to 37 digits."""
+    while True:
+        multiple = rng.randint(10**12, 100 * 10**12)  # 1 to 100 with 12 places, coprime to 10.
+        if multiple % 2 and multiple % 5:
+            break
+    offset = {"below": -rng.randint(1, 10**4), "on": 0, "above": rng.randint(1, 10**4)}[side]
+    modulus = 10**22  # In units of 1E-24, one cent is 10^22.
+    scaled = (5 * 10**21 + offset) * pow(multiple, -1, modulus) % modulus + rng.randint(0, 3) * modulus
+    normalized = Fraction(scaled, 10**12)
+    whole = int(normalized // 999999999)
+    reported = normalized - whole * 999999999
+    adjustments = [{"label": "Synthetic", "amount": "999999999", "evidence_id": "reviewed"}] * whole
+    adjustments.append({"label": "Synthetic unsupported", "amount": "1000", "evidence_id": None})
+    other = rng.randint(0, multiple) if rng.random() < 0.5 else rng.randint(multiple, 100 * 10**12)
+    low, high = sorted([multiple, other])
+    deal = DealInputs(
+        **DEAL,
+        annual_revenue="1000000000000",
+        reported_ebitda=dec(reported),
+        adjustments=adjustments,
+        multiple_low=D(f"{low}E-12"),
+        multiple_high=D(f"{high}E-12"),
+        cash_acquired=D(f"{rng.randint(0, 10**14)}E-2"),
+        debt_assumed=D(f"{rng.randint(0, 10**14)}E-2"),
+    )
+    return deal, normalized * Fraction(multiple, 10**12)
+
+
+def test_enterprise_and_equity_value_beside_a_half_cent_are_exact():
+    rng = random.Random(20261206)
+    for case in range(150):
+        side = ("below", "on", "above")[case % 3]
+        deal, value = deal_with_value_beside_a_half_cent(rng, side)
+        cents = value * 100
+        distance = cents - cents.numerator // cents.denominator - Fraction(1, 2)  # From the half cent.
+        assert {"below": distance < 0, "on": distance == 0, "above": distance > 0}[side]
+        assert abs(distance) <= Fraction(10**4, 10**22) and (side == "on" or significant(dec(value)) > 28)
+        result = assert_exact(deal)
+        assert half_even(value) in result["enterprise_value_range"]
+
+
+def random_deal(rng, wide: bool) -> DealInputs:
+    """A random accepted deal: ordinary amounts with cents and short rates, or 12-place inputs and large amounts."""
+
+    def amount(high, places=None):
+        places = rng.choice([0, 2, 12]) if wide and places is None else places if places is not None else 2
+        return D(f"{rng.randint(0, high * 10**places)}E-{places}")
+
+    def rate(high_percent):
+        places = rng.randint(1, 12) if wide else rng.randint(2, 4)
+        return D(f"{rng.randint(0, high_percent * 10**places // 100)}E-{places}")
+
+    top = 10**12 if wide else 10**7  # The largest transaction amount.
+    scale = 10**9 if wide else 10**6  # The size of the earnings.
+    reported = D(f"{rng.randint(-(scale // 4) * 10**12, scale * 10**12)}E-12") if wide else amount(scale)
+    revenue = max(amount(top), reported)
+    adjustments = [
+        {
+            "label": "Synthetic",
+            "amount": dec(Fraction(amount(scale // 10)) - Fraction(amount(scale // 10))),
+            "evidence_id": rng.choice(["reviewed", "other", None]),
+        }
+        for _ in range(rng.randint(0, 4))
+    ]
+    uses = [amount(top if wide else 10 * scale) for _ in range(4)]
+    total = sum((Fraction(u) for u in uses), Fraction(0))
+    places = 12 if wide else 2
+
+    def share(whole: Fraction) -> Decimal:  # A random part of `whole`, cut to the deal's places.
+        return D(f"{int(whole * rng.randint(0, 1000) * 10**places // 1000)}E-{places}")
+
+    senior = share(min(total * Fraction(3, 5), Fraction(10**12)))
+    seller = share(min(total - Fraction(senior), Fraction(10**12)))
+    low = amount(20, rng.choice([0, 2, 12]) if wide else 1)
+    return DealInputs(
+        **DEAL,
+        annual_revenue=revenue,
+        reported_ebitda=reported,
+        adjustments=adjustments,
+        replacement_management=amount(scale // 10),
+        multiple_low=low,
+        multiple_high=dec(Fraction(low) + Fraction(amount(20, 1))),
+        purchase_price=uses[0],
+        fees=uses[1],
+        working_capital=uses[2],
+        integration_cost=uses[3],
+        senior_debt=senior,
+        debt_rate=rate(25) if rng.random() < 0.8 else D(0),
+        debt_years=rng.randint(1, 30),
+        seller_note=seller,
+        seller_rate=rate(25) if rng.random() < 0.8 else D(0),
+        seller_years=rng.randint(1, 30),
+        annual_capex=amount(scale // 5),
+        annual_working_capital_growth=amount(scale // 20),
+        tax_rate=rate(40),
+        cash_acquired=amount(top // 10),
+        debt_assumed=amount(top // 10),
+    )
+
+
+@pytest.mark.parametrize("wide", [False, True], ids=["ordinary", "twelve_places"])
+def test_random_deals_are_exact_in_every_figure(wide):
+    rng = random.Random(20261207 + wide)
+    for _ in range(200):
+        assert_exact(random_deal(rng, wide))
+
+
+# The reviewer's request and hand-worked coverage on a tie: 100,000 over 6 years at zero rate pays 16,666.66…
+# a year, so coverage is EBITDA × 6 / 100,000 with no tax, capex or interest. Downside subtracts 100,000 of the
+# default 1,000,000 revenue and upside adds 50,000.
+TIE_REQUEST = {
+    "target": "Synthetic",
+    "thesis": "Synthetic testing",
+    "senior_debt": "100000",
+    "debt_rate": "0",
+    "debt_years": 6,
+    "seller_note": "0",
+    "annual_capex": "0",
+    "tax_rate": "0",
+}
+
+
+@pytest.mark.parametrize(
+    ("ebitda", "base", "downside", "upside"),
+    [
+        ("20837.5", "1.2502", "-4.7498", "4.2502"),  # Exact: 1.25025, −4.74975, 4.25025.
+        ("20842.5", "1.2506", "-4.7494", "4.2506"),  # Exact: 1.25055, −4.74945, 4.25055.
+    ],
+)
+def test_api_coverage_on_a_tie_rounds_half_even(client, setup, ebitda, base, downside, upside):
+    response = post(client, setup[3], "deals", {**TIE_REQUEST, "reported_ebitda": ebitda})
+    assert response.status_code == 201
+    scenarios = response.json()["data"]["analysis"]["scenarios"]
+    assert [scenarios[name]["coverage_ratio"] for name in ("base", "downside", "upside")] == [
+        base,
+        downside,
+        upside,
+    ]
+
+
+def test_cash_after_debt_service_of_exactly_zero_is_not_a_shortfall():
+    # 0.01 / 3 + 0.035 / 3 = 0.015 exactly, and cash available is 0.015 with no tax, capex or interest.
+    loans = {"senior_debt": "0.01", "seller_note": "0.035", "debt_rate": "0", "seller_rate": "0"}
+    body = {**DEAL, **loans, "debt_years": 3, "seller_years": 3, "annual_capex": "0", "tax_rate": "0"}
+    base = assert_exact(DealInputs(**body, reported_ebitda="0.015"))["scenarios"]["base"]
+    assert base["cash_after_debt_service"] == "0.00" and base["cash_shortfall"] is False
+    assert base["coverage_ratio"] == "1.0000"
+    base = assert_exact(DealInputs(**body, reported_ebitda="0.014999999999"))["scenarios"]["base"]
+    assert base["cash_after_debt_service"] == "0.00" and base["cash_shortfall"] is True
+    assert base["coverage_ratio"] == "1.0000"
+
+
+def synthetic(**fields):
+    defaults = dict.fromkeys(
+        ("fees", "working_capital", "integration_cost", "annual_working_capital_growth"), "0"
+    ) | {"cash_acquired": "0", "debt_assumed": "0", "adjustments": [], "replacement_management": "0"}
+    return {
+        "target": "Synthetic target",
+        "thesis": "Synthetic thesis for a probe.",
+        "multiple_low": "3",
+        "multiple_high": "5",
+        "tax_rate": "0.000000000001",
+        **defaults,
+        **fields,
+    }
+
+
+# Requests that 1.0.1 as first proposed got wrong, one per family, with the exact base figure.
+LOANS_A = {"senior_debt": "16546575.67", "debt_rate": "0", "debt_years": 9}
+LOANS_A |= {"seller_note": "68625107.58", "seller_rate": "0.104148", "seller_years": 21}
+LOANS_B = {"senior_debt": "82792299.35", "debt_rate": "0.090412", "debt_years": 29}
+LOANS_B |= {"seller_note": "74626943.49", "seller_rate": "0.015372", "seller_years": 20}
+EXAMPLE_REQUESTS = [
+    (
+        synthetic(
+            annual_revenue="25067710",
+            reported_ebitda="25067709.975",
+            purchase_price="868145801",
+            senior_debt="73209800",
+            debt_rate="0",
+            debt_years=30,
+            seller_note="794936000",
+            seller_rate="0",
+            seller_years=30,
+            annual_capex="0",
+            tax_rate="0",
+        ),
+        {"coverage_ratio": "0.8662"},
+    ),
+    (
+        synthetic(
+            annual_revenue="21633440",
+            reported_ebitda="21633439.94025922",
+            purchase_price="56969554.32",
+            senior_debt="44193993.07",
+            debt_rate="0.168104",
+            debt_years=13,
+            seller_note="12775560.25",
+            seller_rate="0.20573",
+            seller_years=11,
+            annual_capex="10306760.003621810658",
+        ),
+        {"cash_shortfall": True},
+    ),
+    (
+        synthetic(
+            annual_revenue="17313842",
+            reported_ebitda="17313841.985945158",
+            purchase_price="85171684.25",
+            annual_capex="7414875.305182901753",
+            **LOANS_A,
+        ),
+        {"cash_shortfall": False},
+    ),
+    (
+        synthetic(
+            annual_revenue="21136961",
+            reported_ebitda="21136960.80752734",
+            purchase_price="157419243.84",
+            annual_capex="8722130.884771204582",
+            **LOANS_B,
+        ),
+        {"cash_after_debt_service": "0.17"},
+    ),
+    (
+        synthetic(
+            annual_revenue="17842046",
+            reported_ebitda="17842045.985945158",
+            purchase_price="85171684.25",
+            annual_capex="7943079.220182373549",
+            **LOANS_A,
+        ),
+        {"cash_after_debt_service": "0.09"},
+    ),
+    (
+        synthetic(
+            annual_revenue="44722704",
+            reported_ebitda="44722703.20391642",
+            purchase_price="157419243.84",
+            annual_capex="9504934.916968584527",
+            **LOANS_B,
+        ),
+        {"coverage_ratio": "2.8367"},
+    ),
+    (
+        synthetic(
+            annual_revenue="52027158",
+            reported_ebitda="52027157.21177942",
+            purchase_price="89498772.41",
+            senior_debt="67899117.1",
+            debt_rate="0.111838",
+            debt_years=15,
+            seller_note="21599654.31",
+            seller_rate="0.234875",
+            seller_years=7,
+            annual_capex="12908371.33336604644",
+        ),
+        {"coverage_ratio": "2.4969"},
+    ),
+    (
+        synthetic(
+            annual_revenue="555579562",
+            reported_ebitda="555579561.000000000656",
+            purchase_price="1",
+            senior_debt="0",
+            debt_rate="0",
+            debt_years=7,
+            seller_note="0",
+            seller_rate="0",
+            seller_years=5,
+            annual_capex="554747270.984444421095",
+        ),
+        {"cash_available_for_debt_service": "832290.01", "cash_after_debt_service": "832290.01"},
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "expected"), EXAMPLE_REQUESTS)
+def test_example_requests_give_the_exact_figures(body, expected):
+    assert len(body) == 23  # Every input of the original request is written out.
+    base = assert_exact(DealInputs.model_validate_json(json.dumps(body)))["scenarios"]["base"]
+    assert {k: base[k] for k in expected} == expected
+
+
+# D3: the largest number of significant digits an accepted input can give each exact step (docs/FINANCE.md).
+# Money inputs are at most 1E+12 and earnings inputs at most 1E+9 in size, rates at most 1, multiples at most 100,
+# each with at most 12 places, so each step's span of digit positions is bounded. Two loans of 30 years, with
+# s = 12 + rate ≤ 13 to 12 places: each denominator s^360 − 12^360 < 10^402 with 4,320 places.
+STEP_DIGITS = {
+    "normalized": 25,  # Below 1.051E+12 in size, 12 places.
+    "uses": 25,
+    "buyer_equity": 25,
+    "interest": 37,  # Below 2E+12, 24 places.
+    "earnings": 27,  # Upside: below 1.051E+12 in size, 14 places (5% of revenue).
+    "taxable": 37,  # Below 3.2E+12 in size, 24 places.
+    "tax": 48,  # Below 1.01E+11, 36 places.
+    "available": 49,  # Below 3.2E+12 in size, 36 places.
+    "value_range": 37,  # Below 5.1E+12, 24 places.
+    "equity_range": 37,  # Below 6.1E+12, 24 places.
+    "denominator": 9443,  # Below 13^720 < 10^803, 8,640 places.
+    "numerator": 9479,  # Below 2E+12 × 13^720 < 10^815, 8,664 places.
+    "scaled_available": 9491,  # Below 3.2E+12 × 13^720 < 10^815, 8,676 places.
+    "after_numerator": 9491,  # Below 5.2E+12 × 13^720 < 10^815, 8,676 places.
+}
+TWELVE_NINES = "0.999999999999"
+WIDEST = "999999999999.999999999999"
+# Witnesses that reach the bounds: wide negative earnings with two 30-year loans, and wide positive earnings
+# with a tax rate just below 1 and wide capex.
+DIGIT_WITNESSES = {
+    "negative": {
+        "annual_revenue": WIDEST,
+        "reported_ebitda": "-1",
+        "replacement_management": WIDEST,
+        "adjustments": [
+            {"label": "Synthetic", "amount": "-999999999.999999999999", "evidence_id": "reviewed"}
+        ]
+        * ADJUSTMENTS,
+        "purchase_price": "1000000000000",
+        "fees": "1000000000000",
+        "senior_debt": WIDEST,
+        "debt_rate": TWELVE_NINES,
+        "debt_years": 30,
+        "seller_note": WIDEST,
+        "seller_rate": TWELVE_NINES,
+        "seller_years": 30,
+        "annual_capex": WIDEST,
+        "annual_working_capital_growth": WIDEST,
+        "tax_rate": TWELVE_NINES,
+    },
+    "positive": {
+        "annual_revenue": WIDEST,
+        "reported_ebitda": "999999999.999999999999",
+        "adjustments": [{"label": "Synthetic", "amount": "999999999.999999999999", "evidence_id": "reviewed"}]
+        * ADJUSTMENTS,
+        "multiple_low": "99.999999999999",
+        "multiple_high": "99.999999999999",
+        **dict.fromkeys(("purchase_price", "fees", "working_capital", "integration_cost"), WIDEST),
+        "senior_debt": "0.000000000001",
+        "debt_rate": TWELVE_NINES,
+        "debt_years": 30,
+        "seller_note": "0.000000000001",
+        "seller_rate": TWELVE_NINES,
+        "seller_years": 30,
+        "annual_capex": WIDEST,
+        "annual_working_capital_growth": WIDEST,
+        "tax_rate": TWELVE_NINES,
+        "cash_acquired": WIDEST,
+        "debt_assumed": "0.000000000001",
+    },
+}
+
+
+def step_digits(inputs: DealInputs, verified=REVIEWED) -> dict:
+    values = finance._deal_values(inputs, set(verified))
+    found = {k: significant(values[k]) for k in ("normalized", "uses", "buyer_equity", "interest")}
+    for k in ("numerator", "denominator"):
+        found[k] = significant(values[k])
+    for k in ("value_range", "equity_range"):
+        found[k] = max((significant(v) for v in values.get(k, ())), default=0)
+    for k in ("earnings", "taxable", "tax", "available", "scaled_available", "after_numerator"):
+        found[k] = max(significant(s[k]) for s in values["scenarios"].values())
+    return found
+
+
+def test_witnesses_reach_the_stated_digit_bounds():
+    found = [step_digits(DealInputs(**DEAL, **w)) for w in DIGIT_WITNESSES.values()]
+    assert {k: max(f[k] for f in found) for k in STEP_DIGITS} == STEP_DIGITS
+
+
+def digit_bound_cases():
+    yield from (DealInputs(**DEAL, **w) for w in DIGIT_WITNESSES.values())
+    yield from (DealInputs(**DEAL, **c) for c in DEAL_CORNERS.values())
+    for wide in (False, True):
+        rng = random.Random(20261208 + wide)
+        yield from (random_deal(rng, wide) for _ in range(100))
+    yield from (deal for _, _, deal in boundary_cases(20261209, 30, lambda rng, service: service))
+
+
+def test_no_accepted_input_exceeds_the_stated_digit_bounds():
+    for inputs in digit_bound_cases():
+        found = step_digits(inputs)
+        assert all(found[k] <= STEP_DIGITS[k] for k in STEP_DIGITS), (found, inputs.model_dump(mode="json"))
+
+
+def test_exceeding_a_digit_bound_is_caught():
+    # A 13-place rate, which validation refuses, needs one digit more for the interest than the stated bound.
+    inputs = DealInputs(**DEAL, **DIGIT_WITNESSES["negative"])
+    over = inputs.model_copy(update={"debt_rate": D("0.9999999999999")})
+    assert step_digits(inputs)["interest"] == STEP_DIGITS["interest"] < step_digits(over)["interest"]
+
+
+# D4: the largest and smallest accepted coverage ratios, rounded to four places with their own precision.
+
+
+def test_largest_and_smallest_accepted_coverage_are_exact():
+    # Most negative: downside cash of −1.051E+12 − 1E+11 − 2E+12 = −3.151E+12 over 1E-12 / 30 a year.
+    smallest = assert_exact(DealInputs(**DEAL, **DEAL_CORNERS["largest_coverage"]))["scenarios"]["downside"]
+    assert smallest["coverage_ratio"] == "-94530000000000000000000000.0000"
+    # Most positive: upside cash of 51 × 1E+9 + 5% of 1E+12 = 1.01E+11 over the same payment.
+    largest = {
+        **dict.fromkeys(decimal_fields(DealInputs), "0"),
+        "annual_revenue": "1000000000000",
+        "reported_ebitda": "1000000000",
+        "adjustments": [{"label": "Synthetic", "amount": "1000000000", "evidence_id": "reviewed"}]
+        * ADJUSTMENTS,
+        "purchase_price": "1",
+        "senior_debt": TINY,
+        "debt_years": 30,
+    }
+    upside = assert_exact(DealInputs(**DEAL, **largest))["scenarios"]["upside"]
+    assert upside["coverage_ratio"] == "3030000000000000000000000.0000"
+    # At these sizes the fourth place still counts: a 1E-12 rate and cash with 36 places.
+    for name, changes in {
+        "smallest": DEAL_CORNERS["largest_coverage"] | {"debt_rate": TINY},
+        "largest": largest | {"debt_rate": TINY, "tax_rate": TINY, "annual_capex": TINY},
+    }.items():
+        result = assert_exact(DealInputs(**DEAL, **changes))
+        coverage = result["scenarios"]["downside" if name == "smallest" else "upside"]["coverage_ratio"]
+        assert len(coverage.lstrip("-").split(".")[0]) == (26 if name == "smallest" else 25)
+        assert coverage[-4:] != "0000"
