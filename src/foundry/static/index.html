@@ -72,6 +72,15 @@
         </div>
       </header>
 
+      <div class="outdated" id="outdated" hidden>
+        <p id="outdated-text" role="alert"></p>
+        <div class="outdated-actions">
+          <button type="button" class="btn small primary" data-action="reload">
+            Load current records</button
+          ><button type="button" class="btn small" data-action="dismiss-outdated">Dismiss</button>
+        </div>
+      </div>
+
       <div class="panes">
         <nav class="pane sources" aria-label="Sources">
           <div class="src-nav" id="src-nav"></div>
@@ -95,7 +104,7 @@
             <h1 id="list-title">Today</h1>
             <span class="ph-right" id="list-right"></span>
           </div>
-          <div class="list-body" id="list" role="list"></div>
+          <div class="list-body" id="list"></div>
         </section>
 
         <section class="pane inspector" aria-labelledby="insp-title">

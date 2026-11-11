@@ -89,6 +89,94 @@ async function hold(page, path) {
     },
   };
 }
+/* Fail the next request for a path as a dropped connection does; later ones go through. A
+   dropped command never reaches the server; a dropped read is a reload that fails. */
+async function dropNext(page, path, method = 'GET') {
+  const match = (url) => url.pathname === path;
+  let used = false,
+    done;
+  const dropped = new Promise((r) => (done = r));
+  const handler = async (route) => {
+    if (used || route.request().method() !== method) return route.fallback();
+    used = true;
+    await route.abort('connectionreset');
+    done();
+  };
+  await page.route(match, handler);
+  return {
+    // resolves once the failure has reached the page and its promise chains have run on it
+    dropped: dropped.then(() => pause(250)),
+    off: () => page.unroute(match, handler),
+  };
+}
+/* Every list on the page, stated by a role or by ul/ol, holds only list items, and every row of
+   the middle list is a button directly inside a list item directly inside a named list. */
+const listFaults = (page) =>
+  page.evaluate(() => {
+    const isList = (el) =>
+      el.hasAttribute('role') ? el.getAttribute('role') === 'list' : /^(UL|OL)$/.test(el.tagName);
+    const isItem = (el) =>
+      el.hasAttribute('role') ? el.getAttribute('role') === 'listitem' : el.tagName === 'LI';
+    const name = (el) =>
+      el.tagName.toLowerCase() +
+      (el.id ? '#' + el.id : '') +
+      [...el.classList].map((c) => '.' + c).join('');
+    const out = [];
+    for (const list of document.querySelectorAll('*'))
+      if (isList(list))
+        for (const child of list.children)
+          if (!isItem(child)) out.push(`${name(list)} holds ${name(child)}`);
+    for (const row of document.querySelectorAll('#list .row')) {
+      const item = row.parentElement,
+        list = item?.parentElement;
+      if (row.tagName !== 'BUTTON' || row.hasAttribute('role'))
+        out.push(`row ${row.dataset.key} is not a plain button`);
+      if (!item || !isItem(item) || !list || !isList(list))
+        out.push(`row ${row.dataset.key} is not in a list item in a list`);
+      else if (!document.getElementById(list.getAttribute('aria-labelledby'))?.textContent.trim())
+        out.push(`the list holding ${row.dataset.key} has no name`);
+    }
+    return out;
+  });
+/* Visit every source at desktop, medium and phone widths and check every list on each. */
+async function walkLists(page, what) {
+  for (const [width, height] of [
+    [1440, 1050],
+    [900, 1000],
+    [390, 844],
+  ]) {
+    await page.setViewportSize({ width, height });
+    const ids = await page.locator('#src-nav .src').evaluateAll((s) => s.map((x) => x.dataset.src));
+    for (const id of ids.length ? ids : [null]) {
+      if (id) {
+        // on a phone, the sources are a pane of their own
+        if (await page.locator('#back-list').isVisible()) await page.locator('#back-list').click();
+        if (await page.locator('#back-src').isVisible()) await page.locator('#back-src').click();
+        await page.locator(`#src-nav .src[data-src="${id}"]`).click();
+        await page
+          .locator(`#src-nav .src[data-src="${id}"][aria-current="true"]`)
+          .waitFor({ state: 'attached' });
+        if (id === 'history')
+          await page.locator('#list .grp', { hasText: 'Events' }).waitFor({ state: 'attached' });
+      }
+      const at = `${what}, ${id || 'no business'}, ${width}px`;
+      assert.deepEqual(await listFaults(page), [], `${at}: lists hold only list items`);
+      assert.equal(
+        await page
+          .locator('#list')
+          .getByRole('list')
+          .getByRole('listitem')
+          .getByRole('button')
+          .count(),
+        await page.locator('#list .row:visible').count(),
+        `${at}: every row is announced as a button in a list item in a list`,
+      );
+    }
+  }
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  // the last click was at phone width; leave nothing hovered for later screenshots
+  await page.mouse.move(0, 0);
+}
 /* The colour each line's paint actually computes to, next to the value of the token it should
    use, for every line rule, casing, bullet disc and code on the page. */
 const lineColours = (page) =>
@@ -185,13 +273,35 @@ async function main() {
       rowCount,
       'every list item holds its row as a button',
     );
-    assert.equal(
-      await page
-        .getByRole('list')
-        .filter({ has: page.locator('.row') })
-        .count(),
-      1,
+    // Each group of rows is a list of its own, named by its heading; the headings, the Today
+    // header and the notes sit between the lists, never inside one.
+    assert.deepEqual(await listFaults(page), [], 'Today: lists hold only list items');
+    assert(
+      (await page.locator('#list').getByRole('list').count()) > 1,
+      'Today has one list per group',
     );
+    // Each counted heading names the list beneath it, which holds that many rows.
+    const counted = await page
+      .locator('#list .grp')
+      .evaluateAll((hs) =>
+        hs
+          .filter((x) => /^\d+$/.test(x.querySelector('.grp-n')?.textContent || ''))
+          .map((x) => [
+            x.firstElementChild.textContent,
+            Number(x.querySelector('.grp-n').textContent),
+          ]),
+      );
+    assert(counted.length >= 1, 'Today has a counted group');
+    for (const [heading, n] of counted)
+      assert.equal(
+        await page
+          .locator('#list')
+          .getByRole('list', { name: new RegExp('^' + heading) })
+          .getByRole('listitem')
+          .count(),
+        n,
+        `the list named ${heading} holds its rows`,
+      );
     mkdirSync('test-results', { recursive: true });
     await page.screenshot({ path: 'test-results/overview-desktop.png', fullPage: true });
     if (process.env.FOUNDRY_UPDATE_DOCS_IMAGE) {
@@ -203,6 +313,8 @@ async function main() {
       await page.screenshot({ path: 'docs/images/workspace.png' });
       await page.setViewportSize({ width: 1440, height: 1050 });
     }
+    // The same holds on every source of a full workspace, at every width.
+    await walkLists(page, 'demo');
 
     const source = async (id) => {
       await page.locator(`#src-nav .src[data-src="${id}"]`).click();
@@ -438,6 +550,8 @@ async function main() {
       .getByText('This workspace contains synthetic demonstration data.', { exact: true })
       .click();
     await submit('Create workspace');
+    // A new workspace shows every source's empty state; its lists follow the same rule.
+    await walkLists(page, 'new workspace');
     await source('records');
     await page.getByRole('button', { name: '+ Add record', exact: true }).click();
     await page.getByLabel('Title', { exact: true }).fill('Browser customer');
@@ -750,8 +864,10 @@ async function main() {
     // releases them after the person has moved on, and checks nothing late reaches the screen.
     const race = await context.newPage();
     race.on('pageerror', (e) => errors.push(e.message));
+    // the connections this page's tests drop on purpose are logged by the browser as failed loads
     race.on('console', (m) => {
-      if (m.type() === 'error' && !m.text().includes('401')) errors.push(m.text());
+      if (m.type() === 'error' && !/401|net::ERR_CONNECTION_RESET/.test(m.text()))
+        errors.push(m.text());
     });
     const demoName = demo.business.data.name,
       testName = 'Browser workflow test';
@@ -858,6 +974,209 @@ async function main() {
     assert.equal(
       await race.evaluate(() => state.businesses.find((b) => b.id === state.bid).data.name),
       testName,
+    );
+
+    // A command the server accepted, followed by a reload that fails. The failure is the page's,
+    // not the command's: the page says the change is saved, offers to load the records again
+    // and invites nothing that would send the command a second time.
+    const outdated = race.locator('#outdated');
+    const recordsTitled = async (title) =>
+      (await (await context.request.get(`${origin}/api/businesses/${bid}`)).json()).objects.filter(
+        (o) => o.title === title,
+      ).length;
+    const addRecord = async (title) => {
+      await race.getByRole('button', { name: '+ Add record', exact: true }).click();
+      await race.getByLabel('Title', { exact: true }).fill(title);
+      await race
+        .getByLabel('Details', { exact: true })
+        .fill('Synthetic record for the browser test.');
+      const answered = race.waitForResponse(
+        (r) =>
+          r.request().method() === 'POST' &&
+          new URL(r.url()).pathname === `/api/businesses/${bid}/records`,
+      );
+      await race
+        .locator('#dialog')
+        .getByRole('button', { name: 'Save record', exact: true })
+        .click();
+      return (await answered).status();
+    };
+
+    // (d) A saved record whose reload fails: saved, said so, and listed once loaded.
+    await onBusiness(bid, testName);
+    await raceSource('records');
+    const savedTitle = 'Browser record saved before a failed reload';
+    let dropList = await dropNext(race, '/api/businesses');
+    assert.equal(await addRecord(savedTitle), 201, 'the server saved the record');
+    await dropList.dropped;
+    await dropList.off();
+    assert(await outdated.isVisible(), 'a saved change whose reload failed says so on the page');
+    let notice = await outdated.innerText();
+    assert.match(notice, /Your change was saved/);
+    assert.match(notice, /no need to enter it again/);
+    assert.doesNotMatch(notice, /retry/i, 'the notice does not ask for the form again');
+    assert(await race.getByRole('alert').filter({ hasText: 'Your change was saved' }).isVisible());
+    assert.equal(await race.locator('#dialog').evaluate((d) => d.open), false, 'the form closed');
+    assert.equal(
+      await race.locator('#dialog-content').evaluate((c) => c.textContent.includes('Retry')),
+      false,
+      'nothing is written into the closed form',
+    );
+    assert.equal(await race.locator('#list .row', { hasText: savedTitle }).count(), 0);
+    // The notice outlasts the ordinary message, which hides after 5.5 seconds.
+    await pause(6000);
+    assert(await outdated.isVisible(), 'the notice stays while the page is out of date');
+    // The page's own control loads the records; when that fails too, the notice says so.
+    dropList = await dropNext(race, '/api/businesses');
+    await outdated.getByRole('button', { name: 'Load current records' }).click();
+    await dropList.dropped;
+    await dropList.off();
+    notice = await outdated.innerText();
+    assert.match(notice, /still could not be loaded/);
+    assert.match(notice, /Your change was saved/);
+    await outdated.getByRole('button', { name: 'Load current records' }).click();
+    await outdated.waitFor({ state: 'hidden' });
+    await race.locator('#list .row', { hasText: savedTitle }).waitFor();
+    f = await focused(race);
+    assert.deepEqual([f.pane, f.visible], ['list', true], 'focus after loading the records');
+    assert.equal(await recordsTitled(savedTitle), 1, 'the record was saved once');
+
+    // (e) A switch to another business is pending while a save in this one is followed by a
+    // failed reload. The switch did not happen, and no later reload makes it unasked.
+    await onBusiness(bid, testName);
+    await raceSource('records');
+    const heldSwitch = await hold(race, `/api/businesses/${demoBid}`);
+    await race.locator('#business-select').selectOption(demoBid);
+    await heldSwitch.requested;
+    const switchTitle = 'Browser record saved during a pending switch';
+    dropList = await dropNext(race, '/api/businesses');
+    assert.equal(await addRecord(switchTitle), 201);
+    await dropList.dropped;
+    await dropList.off();
+    await heldSwitch.release();
+    assert.equal(
+      await race.locator('#business-select').inputValue(),
+      bid,
+      'after a failed reload the selector names the business on screen',
+    );
+    assert.equal(
+      await race.locator('#business-select option:checked').innerText(),
+      testName,
+      'the selector shows its name',
+    );
+    assert(await race.locator('#list .row', { hasText: 'Browser customer' }).count());
+    notice = await outdated.innerText();
+    assert.match(notice, /Your change was saved/);
+    assert(
+      notice.includes(`${demoName} was not opened; this page still shows ${testName}.`),
+      'the notice says the switch did not happen',
+    );
+    await outdated.getByRole('button', { name: 'Load current records' }).click();
+    await outdated.waitFor({ state: 'hidden' });
+    await race.locator('#list .row', { hasText: switchTitle }).waitFor();
+    assert.equal(
+      await race.locator('#business-select').inputValue(),
+      bid,
+      'the next reload stays on the business shown',
+    );
+    assert.equal(await recordsTitled(switchTitle), 1);
+    // With nothing saved, a switch whose reload fails is reported on its own, and let go.
+    dropList = await dropNext(race, '/api/businesses');
+    await race.locator('#business-select').selectOption(demoBid);
+    await dropList.dropped;
+    await dropList.off();
+    assert.equal(await race.locator('#business-select').inputValue(), bid);
+    assert.equal(
+      await race.getByRole('status').innerText(),
+      `${demoName} could not be opened. The server could not be reached. This page still shows ${testName}.`,
+    );
+    assert(await outdated.isHidden(), 'no saved change is claimed');
+
+    // (f) Step decisions. A decision that itself fails keeps its form, and sending it again
+    // uses the same key. A decision the server accepted closes its form even when the reload
+    // after it fails, and the step offers nothing that would send it again.
+    const ready = (
+      await (await context.request.get(`${origin}/api/businesses/${bid}`)).json()
+    ).objects.find(
+      (o) => o.kind === 'task' && o.state === 'pending' && !o.blockers?.length && !o.data.deal_id,
+    );
+    const txPath = `/api/businesses/${bid}/tasks/${ready.id}/transition`;
+    const txKeys = [];
+    race.on('request', (r) => {
+      if (r.method() === 'POST' && new URL(r.url()).pathname === txPath)
+        txKeys.push(r.headers()['idempotency-key']);
+    });
+    const txAnswered = () =>
+      race.waitForResponse(
+        (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === txPath,
+      );
+    const decide = async (to, note) => {
+      await race.locator(`#insp [data-action="tx"][data-to="${to}"]`).click();
+      await race.getByLabel('Decision note', { exact: false }).fill(note);
+      await race.locator('#insp').getByRole('button', { name: 'Record decision' }).click();
+    };
+    await raceSource('today');
+    await race.locator(`#list .row[data-key="step:${ready.id}"]`).click();
+    await race.locator('#insp-title', { hasText: ready.title }).waitFor();
+    const dropTx = await dropNext(race, txPath, 'POST');
+    await decide('in_progress', 'Synthetic browser test: work started.');
+    await dropTx.dropped;
+    await dropTx.off();
+    assert.equal(
+      await race.locator('#tx-form .error').innerText(),
+      'Connection interrupted. Retry the unchanged form to check the same request safely.',
+      'a decision that failed keeps its form and says so',
+    );
+    let answered = txAnswered();
+    await race.locator('#insp').getByRole('button', { name: 'Record decision' }).click();
+    assert.equal((await answered).status(), 200);
+    await race.locator('#insp #tx-form').waitFor({ state: 'detached' });
+    assert.equal(txKeys.length, 2);
+    assert.equal(txKeys[1], txKeys[0], 'sending a failed decision again uses the same key');
+    txKeys.length = 0;
+    await race.locator('#insp .i-state .st', { hasText: 'In progress' }).waitFor();
+    dropList = await dropNext(race, '/api/businesses');
+    answered = txAnswered();
+    await decide('prepared', 'Synthetic browser test: prepared for approval.');
+    assert.equal((await answered).status(), 200, 'the server accepted the decision');
+    await dropList.dropped;
+    await dropList.off();
+    assert.equal(
+      await race.locator('#tx-form').count(),
+      0,
+      'the inline form closes once the server has accepted the decision',
+    );
+    assert(await outdated.isVisible(), 'an accepted decision whose reload failed says so');
+    assert.match(await outdated.innerText(), /Your change was saved/);
+    assert.equal(
+      await race.locator('#insp [data-action="tx"]').count(),
+      0,
+      'the step offers no move that would send the decision again',
+    );
+    assert.match(
+      await race.locator('#insp [data-accepted]').innerText(),
+      /Your decision to move this step to Prepared is recorded/,
+    );
+    assert.doesNotMatch(await race.locator('body').innerText(), /Cannot read|TypeError|undefined/);
+    assert.equal((await focused(race)).id, 'insp-title', 'focus after an accepted decision');
+    // The step's own control loads the records too, and the step shows the recorded state.
+    await race
+      .locator('#insp [data-accepted]')
+      .getByRole('button', { name: 'Load current records' })
+      .click();
+    await outdated.waitFor({ state: 'hidden' });
+    await race.locator('#insp .i-state .st', { hasText: 'Prepared' }).waitFor();
+    assert.equal(txKeys.length, 1, 'the accepted decision was sent once');
+    f = await focused(race);
+    assert.deepEqual([f.id, f.visible], ['insp-title', true], 'focus after loading the records');
+    const decided = (
+      await (await context.request.get(`${origin}/api/businesses/${bid}`)).json()
+    ).objects.find((o) => o.id === ready.id);
+    assert.equal(decided.state, 'prepared');
+    assert.deepEqual(
+      decided.data.history.map((e) => e.to),
+      ['in_progress', 'prepared'],
+      'each decision is recorded once',
     );
 
     // Stored addresses: only http and https become links. The server refuses anything else, so
@@ -992,6 +1311,7 @@ async function main() {
     assert(await fresh.getByRole('button', { name: 'Create a business' }).isVisible());
     assert(await fresh.locator('#insp [data-map="empty"]').isVisible());
     await fresh.screenshot({ path: 'test-results/empty-desktop.png' });
+    await walkLists(fresh, 'no business yet');
     await fresh.setViewportSize({ width: 390, height: 844 });
     assert.equal(await overflow(fresh), false, 'empty workspace: mobile overflow');
     await fresh.close();
@@ -999,7 +1319,7 @@ async function main() {
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

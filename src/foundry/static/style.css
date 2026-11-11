@@ -350,8 +350,37 @@ code {
 .app {
   height: 100vh;
   display: grid;
-  grid-template-rows: auto 1fr;
+  /* the out-of-date notice takes the middle row only while it is shown */
+  grid-template-rows: auto auto 1fr;
   min-height: 0;
+}
+.app > .toolbar {
+  grid-row: 1;
+}
+.app > .outdated {
+  grid-row: 2;
+}
+.app > .panes {
+  grid-row: 3;
+}
+/* A change was saved but the page could not load the records after it. */
+.outdated {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s2) var(--s4);
+  padding: var(--s2) var(--s4);
+  background: var(--review-bg);
+  border-bottom: 1px solid var(--review-line);
+}
+.outdated p {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.outdated-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
 }
 .toolbar {
   display: grid;
@@ -682,6 +711,12 @@ code {
 /* ---------- middle list ---------- */
 .list-body {
   padding-bottom: var(--s4);
+}
+/* one list per group of rows; it adds nothing to the layout */
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 .grp {
   position: relative;

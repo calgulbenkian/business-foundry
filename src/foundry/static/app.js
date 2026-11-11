@@ -72,6 +72,10 @@ const state = {
   remembered: {},
   scenario: 'base',
   open: null,
+  // a command the server accepted that no successful reload has shown yet
+  behind: false,
+  // step decisions accepted since the last successful reload: task id -> the state recorded
+  accepted: {},
 };
 
 const canReview = () => ['owner', 'reviewer'].includes(state.actor?.role);
@@ -1067,12 +1071,13 @@ function accountHTML() {
 
 /* ---------------- middle list ---------------- */
 /* Each row is a native button inside its own list item, so it is announced as something that can
-   be activated, and the list still reports its length and position. */
+   be activated, and its list still reports its length and position. groupRows() puts each run of
+   rows into a list of its own; headings, notes and empty states stay outside the lists. */
 function row({ key, glyph, num = '', title, right = '', sub = '', fig = false, line = null }) {
-  return `<div class="ri" role="listitem"><button type="button" class="row${sub ? ' two' : ''}${num ? '' : ' nonum'}${line ? ' ln lc-' + line.k : ''}"${line ? ` data-line="${line.k}"` : ''} data-key="${h(key)}" aria-current="${key === state.selected}">
+  return `<li class="ri"><button type="button" class="row${sub ? ' two' : ''}${num ? '' : ' nonum'}${line ? ' ln lc-' + line.k : ''}"${line ? ` data-line="${line.k}"` : ''} data-key="${h(key)}" aria-current="${key === state.selected}">
     <span class="r-g">${glyph}</span>
     <span class="r-main"><span class="r-l1"><span class="r-num">${h(num)}</span><span class="r-t">${title}</span><span class="r-right${fig ? ' fig' : ''}">${right}</span></span>${sub ? `<span class="r-sub">${sub}</span>` : ''}</span>
-  </button></div>`;
+  </button></li>`;
 }
 function stepSub(s) {
   const t = s.task;
@@ -1098,9 +1103,9 @@ const stepRow = (s, sub, prefix = 'step', named = false) => {
   });
 };
 const grp = (name, n, note) =>
-  `<div class="grp" role="presentation"><span>${name}</span>${n !== undefined && n !== '' ? `<span class="grp-n">${n}</span>` : ''}</div>${note ? `<div class="grp-note">${note}</div>` : ''}`;
+  `<h2 class="grp"><span>${name}</span>${n !== undefined && n !== '' ? `<span class="grp-n">${n}</span>` : ''}</h2>${note ? `<div class="grp-note">${note}</div>` : ''}`;
 const grpLine = (l, text, n) =>
-  `<div class="grp ln lc-${l.k}${l.steps.length ? '' : ' bare'}" data-line="${l.k}" role="presentation">${bul(l, true)}<span>${h(text)}</span><span class="grp-n">${h(n)}</span></div>`;
+  `<h2 class="grp ln lc-${l.k}${l.steps.length ? '' : ' bare'}" data-line="${l.k}">${bul(l, true)}<span>${h(text)}</span><span class="grp-n">${h(n)}</span></h2>`;
 function evInfo(o) {
   if (o.state === 'rejected')
     return { glyph: g('review'), label: 'Withdrawn', amber: true, short: 'Withdrawn' };
@@ -1382,7 +1387,8 @@ function renderList() {
         },
         (e) => {
           const wait = $('#list [data-audit-wait]');
-          if (current() && wait) wait.textContent = `The history could not be loaded: ${e.message}`;
+          if (current() && wait)
+            wait.textContent = `The history could not be loaded: ${messageFor(e)}`;
         },
       );
     }
@@ -1428,9 +1434,36 @@ function renderList() {
   $('#list-right').innerHTML = right;
   out += `<div class="list-key">${keyHTML()}</div>`;
   list.innerHTML = out;
+  groupRows(list);
   ensureSelection();
   joinLines();
   applySearch();
+}
+/* The rows in the markup are list items in sequence with the headings and notes between them.
+   Each unbroken run of rows becomes one list, named by the heading above it (or by the list's
+   title where it has none), so a list holds only list items. */
+function groupRows(list) {
+  let ul = null,
+    heading = null,
+    n = 0;
+  for (const el of [...list.children]) {
+    if (el.classList.contains('ri')) {
+      if (!ul) {
+        ul = document.createElement('ul');
+        ul.className = 'rows';
+        // an unstyled list keeps its role only when it is stated
+        ul.setAttribute('role', 'list');
+        if (heading) heading.id ||= `grp-${++n}`;
+        ul.setAttribute('aria-labelledby', heading ? heading.id : 'list-title');
+        el.before(ul);
+      }
+      ul.append(el);
+    } else {
+      ul = null;
+      if (el.classList.contains('grp')) heading = el;
+      else if (!el.classList.contains('grp-note')) heading = null;
+    }
+  }
 }
 function certaintyGlyph(s) {
   return s === 'verified' ? tick : s === 'reported' ? ring : dash;
@@ -1542,8 +1575,8 @@ function changedRows() {
 /* A line runs unbroken through consecutive rows of the same line (and up into its bullet);
    it stops short where the line changes, so two lines never touch. */
 function joinLines() {
-  const items = [...document.querySelectorAll('#list > .ri, #list > .grp')]
-    .filter((el) => !el.hidden)
+  const items = [...document.querySelectorAll('#list .ri, #list .grp')]
+    .filter((el) => !el.closest('[hidden]'))
     .map((el) => (el.classList.contains('ri') ? el.firstElementChild : el));
   items.forEach((el, i) => {
     if (!el.classList.contains('row') || !el.dataset.line) return;
@@ -1737,7 +1770,7 @@ function renderInspector() {
       out = `<p class="empty">Choose an item in the list to see it here.</p>`;
     }
   } catch (error) {
-    out = `<p class="empty">This item could not be shown: ${h(error.message)}</p>`;
+    out = `<p class="empty">This item could not be shown. ${h(messageFor(error))}</p>`;
   }
   el.innerHTML = `<div class="i-wrap${wide ? ' wide' : ''}">${out}</div>`;
   crumb.textContent = crumbText;
@@ -1796,6 +1829,10 @@ function txForm(t) {
     <p class="error spaced" role="alert"></p>
     <div class="i-actions"><button type="submit" class="btn primary">Record decision</button>${btn('Not yet', 'data-action="close-inline"')}</div></form>`;
 }
+/* A decision the server accepted whose reload failed: the step still shows its earlier state, so
+   in place of its moves it says the decision is recorded, and nothing offers to send it again. */
+const acceptedNote = (to) =>
+  `<div class="flag" data-accepted><span></span><div>Your decision to move this step to ${h(STATES[to]?.label || label(to))} is recorded. This page has not loaded it yet; load the current records to continue.<div class="i-actions">${btn('Load current records', 'data-action="reload"')}</div></div></div>`;
 function stepFlags(s) {
   const t = s.task;
   let out = '';
@@ -1926,6 +1963,7 @@ function inspStep(s) {
     l = s.line,
     ext = t.data.external;
   const kicker = `${bul(l, true)}<span>Step ${h(s.n)} of ${M.steps.length} · ${h(l.name)} · ${ext ? 'outside body' : 'internal review'}</span>`;
+  const accepted = state.accepted[t.id];
   const open = state.open?.kind === 'tx' && state.open.id === t.id ? txForm(t) : '';
   const deps = (t.data.depends_on || []).map(find).filter(Boolean);
   const needed = objs('task').filter((x) => (x.data.depends_on || []).includes(t.id));
@@ -1948,8 +1986,8 @@ function inspStep(s) {
       glyph: taskGlyph(t),
       stateLabel: stateOf(t).label,
       next: h(nextText(s)),
-      actions: transitionButtons(t),
-      extra: open + stepFlags(s),
+      actions: accepted ? '' : transitionButtons(t),
+      extra: (accepted ? acceptedNote(accepted) : open) + stepFlags(s),
     }) +
     sec('Stages', stageLadder(t)) +
     journeySec(s) +
@@ -2221,7 +2259,7 @@ function fillVersions(oid) {
         : '<p class="fine">No versions recorded.</p>';
     },
     (e) => {
-      el.innerHTML = `<p class="fine">The history could not be loaded: ${h(e.message)}</p>`;
+      el.innerHTML = `<p class="fine">The history could not be loaded: ${h(messageFor(e))}</p>`;
     },
   );
 }
@@ -2652,7 +2690,7 @@ function fillHistory(seq) {
       el.innerHTML = out;
     },
     (e) => {
-      el.innerHTML = `<p class="empty">The history could not be loaded: ${h(e.message)}</p>`;
+      el.innerHTML = `<p class="empty">The history could not be loaded: ${h(messageFor(e))}</p>`;
     },
   );
 }
@@ -2784,16 +2822,15 @@ function applySearch() {
       (r.hidden = r.parentElement.hidden =
         Boolean(term) && !r.textContent.toLowerCase().includes(term)),
   );
+  // A list with no match left is hidden, and so are its heading and note.
+  list
+    .querySelectorAll('ul.rows')
+    .forEach((ul) => (ul.hidden = Boolean(term) && !ul.querySelector('.ri:not([hidden])')));
   list.querySelectorAll('.grp').forEach((gh) => {
-    let n = gh.nextElementSibling,
-      any = false;
-    while (n && !n.classList.contains('grp') && !n.classList.contains('list-key')) {
-      if (n.classList.contains('ri') && !n.hidden) any = true;
-      n = n.nextElementSibling;
-    }
-    gh.hidden = Boolean(term) && !any;
-    if (gh.nextElementSibling?.classList.contains('grp-note'))
-      gh.nextElementSibling.hidden = Boolean(term) && !any;
+    const ul = gh.id ? list.querySelector(`ul[aria-labelledby="${CSS.escape(gh.id)}"]`) : null;
+    const off = Boolean(term) && !(ul && !ul.hidden);
+    gh.hidden = off;
+    if (gh.nextElementSibling?.classList.contains('grp-note')) gh.nextElementSibling.hidden = off;
   });
   const th = list.querySelector('.today-head');
   if (th) th.hidden = Boolean(term);
@@ -2944,27 +2981,39 @@ function toast(text) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => ($('#toast').hidden = true), 5500);
 }
+/* What the server, or the way to it, said. Its message is written for the person. Any other error
+   is a fault in this page, and its text (a TypeError, say) is never shown. */
+class RequestError extends Error {}
+function messageFor(error) {
+  if (error instanceof RequestError) return error.message;
+  console.error(error);
+  return 'Something went wrong in this page. Load the current records and try again.';
+}
 async function api(path, options = {}) {
   const headers = { ...options.headers };
   if (options.body !== undefined) {
     headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(options.body);
   }
-  if (options.method && !['GET', 'HEAD'].includes(options.method))
-    headers['Idempotency-Key'] ||= crypto.randomUUID();
+  const command = Boolean(options.method) && !['GET', 'HEAD'].includes(options.method);
+  if (command) headers['Idempotency-Key'] ||= crypto.randomUUID();
   const session = sessionSeq;
   let response;
   try {
     response = await fetch('/api' + path, { ...options, headers, credentials: 'same-origin' });
   } catch {
-    throw new Error(
-      'Connection interrupted. Retry the unchanged form to check the same request safely.',
+    // A command may have reached the server; the same key lets a retry find out safely. A read
+    // changes nothing, so there is nothing to retry carefully.
+    throw new RequestError(
+      command
+        ? 'Connection interrupted. Retry the unchanged form to check the same request safely.'
+        : 'The server could not be reached.',
     );
   }
   const data = await response.json().catch(() => ({ detail: 'Unexpected server response.' }));
   if (!response.ok) {
     if (response.status === 401 && path !== '/login' && session === sessionSeq) showLogin();
-    throw new Error(data.detail || 'The request could not be completed.');
+    throw new RequestError(data.detail || 'The request could not be completed.');
   }
   return data;
 }
@@ -2994,6 +3043,8 @@ function forget() {
     remembered: {},
     scenario: 'base',
     open: null,
+    behind: false,
+    accepted: {},
   });
   M = buildModel(null);
   if ($('#dialog').open) $('#dialog').close();
@@ -3005,6 +3056,8 @@ function forget() {
   $('#business-select').innerHTML = '';
   $('#demo-tag').hidden = true;
   $('#toast').hidden = true;
+  $('#outdated').hidden = true;
+  $('#outdated-text').textContent = '';
   q.value = '';
   app.dataset.level = 'list';
 }
@@ -3016,7 +3069,9 @@ function showLogin() {
 }
 /* Load the businesses and the records of the one asked for, then show them. Returns false, and
    changes nothing, when a newer refresh or a sign-out has started meanwhile; its errors are then
-   dropped too. */
+   dropped too. When it fails it changes nothing on screen either, and a business that was asked
+   for is let go: the selector goes back to the business shown, so no later reload switches to it
+   unasked. The error then carries the name of that business as `missed`. */
 async function refresh() {
   const load = ++loadSeq;
   const stale = () => load !== loadSeq;
@@ -3033,6 +3088,11 @@ async function refresh() {
     ]);
   } catch (error) {
     if (stale()) return false;
+    if (state.wantBid && state.wantBid !== state.bid)
+      error.missed =
+        state.businesses.find((b) => b.id === state.wantBid)?.data.name || 'the new business';
+    state.wantBid = null;
+    $('#business-select').value = state.bid || '';
     throw error;
   }
   if (stale()) return false;
@@ -3056,7 +3116,10 @@ async function refresh() {
     principals,
     audit: null,
     auditPromise: null,
+    behind: false,
+    accepted: {},
   });
+  $('#outdated').hidden = true;
   if (bid) saved.set('foundry.business', bid);
   const select = $('#business-select');
   select.innerHTML =
@@ -3080,6 +3143,51 @@ async function refresh() {
   if (!state.snapshot) state.source = 'today';
   renderAll();
   return true;
+}
+/* A reload that failed. After a command the server accepted, that failure is not the command's:
+   the change is saved and only the page is behind. A notice on the page says so, offers to load
+   the records again, and stays until a reload succeeds or the person dismisses it. Without such a
+   command, a failed switch to another business is reported on its own. */
+function reloadFailed(error, again = false) {
+  const reason = messageFor(error);
+  const shown = businessName();
+  const missed = error.missed
+    ? shown
+      ? ` ${capFirst(error.missed)} was not opened; this page still shows ${shown}.`
+      : ` ${capFirst(error.missed)} was not opened.`
+    : '';
+  if (!state.behind) {
+    toast(
+      missed
+        ? `${capFirst(error.missed)} could not be opened. ${reason}${shown ? ` This page still shows ${shown}.` : ''}`
+        : reason,
+    );
+    return;
+  }
+  $('#outdated').hidden = false;
+  $('#outdated-text').textContent =
+    (again
+      ? `The current records still could not be loaded. ${reason} Your change was saved`
+      : `Your change was saved, but this page could not load the current records. ${reason} What you see may not include it yet`) +
+    `; there is no need to enter it again.${missed}`;
+}
+/* Reload after a command the server accepted. The view a save asked to move to (`moved`, the view
+   before it) is kept only together with the records that show it. */
+async function reloadAfter(before) {
+  state.behind = true;
+  const session = sessionSeq,
+    moved = { source: state.source, selected: state.selected };
+  try {
+    await refresh();
+    // when a newer reload took over, that one shows the records, or reports why it could not
+    if (session === sessionSeq) toast('Saved to the workspace.');
+  } catch (error) {
+    if (session !== sessionSeq) return;
+    if (before && state.source === moved.source && state.selected === moved.selected)
+      Object.assign(state, before);
+    renderAll();
+    reloadFailed(error);
+  }
 }
 
 /* ---------------- forms ---------------- */
@@ -3142,26 +3250,32 @@ function formDialog(title, fields, submit, button = 'Save', intro = '', after = 
     form.querySelector('.error').textContent = '';
     const bid = state.bid,
       session = sessionSeq;
+    let result;
     try {
-      const result = await submit(new FormData(form), command);
-      if (session !== sessionSeq) return;
-      // The dialog can be closed, and another opened, while a save is in flight; a late result
-      // closes only its own form, and moves the view only if the same business is still shown.
-      if (form.isConnected) $('#dialog').close();
-      if (after && state.bid === bid && !state.wantBid) after(result);
-      await refresh();
-      toast('Saved to the workspace.');
+      result = await submit(new FormData(form), command);
     } catch (error) {
       if (session !== sessionSeq) return;
-      if (form.isConnected) {
-        form.querySelector('.error').textContent = error.message;
-        // a failed save leaves focus on its button, which disabling had cleared
-        b.disabled = false;
-        if (document.activeElement === document.body) b.focus();
-      } else toast(error.message);
-    } finally {
+      // The command itself failed. Its form stays, with the same key, so sending it again
+      // unchanged is safe; if the person closed it meanwhile, the message is shown instead.
       b.disabled = false;
+      if (form.isConnected && $('#dialog').open) {
+        form.querySelector('.error').textContent = messageFor(error);
+        // a failed save leaves focus on its button, which disabling had cleared
+        if (document.activeElement === document.body) b.focus();
+      } else toast(messageFor(error));
+      return;
     }
+    if (session !== sessionSeq) return;
+    // Saved. The dialog can be closed, and another opened, while a save is in flight; a late
+    // result closes only its own form, and moves the view only if the same business is shown.
+    if (form.isConnected) $('#dialog').close();
+    const before = {
+      source: state.source,
+      selected: state.selected,
+      remembered: { ...state.remembered },
+    };
+    if (after && state.bid === bid && !state.wantBid) after(result);
+    await reloadAfter(before);
   });
 }
 const selectAfter = (source, prefix) => (result) => {
@@ -3640,7 +3754,7 @@ function aiDialog() {
         },
         key,
       );
-      if (r.state !== 'succeeded') throw new Error(r.data.error || r.data.note);
+      if (r.state !== 'succeeded') throw new RequestError(r.data.error || r.data.note);
       return r;
     },
     'Share and request review',
@@ -3652,15 +3766,20 @@ function aiDialog() {
   );
 }
 async function submitTransition(form) {
-  const t = find(form.dataset.id);
+  const open = state.open,
+    t = open?.kind === 'tx' && open.id === form.dataset.id ? find(open.id) : null;
+  // a form left from a decision that is no longer open is taken away rather than sent
+  if (!t) {
+    rerender(renderInspector);
+    return;
+  }
   const f = new FormData(form);
   const b = form.querySelector('[type=submit]');
   const memo = focusMemo();
   b.disabled = true;
   form.querySelector('.error').textContent = '';
   $('#toast').hidden = true;
-  const open = state.open,
-    session = sessionSeq;
+  const session = sessionSeq;
   try {
     await post(
       `/tasks/${t.id}/transition`,
@@ -3672,20 +3791,23 @@ async function submitTransition(form) {
       },
       open.key,
     );
-    if (session !== sessionSeq) return;
-    // close this decision's form only if it is still the one open
-    if (state.open === open) state.open = null;
-    await refresh();
-    restoreFocus(memo);
-    toast('Saved to the workspace.');
   } catch (error) {
     if (session !== sessionSeq) return;
+    // The decision itself failed: the form stays, and sending it again uses the same key.
     if (form.isConnected) {
-      form.querySelector('.error').textContent = error.message;
+      form.querySelector('.error').textContent = messageFor(error);
       b.disabled = false;
       if (memo?.el === b && document.activeElement === document.body) b.focus();
-    } else toast(error.message);
+    } else toast(messageFor(error));
+    return;
   }
+  if (session !== sessionSeq) return;
+  // Accepted. Close this decision's form if it is still the one open; until a reload shows the
+  // step as it now is, the step says the decision is recorded instead of offering its moves.
+  state.accepted[t.id] = f.get('state');
+  if (state.open === open) state.open = null;
+  await reloadAfter();
+  restoreFocus(memo);
 }
 
 /* ---------------- events ---------------- */
@@ -3695,6 +3817,25 @@ async function handle(a, el) {
     state.scenario = id;
     rerender(renderInspector);
   } else if (a === 'close-dialog') $('#dialog').close();
+  else if (a === 'reload') {
+    // The notice's control and the one on a step whose decision is recorded do the same.
+    const memo = focusMemo();
+    el.disabled = true;
+    try {
+      if (await refresh()) {
+        // focus left with the control: to its region's place, or, from the notice, to the list
+        restoreFocus(memo);
+        if (document.activeElement === document.body || !visible(document.activeElement))
+          focusFirst([SELECTED_ROW, '#list .row', '#insp-title']);
+      }
+    } catch (e) {
+      reloadFailed(e, true);
+    } finally {
+      el.disabled = false;
+      // a reload that failed again leaves focus on the control, so it can be pressed again
+      if (el.isConnected && visible(el) && document.activeElement === document.body) el.focus();
+    }
+  } else if (a === 'dismiss-outdated') $('#outdated').hidden = true;
   else if (a === 'logout') {
     await api('/logout', { method: 'POST' });
     showLogin();
@@ -3745,7 +3886,7 @@ async function handle(a, el) {
 document.addEventListener('click', (event) => {
   const action = event.target.closest('[data-action]');
   if (action) {
-    handle(action.dataset.action, action).catch((e) => toast(e.message));
+    handle(action.dataset.action, action).catch((e) => toast(messageFor(e)));
     return;
   }
   const link = event.target.closest('[data-go]');
@@ -3812,9 +3953,7 @@ $('#business-select').addEventListener('change', async (event) => {
   try {
     await refresh();
   } catch (e) {
-    state.wantBid = null;
-    event.target.value = state.bid || '';
-    toast(e.message);
+    reloadFailed(e);
   }
 });
 if (fitter) fitter.observe($('#insp'));
