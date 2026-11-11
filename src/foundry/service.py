@@ -576,12 +576,12 @@ class Service:
             for event in events:
                 event["payload"] = json.loads(event["payload"])
             integrity = self.store.verify_chain(con, bid)
-            errors, latest, ai_latest, recorded = [], {}, {}, {}
+            errors, latest, ai_latest, versions = [], {}, {}, {}
             for event in events:
                 p = event["payload"]
                 if p.get("id") == event["object_id"] and "version" in p and "data" in p:
                     latest[p["id"]] = p
-                    recorded[(p["id"], p["version"])] = p
+                    versions[(p["id"], p["version"])] = p
                 if p.get("run_id") and p.get("data_sha256"):
                     ai_latest[p["run_id"]] = p
             objects = self.store.objects(con, bid)
@@ -601,7 +601,7 @@ class Service:
                     if not revision or json.loads(revision[0]) != obj:
                         errors.append(f"Revision mismatch: {obj['id']}")
             errors.extend(f"Historical record missing: {oid}" for oid in latest)
-            errors.extend(self._revision_errors(con, bid, recorded))
+            errors.extend(self._revision_errors(con, bid, versions))
             for run in con.execute("SELECT * FROM ai_calls WHERE business_id=?", (bid,)):
                 recorded = ai_latest.pop(run["id"], {})
                 if recorded.get("state") != run["state"] or recorded.get("data_sha256") != digest(
