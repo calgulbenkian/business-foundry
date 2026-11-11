@@ -2,9 +2,9 @@
 
 ## 1. Create the workspace
 
-Start with the README setup. Sign in, choose **New business**, and enter the concept, intended buyer, entry path, accountable person, currency and planning jurisdiction. Leave jurisdiction undecided until there is a reviewed basis for selecting it. A workspace creates work and records; it does not register a legal entity.
+Start Foundry with `uv run foundry start`, as the README describes; for the first run explained step by step, see [your first hour](FIRST_HOUR.md). Sign in, choose **New business**, and enter the concept, intended buyer, entry path, accountable person, currency and planning jurisdiction. Leave jurisdiction undecided until there is a reviewed basis for selecting it. A workspace creates work and records; it does not register a legal entity.
 
-To start from configuration instead:
+To start from configuration instead (`init` only prints where the database is if `start` has already created it):
 
 ```sh
 uv run foundry init
@@ -72,4 +72,4 @@ uv run foundry backup /private/path/foundry-backup.db
 uv run foundry --db /private/path/recovered/foundry.db restore /private/path/foundry-backup.db
 ```
 
-Stop the destination server before restoration. Restore refuses to overwrite an existing database. The backup contains all businesses and credential hashes; keep it private and retain the original owner key separately. Use the same key to sign into a restored server. For command-line owner operations, securely place the original `owner.key` beside the restored database. The JSON export is for inspection and portability; it is not a restore or permissions-import feature.
+Stop the destination server before restoration. Restore refuses to overwrite an existing database. The backup contains all businesses and credential hashes; keep it private and retain the original owner key separately. Use the same key to sign into a restored server. `uv run foundry --db /private/path/recovered/foundry.db start` serves the restored database; while `owner.key` is not beside it, it says where it expected the key file. For command-line owner operations, securely place the original `owner.key` beside the restored database. The JSON export is for inspection and portability; it is not a restore or permissions-import feature.

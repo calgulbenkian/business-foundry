@@ -10,20 +10,31 @@ Turn a concept into a connected business workspace: customers, offers, assets an
 
 ## Run it
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+**New to the terminal? Follow [your first hour with Foundry](docs/FIRST_HOUR.md).**
+
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/). It also provides Python 3.11 or newer if your computer does not have it.
 
 ```sh
 git clone https://github.com/calgulbenkian/business-foundry.git
 cd business-foundry
-uv sync --locked
-uv run foundry init
-uv run foundry demo
-uv run foundry serve
+uv run foundry start
 ```
 
-Open **http://127.0.0.1:8765**, retrieve your private sign-in key with `uv run foundry token`, and paste it into the sign-in screen. The application works without an AI subscription or API key. Skip `demo` for an empty workspace.
+On the first run, uv installs Foundry's dependencies into `.venv` in that folder (downloading them if needed), then Foundry creates a private workspace and owner key in `.foundry/`. When the server is ready, the terminal shows the address to open, **http://127.0.0.1:8765**, your private sign-in key and how to stop (Ctrl+C), and your default browser opens at that address (on Linux, only when a desktop session is running). Paste the key into the sign-in screen. The application works without an AI subscription or API key.
+
+The first run also adds the synthetic example business described below; use `uv run foundry start --empty` for an empty workspace instead. Later runs reuse the same workspace and key and never add the example again. `start` listens on 127.0.0.1 only. `--port` chooses another port and `--no-browser` skips the browser. If the output is not a terminal (for example, piped or captured by a service), the key is not printed; run `uv run foundry token` to see it.
 
 The Polymer Geospatial example is **explicitly synthetic**. Its concept, customers, figures, receipts and completed steps are demonstration fixtures. They do not describe or certify Polymer's actual business.
+
+The same setup is also available as separate commands:
+
+```sh
+uv sync --locked
+uv run foundry init    # create the private database and owner key
+uv run foundry demo    # optional: add the synthetic example
+uv run foundry serve   # serve on 127.0.0.1:8765; --host and --port change the address
+uv run foundry token   # print the sign-in key to paste into the sign-in screen
+```
 
 Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `foundry` directly.
 
@@ -39,7 +50,7 @@ Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `fou
 - A reviewable event history, local integrity checks, portable JSON exports and consistent database backups/restores.
 - Optional OpenAI reviews with explicit sharing, recorded prompts/results, limits and validated citations; an MCP adapter for compatible AI clients.
 
-See [the walkthrough](docs/WALKTHROUGH.md), [architecture](docs/ARCHITECTURE.md), [financial methodology](docs/FINANCE.md), [AI setup](docs/AI.md), [security and deployment](SECURITY.md), and [the research and roadmap](docs/RESEARCH.md).
+See [your first hour](docs/FIRST_HOUR.md), [the walkthrough](docs/WALKTHROUGH.md), [architecture](docs/ARCHITECTURE.md), [financial methodology](docs/FINANCE.md), [AI setup](docs/AI.md), [security and deployment](SECURITY.md), and [the research and roadmap](docs/RESEARCH.md).
 
 ## Development
 
@@ -50,7 +61,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-The OpenAPI schema is served at `/api/openapi.json`; load it into any OpenAPI viewer you run yourself. No interactive documentation page is served, because one would need third-party scripts that the content security policy forbids. Authenticated requests use `Authorization: Bearer <access-key>`; such requests need no `Origin` header. Business writes require an `Idempotency-Key`; reuse it only when retrying the identical request. Access-key creation returns a new key once and is intentionally not cached.
+The OpenAPI schema is served at `/api/openapi.json`; load it into any OpenAPI viewer you run yourself. FastAPI's built-in documentation pages (Swagger UI at `/docs` and ReDoc at `/redoc`) are switched off, because they load scripts from a third-party host and run inline scripts, which the content security policy forbids. Authenticated requests use `Authorization: Bearer <access-key>`; such requests need no `Origin` header. Business writes require an `Idempotency-Key`; reuse it only when retrying the identical request. Access-key creation returns a new key once and is intentionally not cached.
 
 Private state lives in `.foundry/` and is ignored by Git. No telemetry, remote databases, third-party fonts or analytics are required. Software is MIT licensed; your business data stays yours.
 
