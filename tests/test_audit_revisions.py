@@ -178,6 +178,10 @@ UNREADABLE_SNAPSHOTS = [
     pytest.param("NaN", id="bare-nan"),
     pytest.param("Infinity", id="bare-infinity"),
     pytest.param(OBJECT_WITH_NAN, id="object-with-nan"),
+    pytest.param('{"n":1E400}', id="object-with-overflow"),
+    pytest.param('{"n":"\\ud800"}', id="object-with-surrogate-value"),
+    pytest.param('{"\\udc00":1}', id="object-with-surrogate-key"),
+    pytest.param('{"n":1' + "0" * 4300 + "}", id="integer-over-digit-limit"),
     pytest.param(b"\xff\xfe\x00{", id="invalid-utf8-blob"),
     pytest.param("[" * 100000 + "]" * 100000, id="nested-beyond-recursion-limit"),
 ]
@@ -1386,3 +1390,580 @@ def test_removing_the_newest_event_keeps_the_chain_valid_but_is_reported(setup):
         f"Current record differs from history: {item['id']}",
         f"Revision has no recorded history: {item['id']} version 2",
     ]
+
+
+def test_limitation_text_is_exact(setup):
+    assert integrity(setup)["limitation"] == (
+        "The hash chain detects a changed recorded event, but anyone who can edit the database can "
+        "rewrite the chain, remove its newest events or append events to it that pass this check. Keep "
+        "protected off-machine backups, and store the head hash outside this machine to show later that "
+        "the events up to it are unchanged."
+    )
+
+
+# Known limits, not wanted behaviour: stored values that stop the audit with an exception instead
+# of a report (docs/ARCHITECTURE.md, Integrity and recovery, lists them). Making the audit report
+# them is separate work; these tests record exactly where it raises today, so that work has to
+# change them on purpose. Each "known_limit" test asserts the exact exception type. The tests
+# without "known_limit" in their name pin the neighbouring values that are reported.
+
+
+class SQL(str):
+    """An SQL expression to store as is, where a plain str is bound as TEXT."""
+
+
+def stored(value):
+    return (value, ()) if isinstance(value, SQL) else ("?", (value,))
+
+
+INVALID_TEXT = SQL("CAST(X'7BFF7D' AS TEXT)")
+DEEP = "[" * 100000 + "]" * 100000
+LONG_INTEGER = "1" + "0" * 4300  # 4,301 digits; Python's default limit for int() is 4,300.
+NOT_THE_HEAD = "f" * 64
+NOT_ITS_HASH = "0" * 64
+
+
+def without_constraint(store, table, declared, column):
+    """Rewrite one table's schema so ``declared`` (``<column> <TYPE> NOT NULL``) becomes ``column``."""
+    con = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        con.execute("PRAGMA writable_schema=ON")
+        changed = con.execute(
+            "UPDATE sqlite_schema SET sql=replace(sql,?,?) WHERE type='table' AND name=? AND instr(sql,?)",
+            (declared, column, table, declared),
+        ).rowcount
+        con.execute("PRAGMA writable_schema=OFF")
+    finally:
+        con.close()
+    assert changed == 1
+
+
+def append_raw(store, bid, object_id, payload, *, hashed=True, columns=None):
+    """Append one event row with SQL and return its seq. Its hash is never right.
+
+    With ``hashed`` its prev_hash is the current head, so the chain check hashes it if every earlier
+    event verifies; otherwise its prev_hash is wrong and the check stops before hashing it.
+    ``payload`` and the values in ``columns`` are bound as TEXT unless given as SQL.
+    """
+    with store.write() as con:
+        head = con.execute(
+            "SELECT hash FROM events WHERE business_id=? ORDER BY seq DESC LIMIT 1", (bid,)
+        ).fetchone()[0]
+        values = {
+            "business_id": bid,
+            "actor_id": "principal_appender",
+            "action": "record.updated",
+            "object_id": object_id,
+            "payload": payload,
+            "created_at": APPENDED_AT,
+            "prev_hash": head if hashed else NOT_THE_HEAD,
+            "hash": NOT_ITS_HASH,
+            **(columns or {}),
+        }
+        parts = [stored(v) for v in values.values()]
+        con.execute(
+            f"INSERT INTO events({','.join(values)}) VALUES({','.join(p[0] for p in parts)})",
+            [arg for p in parts for arg in p[1]],
+        )
+        return con.execute("SELECT max(seq) FROM events").fetchone()[0]
+
+
+def assert_audit_raises(setup, expected, export=False):
+    _, service, actor, bid, _ = setup
+    with pytest.raises(Exception) as caught:
+        service.audit(actor, bid, export)
+    assert caught.type is expected, caught.value
+
+
+def broken_at(setup, seq, record_errors=()):
+    result = integrity(setup)
+    assert result["valid"] is False
+    assert result["failed_sequence"] == seq
+    assert result["record_errors"] == list(record_errors)
+
+
+POSITIONS = [pytest.param(True, id="hashed"), pytest.param(False, id="not-hashed")]
+
+UNREADABLE_PAYLOADS = [
+    pytest.param("{", json.JSONDecodeError, id="not-json"),
+    pytest.param("", json.JSONDecodeError, id="empty-text"),
+    pytest.param(SQL("X'7BFF7D'"), UnicodeDecodeError, id="blob-not-utf8"),
+    pytest.param('{"n":' + LONG_INTEGER + "}", ValueError, id="integer-over-digit-limit"),
+    pytest.param(DEEP, RecursionError, id="nested-beyond-recursion-limit"),
+    pytest.param("[1]", AttributeError, id="json-array"),
+    pytest.param("null", AttributeError, id="json-null"),
+    pytest.param("3", AttributeError, id="json-number"),
+    pytest.param('"x"', AttributeError, id="json-string"),
+    pytest.param('{"run_id":[1],"data_sha256":"a"}', TypeError, id="list-run-id"),
+    pytest.param('{"run_id":{"a":1},"data_sha256":true}', TypeError, id="object-run-id-true-digest"),
+    pytest.param('{"run_id":[1],"data_sha256":1}', TypeError, id="list-run-id-number-digest"),
+    pytest.param('{"run_id":[1],"data_sha256":[0]}', TypeError, id="list-run-id-list-digest"),
+]
+
+
+@pytest.mark.parametrize("hashed", POSITIONS)
+@pytest.mark.parametrize(("payload", "expected"), UNREADABLE_PAYLOADS)
+def test_known_limit_unreadable_event_payload_raises_at_any_position(setup, payload, expected, hashed):
+    store, service, actor, bid, _ = setup
+    item = history(setup, versions=1)
+    append_raw(store, bid, item["id"], payload, hashed=hashed)
+    assert_audit_raises(setup, expected)
+
+
+def test_known_limit_null_event_payload_raises(setup):
+    store, _, _, bid, _ = setup
+    without_constraint(store, "events", "payload TEXT NOT NULL", "payload")
+    append_raw(store, bid, bid, SQL("NULL"), hashed=False)
+    assert_audit_raises(setup, TypeError)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"run_id":[],"data_sha256":"a"}',
+        '{"run_id":{},"data_sha256":"a"}',
+        '{"run_id":[1],"data_sha256":""}',
+        '{"run_id":[1],"data_sha256":0}',
+        '{"run_id":[1],"data_sha256":false}',
+        '{"run_id":{"a":1},"data_sha256":null}',
+        '{"run_id":[1],"data_sha256":[]}',
+        '{"run_id":[1]}',
+    ],
+)
+def test_list_or_object_run_id_without_a_digest_is_reported(setup, payload):
+    store, _, _, bid, _ = setup
+    seq = append_raw(store, bid, bid, payload)
+    broken_at(setup, seq)
+
+
+def add_ai_review(store, actor, bid, chained=True):
+    run_id = "review_synthetic"
+    data = {"note": "Synthetic run written for this test."}
+    with store.write() as con:
+        con.execute(
+            "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
+            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), "unknown", APPENDED_AT),
+        )
+        if chained:
+            store.event(
+                con,
+                bid,
+                actor,
+                "ai.unknown",
+                run_id,
+                {"run_id": run_id, "state": "unknown", "data_sha256": digest(canonical(data))},
+            )
+    return run_id
+
+
+TABLE_COLUMNS = [
+    *[
+        ("events", c)
+        for c in ("actor_id", "action", "object_id", "payload", "created_at", "prev_hash", "hash")
+    ],
+    *[("businesses", c) for c in ("data", "version", "created_at", "updated_at")],
+    *[
+        ("objects", c)
+        for c in ("id", "kind", "title", "data", "state", "version", "created_at", "updated_at")
+    ],
+    *[
+        ("ai_calls", c)
+        for c in ("id", "principal_id", "command_key", "request_hash", "data", "state", "created_at")
+    ],
+]
+
+
+@pytest.mark.parametrize("hashed", POSITIONS)
+@pytest.mark.parametrize(("table", "column"), TABLE_COLUMNS, ids=[f"{t}.{c}" for t, c in TABLE_COLUMNS])
+def test_known_limit_text_not_valid_in_the_database_encoding_raises(setup, table, column, hashed):
+    # sqlite3 raises while fetching the row; only revision rows are read in a way that avoids it.
+    store, _, actor, bid, _ = setup
+    item = history(setup, versions=1)
+    if table == "events":
+        append_raw(store, bid, item["id"], '{"note":1}', hashed=hashed, columns={column: INVALID_TEXT})
+    else:
+        if table == "ai_calls":
+            add_ai_review(store, actor, bid)
+        row = {"businesses": bid, "objects": item["id"], "ai_calls": "review_synthetic"}[table]
+        with store.write() as con:
+            assert con.execute(f"UPDATE {table} SET {column}={INVALID_TEXT} WHERE id=?", (row,)).rowcount == 1
+    assert_audit_raises(setup, sqlite3.OperationalError)
+
+
+@pytest.mark.parametrize(("encoding", "unpaired"), [("UTF-16le", "X'00D8'"), ("UTF-16be", "X'D800'")])
+def test_known_limit_text_not_valid_in_a_utf16_database_raises(tmp_path, encoding, unpaired):
+    path = tmp_path / "private" / "foundry.db"
+    path.parent.mkdir()
+    con = sqlite3.connect(path)
+    con.execute(f"PRAGMA encoding='{encoding}'")
+    con.execute("CREATE TABLE encoding_marker(x)")
+    con.close()
+    store = Store(path)
+    actor = store.authenticate(store.bootstrap()["token"])
+    service = Service(store)
+    bid = service.create_business(
+        actor,
+        key(),
+        models.BusinessCreate(name="Encoded business", concept="A synthetic business.").model_dump(
+            mode="json"
+        ),
+    )["id"]
+    append_raw(
+        store, bid, bid, '{"note":1}', hashed=False, columns={"actor_id": SQL(f"CAST({unpaired} AS TEXT)")}
+    )
+    assert_audit_raises((store, service, actor, bid, None), sqlite3.OperationalError)
+
+
+UNREADABLE_DATA = [
+    pytest.param("{", json.JSONDecodeError, id="not-json"),
+    pytest.param("", json.JSONDecodeError, id="empty-text"),
+    pytest.param(SQL("X'FF'"), UnicodeDecodeError, id="blob-not-utf8"),
+    pytest.param('{"n":' + LONG_INTEGER + "}", ValueError, id="integer-over-digit-limit"),
+    pytest.param(DEEP, RecursionError, id="nested-beyond-recursion-limit"),
+]
+
+
+def record_row(setup, table):
+    store, _, _, bid, _ = setup
+    return bid if table == "businesses" else history(setup, versions=1)["id"]
+
+
+def set_column(store, table, column, row, value):
+    expression, args = stored(value)
+    with store.write() as con:
+        assert con.execute(f"UPDATE {table} SET {column}={expression} WHERE id=?", (*args, row)).rowcount == 1
+
+
+@pytest.mark.parametrize("table", ["businesses", "objects"])
+@pytest.mark.parametrize(("data", "expected"), UNREADABLE_DATA)
+def test_known_limit_unreadable_record_data_raises(setup, table, data, expected):
+    store = setup[0]
+    set_column(store, table, "data", record_row(setup, table), data)
+    assert_audit_raises(setup, expected)
+
+
+@pytest.mark.parametrize("table", ["businesses", "objects"])
+def test_known_limit_null_record_data_raises(setup, table):
+    store = setup[0]
+    row = record_row(setup, table)
+    without_constraint(store, table, "data TEXT NOT NULL", "data")
+    set_column(store, table, "data", row, SQL("NULL"))
+    assert_audit_raises(setup, TypeError)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param("[1]", id="json-array"),
+        pytest.param('"x"', id="json-string"),
+        pytest.param("3", id="json-number"),
+        pytest.param("null", id="json-null"),
+        pytest.param('{"n":NaN}', id="nan"),
+        pytest.param('{"n":1E400}', id="overflow"),
+        pytest.param('{"n":-Infinity}', id="minus-infinity"),
+        pytest.param('{"n":"\\ud800"}', id="surrogate-value"),
+        pytest.param('{"\\udc00":1}', id="surrogate-key"),
+        pytest.param(SQL("CAST('{\"n\":1}' AS BLOB)"), id="utf8-blob"),
+        pytest.param(SQL("X'7B226E223A22EDA080227D'"), id="blob-with-raw-surrogate"),
+    ],
+)
+@pytest.mark.parametrize("table", ["businesses", "objects"])
+def test_record_data_that_parses_is_reported(setup, table, data):
+    store = setup[0]
+    row = record_row(setup, table)
+    set_column(store, table, "data", row, data)
+    expected = [f"Current record differs from history: {row}"]
+    assert integrity(setup)["record_errors"] == expected + (
+        [f"Revision mismatch: {row}"] if table == "objects" else []
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(SQL("X'41'"), id="blob"),
+        pytest.param(SQL("1e308 * 10"), id="real-infinity"),
+        pytest.param("abc", id="text"),
+        pytest.param(SQL("NULL"), id="null"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("table", "column", "declared"),
+    [
+        ("businesses", "version", "version INTEGER NOT NULL"),
+        ("businesses", "updated_at", "updated_at TEXT NOT NULL"),
+        ("objects", "title", "title TEXT NOT NULL"),
+        ("objects", "version", "version INTEGER NOT NULL"),
+    ],
+)
+def test_record_columns_in_any_storage_class_are_reported(setup, table, column, declared, value):
+    store = setup[0]
+    row = record_row(setup, table)
+    if value == "NULL":
+        without_constraint(store, table, declared, column)
+    set_column(store, table, column, row, value)
+    expected = [f"Current record differs from history: {row}"]
+    assert integrity(setup)["record_errors"] == expected + (
+        [f"Revision mismatch: {row}"] if table == "objects" else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        pytest.param("[1]", TypeError, id="json-array"),
+        pytest.param('"abc"', TypeError, id="json-string"),
+        pytest.param("3", TypeError, id="json-number"),
+        pytest.param("null", TypeError, id="json-null"),
+        pytest.param('{"content_sha256":"x"}', KeyError, id="no-content"),
+        pytest.param('{"content":"abc"}', KeyError, id="no-content-hash"),
+        pytest.param('{"content":1,"content_sha256":"x"}', AttributeError, id="number-content"),
+        pytest.param('{"content":[1],"content_sha256":"x"}', AttributeError, id="list-content"),
+        pytest.param('{"content":null,"content_sha256":"x"}', AttributeError, id="null-content"),
+        pytest.param(
+            '{"content":"\\ud800","content_sha256":"x"}', UnicodeEncodeError, id="surrogate-content"
+        ),
+    ],
+)
+@pytest.mark.parametrize("kind", ["evidence", "document"])
+def test_known_limit_malformed_evidence_or_document_data_raises(setup, kind, data, expected):
+    store = setup[0]
+    row = record_row(setup, "objects")
+    with store.write() as con:
+        con.execute("UPDATE objects SET kind=?,data=? WHERE id=?", (kind, data, row))
+    assert_audit_raises(setup, expected)
+
+
+@pytest.mark.parametrize("content_hash", ['"x"', "[1]", "NaN", "null"])
+@pytest.mark.parametrize("kind", ["evidence", "document"])
+def test_evidence_or_document_content_hash_of_any_type_is_reported(setup, kind, content_hash):
+    store = setup[0]
+    row = record_row(setup, "objects")
+    with store.write() as con:
+        con.execute(
+            "UPDATE objects SET kind=?,data=? WHERE id=?",
+            (kind, '{"content":"abc","content_sha256":' + content_hash + "}", row),
+        )
+    assert integrity(setup)["record_errors"] == [
+        f"Current record differs from history: {row}",
+        f"Content hash mismatch: {row}",
+        f"Revision mismatch: {row}",
+    ]
+
+
+AI_DATA = [
+    pytest.param("{", json.JSONDecodeError, id="not-json"),
+    pytest.param(SQL("X'FF'"), UnicodeDecodeError, id="blob-not-utf8"),
+    pytest.param('{"n":' + LONG_INTEGER + "}", ValueError, id="integer-over-digit-limit"),
+    pytest.param(DEEP, RecursionError, id="nested-beyond-recursion-limit"),
+    pytest.param('{"n":NaN}', ValueError, id="nan"),
+    pytest.param('{"n":1E400}', ValueError, id="overflow"),
+    pytest.param('{"n":"\\ud800"}', UnicodeEncodeError, id="surrogate-value"),
+    pytest.param('{"\\udc00":1}', UnicodeEncodeError, id="surrogate-key"),
+]
+
+
+@pytest.mark.parametrize(("data", "expected"), AI_DATA)
+def test_known_limit_ai_review_data_raises_when_its_state_matches_history(setup, data, expected):
+    store, _, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid)
+    set_column(store, "ai_calls", "data", run_id, data)
+    assert_audit_raises(setup, expected)
+
+
+def test_known_limit_null_ai_review_data_raises_when_its_state_matches_history(setup):
+    store, _, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid)
+    without_constraint(store, "ai_calls", "data TEXT NOT NULL", "data")
+    set_column(store, "ai_calls", "data", run_id, SQL("NULL"))
+    assert_audit_raises(setup, TypeError)
+
+
+def test_known_limit_ai_review_with_null_state_and_no_history_reads_its_data(setup):
+    store, _, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid, chained=False)
+    without_constraint(store, "ai_calls", "state TEXT NOT NULL", "state")
+    with store.write() as con:
+        con.execute("UPDATE ai_calls SET state=NULL,data='{' WHERE id=?", (run_id,))
+    assert_audit_raises(setup, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize(
+    "chained", [pytest.param(True, id="state-changed"), pytest.param(False, id="no-history")]
+)
+@pytest.mark.parametrize(("data", "expected"), AI_DATA)
+def test_ai_review_data_is_not_read_when_its_state_differs_from_history(setup, data, expected, chained):
+    store, _, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid, chained)
+    set_column(store, "ai_calls", "data", run_id, data)
+    with store.write() as con:
+        con.execute("UPDATE ai_calls SET state='succeeded' WHERE id=?", (run_id,))
+    assert integrity(setup)["record_errors"] == [f"AI review differs from history: {run_id}"]
+
+
+@pytest.mark.parametrize("data", ["[1]", '"x"', "3", "null", SQL("CAST('{\"n\":1}' AS BLOB)")])
+def test_ai_review_data_that_parses_is_reported(setup, data):
+    store, _, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid)
+    set_column(store, "ai_calls", "data", run_id, data)
+    assert integrity(setup)["record_errors"] == [f"AI review differs from history: {run_id}"]
+
+
+UNENCODABLE_EVENTS = [
+    pytest.param('{"note":NaN}', {}, ValueError, id="nan"),
+    pytest.param('{"note":Infinity}', {}, ValueError, id="infinity"),
+    pytest.param('{"note":-Infinity}', {}, ValueError, id="minus-infinity"),
+    pytest.param('{"note":1E400}', {}, ValueError, id="overflow"),
+    pytest.param('{"note":-1E400}', {}, ValueError, id="negative-overflow"),
+    pytest.param('{"run_id":NaN,"data_sha256":"a"}', {}, ValueError, id="nan-run-id"),
+    pytest.param('{"note":"\\ud800"}', {}, UnicodeEncodeError, id="surrogate-value"),
+    pytest.param('{"\\udc00":1}', {}, UnicodeEncodeError, id="surrogate-key"),
+    pytest.param(SQL("X'7B226E223A22EDA080227D'"), {}, UnicodeEncodeError, id="blob-with-raw-surrogate"),
+    *[
+        pytest.param('{"note":1}', {column: SQL("X'41'")}, TypeError, id=f"blob-{column}")
+        for column in ("actor_id", "action", "object_id", "created_at")
+    ],
+]
+
+
+@pytest.mark.parametrize(("payload", "columns", "expected"), UNENCODABLE_EVENTS)
+def test_known_limit_unencodable_event_raises_when_the_chain_check_hashes_it(
+    setup, payload, columns, expected
+):
+    store, _, _, bid, _ = setup
+    item = history(setup, versions=1)
+    append_raw(store, bid, item["id"], payload, columns=columns)
+    assert_audit_raises(setup, expected)
+
+
+@pytest.mark.parametrize("column", ["actor_id", "action", "object_id", "created_at"])
+def test_known_limit_infinite_real_event_column_raises_when_the_chain_check_hashes_it(setup, column):
+    # Only after a schema change: a TEXT column stores an infinite REAL as the text 'Inf'.
+    store, _, _, bid, _ = setup
+    without_constraint(store, "events", f"{column} TEXT NOT NULL", column)
+    append_raw(store, bid, bid, '{"note":1}', columns={column: SQL("1e308 * 10")})
+    assert_audit_raises(setup, ValueError)
+
+
+@pytest.mark.parametrize(
+    "after_break", [pytest.param(False, id="own-link-wrong"), pytest.param(True, id="after-broken-event")]
+)
+@pytest.mark.parametrize(("payload", "columns", "expected"), UNENCODABLE_EVENTS)
+def test_unencodable_event_is_reported_when_the_chain_check_does_not_hash_it(
+    setup, payload, columns, expected, after_break
+):
+    store, _, _, bid, _ = setup
+    item = history(setup, versions=1)
+    if after_break:
+        # A well-formed event with a wrong hash; the next one links to that hash but is not hashed.
+        broken = append_raw(store, bid, item["id"], '{"note":1}')
+        append_raw(store, bid, item["id"], payload, columns=columns)
+    else:
+        broken = append_raw(store, bid, item["id"], payload, hashed=False, columns=columns)
+    missing = ["Historical AI review missing: nan"] if "NaN," in payload else []
+    broken_at(setup, broken, missing)
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "declared"),
+    [
+        pytest.param("prev_hash", SQL("X'41'"), None, id="blob-prev-hash"),
+        pytest.param("hash", SQL("X'41'"), None, id="blob-hash"),
+        pytest.param("prev_hash", SQL("NULL"), "prev_hash TEXT NOT NULL", id="null-prev-hash"),
+        pytest.param("hash", SQL("NULL"), "hash TEXT NOT NULL", id="null-hash"),
+        pytest.param("actor_id", SQL("NULL"), "actor_id TEXT NOT NULL", id="null-actor-id"),
+        pytest.param("created_at", SQL("7"), "created_at TEXT NOT NULL", id="integer-created-at"),
+        pytest.param("action", SQL("2.5"), "action TEXT NOT NULL", id="real-action"),
+    ],
+)
+def test_hashed_event_columns_in_other_storage_classes_are_reported(setup, column, value, declared):
+    store, _, _, bid, _ = setup
+    if declared:
+        without_constraint(store, "events", declared, column)
+    seq = append_raw(store, bid, bid, '{"note":1}', columns={column: value})
+    broken_at(setup, seq)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param(("payload", '{"note":NaN}'), ValueError, id="unhashed-event-nan"),
+        pytest.param(("payload", '{"note":"\\ud800"}'), UnicodeEncodeError, id="unhashed-event-surrogate"),
+        pytest.param(("actor_id", SQL("X'41'")), TypeError, id="unhashed-event-blob-column"),
+        pytest.param(("hash", SQL("X'41'")), TypeError, id="blob-hash"),
+        pytest.param(("businesses", "data", '{"n":NaN}'), ValueError, id="business-data-nan"),
+        pytest.param(("businesses", "version", SQL("X'41'")), TypeError, id="business-version-blob"),
+        pytest.param(
+            ("businesses", "version", SQL("1e308 * 10")), ValueError, id="business-version-infinite-real"
+        ),
+        pytest.param(("objects", "data", '{"n":"\\ud800"}'), UnicodeEncodeError, id="record-data-surrogate"),
+        pytest.param(("objects", "title", SQL("X'41'")), TypeError, id="record-title-blob"),
+        pytest.param(("ai_calls", "data", "{"), json.JSONDecodeError, id="unread-ai-data-not-json"),
+        pytest.param(("ai_calls", "data", '{"n":1E400}'), ValueError, id="unread-ai-data-overflow"),
+        pytest.param(("ai_calls", "created_at", SQL("X'41'")), TypeError, id="ai-created-at-blob"),
+        pytest.param(("ai_calls", "state", SQL("X'41'")), TypeError, id="ai-state-blob"),
+    ],
+)
+def test_known_limit_export_raises_on_values_it_cannot_write(setup, change, expected):
+    store, service, actor, bid, _ = setup
+    item = history(setup, versions=1)
+    # The AI review has no chained event, so verification reports it and does not read its data.
+    run_id = add_ai_review(store, actor, bid, chained=False)
+    if len(change) == 2:
+        append_raw(
+            store,
+            bid,
+            item["id"],
+            change[1] if change[0] == "payload" else '{"note":1}',
+            hashed=False,
+            columns={} if change[0] == "payload" else {change[0]: change[1]},
+        )
+    else:
+        table, column, value = change
+        set_column(
+            store, table, column, {"businesses": bid, "objects": item["id"], "ai_calls": run_id}[table], value
+        )
+    assert not integrity(setup)["valid"]
+    assert_audit_raises(setup, expected, export=True)
+
+
+@pytest.mark.parametrize("column", ["principal_id", "command_key", "request_hash"])
+def test_export_leaves_out_ai_review_columns_it_does_not_carry(setup, column):
+    store, service, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid)
+    set_column(store, "ai_calls", column, run_id, SQL("X'41'"))
+    export = service.audit(actor, bid, True)
+    assert export["integrity"]["valid"], export["integrity"]["record_errors"]
+    assert set(export["ai_runs"][0]) == {"id", "state", "created_at", "data"}
+
+
+@pytest.mark.parametrize(
+    ("payload", "columns", "expected"),
+    [
+        pytest.param('{"note":NaN}', {}, ValueError, id="nan"),
+        pytest.param('{"note":1E400}', {}, ValueError, id="overflow"),
+        pytest.param('{"note":"\\ud800"}', {}, UnicodeEncodeError, id="surrogate"),
+        pytest.param('{"note":1}', {"actor_id": SQL("X'FF'")}, UnicodeDecodeError, id="blob-not-utf8"),
+        pytest.param('{"n":' + "[" * 2000 + "]" * 2000 + "}", {}, RecursionError, id="nested-2000-levels"),
+    ],
+)
+def test_known_limit_audit_endpoint_raises_on_events_it_cannot_send(
+    setup, client, payload, columns, expected
+):
+    # The service returns a report for these unhashed events; sending the events as JSON fails.
+    store, service, actor, bid, _ = setup
+    append_raw(store, bid, bid, payload, hashed=False, columns=columns)
+    assert service.audit(actor, bid)["integrity"]["valid"] is False
+    with pytest.raises(Exception) as caught:
+        client.get(f"/api/businesses/{bid}/audit")
+    assert caught.type is expected
+
+
+def test_audit_endpoint_sends_an_event_column_stored_as_a_utf8_blob(setup, client):
+    store, _, _, bid, _ = setup
+    seq = append_raw(store, bid, bid, '{"note":1}', hashed=False, columns={"actor_id": SQL("X'41'")})
+    response = client.get(f"/api/businesses/{bid}/audit")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["integrity"]["failed_sequence"] == seq
+    assert body["events"][-1]["actor_id"] == "A"

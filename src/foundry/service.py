@@ -14,6 +14,12 @@ WRITERS = {"owner", "operator", "reviewer", "agent"}
 FINISHED = {"verified", "not_applicable"}
 COMPLETED = {"approved", "submitted", "verified", "not_applicable"}
 UNREADABLE = (TypeError, ValueError, RecursionError)
+LIMITATION = (
+    "The hash chain detects a changed recorded event, but anyone who can edit the database can rewrite "
+    "the chain, remove its newest events or append events to it that pass this check. Keep protected "
+    "off-machine backups, and store the head hash outside this machine to show later that the events up "
+    "to it are unchanged."
+)
 
 
 def read_json(value, encoding="utf-8"):
@@ -725,7 +731,7 @@ class Service:
                 **integrity,
                 "valid": integrity["valid"] and not errors,
                 "record_errors": errors,
-                "limitation": "Local hash chain detects mismatches. A database administrator can rewrite the chain; use protected off-machine backups for independent anchoring.",
+                "limitation": LIMITATION,
             }
             if export:
                 archive = {
