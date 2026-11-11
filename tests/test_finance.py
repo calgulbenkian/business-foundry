@@ -170,6 +170,22 @@ def test_new_fields_default_to_version_one_behaviour():
     assert column(forecast(inputs), "base", "fixed_costs") == ["100.00"] * 3
 
 
+def test_default_neutrality_preserves_v1_rounding_tie_breaks():
+    inputs = ForecastInputs(
+        months=6,
+        monthly_units=100000000,
+        unit_price=2000,
+        monthly_growth="-0.8",
+        receivable_days=15,
+        monthly_capex="123.45",
+        asset_life_months=7,
+        tax_rate="0.5",
+    )
+    base = forecast(inputs)["scenarios"]["base"]
+    assert base["months"][5]["cash"] == "106211231444.47"
+    assert base["summary"]["ending_cash"] == "106211231444.47"
+
+
 @pytest.mark.parametrize(
     "changes",
     [

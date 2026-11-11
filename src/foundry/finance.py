@@ -21,7 +21,7 @@ def ratio(value: Decimal | None) -> str | None:
 
 def _forecast(a: ForecastInputs, volume_factor=ONE, fixed_factor=ONE):
     with localcontext() as ctx:
-        ctx.prec = 50
+        ctx.prec = 40
         cash = a.opening_equity + a.opening_debt
         debt, ar, retained, gross_assets, accumulated_dep = a.opening_debt, ZERO, ZERO, ZERO, ZERO
         revenues, rows, flows = [], [], []
