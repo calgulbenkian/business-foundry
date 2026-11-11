@@ -11,6 +11,7 @@ Install with the ``desktop`` extra; the CLI, the web server and the test suite d
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import ctypes
 import hmac
@@ -30,13 +31,27 @@ from pathlib import Path
 from .store import Store, digest, now
 
 APP_NAME = "Business Foundry"
-LAUNCH_CODE_SECONDS = 30
+# How long the window has to use a launch code, counted from the moment it is told to open the
+# start address. On macOS the first request arrived 11 seconds after server start on a cold
+# first launch of the Qt engine; a first WebView2 start on a slow Windows PC, with antivirus scanning a new program, can take
+# far longer. The duration adds little protection: the code is 256 random bits, single use,
+# held only in memory and handed straight to the window. So the limit is generous, and a window
+# that still misses it is sent a fresh code (up to LAUNCH_ATTEMPTS in all) instead of a dead end.
+LAUNCH_CODE_SECONDS = 180
+LAUNCH_ATTEMPTS = 3
+LAUNCH_GRACE_SECONDS = 5
+# How long to wait for the window to show its first page before sending it the start address
+# anyway. The launch code's clock starts only then.
+WINDOW_READY_SECONDS = 120
 # The browser cookie has no expiry and the window keeps no cookies on disk, so the session
 # ends with the process; the database row is removed at shutdown. This bound only limits a
 # row left behind by a crash, whose token never left the dead process's memory.
 SESSION_DAYS = 30
 SERVER_START_SECONDS = 15
 SHUTDOWN_SECONDS = 10
+# After a termination signal, how long the window has to close the normal way before the app
+# cleans up and exits without it.
+SIGNAL_EXIT_SECONDS = 20
 
 log = logging.getLogger("foundry.desktop")
 
@@ -52,6 +67,21 @@ BROWSER_PAGE = """<!doctype html>
 <p>This address belongs to the Business Foundry desktop app and does not open in a web browser.
 Close this tab and open Business Foundry from its icon.</p>
 <p>If you see this inside the Business Foundry window, quit the app and open it again.</p>
+</body></html>
+"""
+
+OPENING_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Business Foundry</title></head>
+<body><p>Opening Business Foundry\u2026</p></body></html>
+"""
+
+SIGN_IN_FAILED_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Business Foundry</title></head>
+<body>
+<h1>Business Foundry could not open your records</h1>
+<p>The window could not sign in. Quit Business Foundry and open it again.</p>
+<p>If this keeps happening, the details are in desktop.log in the Business Foundry data
+folder.</p>
 </body></html>
 """
 
@@ -223,6 +253,10 @@ def configure_logging(data_dir: Path) -> Path:
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
+    # httpx logs every request's full URL at INFO. Nothing in the app sends the launch code
+    # through httpx, but keep any URL with a query string out of the file regardless.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     return path
 
 
@@ -279,21 +313,39 @@ def bind_loopback() -> socket.socket:
 
 
 class LaunchSignIn:
-    """Signs in the desktop window, once, with a code that never leaves this process.
+    """Signs in the desktop window with a code that never leaves this process.
 
-    The 256-bit code is generated here, kept only in memory and handed straight to the window.
-    It is accepted once, within LAUNCH_CODE_SECONDS of being issued, and exchanged for an
-    ordinary owner browser session. Sessions it created are deleted at shutdown.
+    Each 256-bit code is generated here, kept only in memory and handed straight to the window.
+    At most one code is valid at a time: issuing a new one replaces the last. A code is accepted
+    once, within LAUNCH_CODE_SECONDS of being issued, and exchanged for an ordinary owner
+    browser session. At most LAUNCH_ATTEMPTS codes are issued per process, none after the
+    window has signed in. Sessions it created are deleted at shutdown.
+
+    Whoever waits on ``wait`` learns how the current code ended: the window signed in, the code
+    was presented but refused, or the app is closing.
     """
 
-    def __init__(self, store: Store, host: str, *, lifetime: float = LAUNCH_CODE_SECONDS, clock=None):
+    SIGNED_IN, REFUSED, CLOSED = "signed in", "refused", "closed"
+
+    def __init__(
+        self,
+        store: Store,
+        host: str,
+        *,
+        lifetime: float = LAUNCH_CODE_SECONDS,
+        attempts: int = LAUNCH_ATTEMPTS,
+        clock=None,
+    ):
         self.store, self.host = store, host
+        self.lifetime = lifetime
         self._clock = clock or time.monotonic
-        self._lifetime = lifetime
+        self._attempts = attempts
+        self._issued = 0
         self._code: str | None = None
-        self._issued = False
         self._deadline = 0.0
-        self._lock = threading.Lock()
+        self._outcome: str | None = None
+        self._finished = False  # signed in or closed: no more codes
+        self._changed = threading.Condition()
         self._sessions: set[str] = set()
 
     def __repr__(self):
@@ -304,29 +356,61 @@ class LaunchSignIn:
         return "http://" + self.host
 
     def issue(self) -> str:
-        """Create the code, start its clock and return the window's start URL. Once only."""
-        with self._lock:
-            if self._issued:
-                raise RuntimeError("A launch code is issued once per process.")
-            self._issued = True
+        """Create a new code, start its clock and return the window's start URL.
+
+        Call it as the window is told to navigate, so that the window, not the server's start,
+        uses the time. Any earlier code stops working.
+        """
+        with self._changed:
+            if self._finished:
+                raise RuntimeError("The window has already signed in, or the app is closing.")
+            if self._issued >= self._attempts:
+                raise RuntimeError(f"Only {self._attempts} launch codes are issued per process.")
+            self._issued += 1
             self._code = secrets.token_urlsafe(32)  # 256 bits
-            self._deadline = self._clock() + self._lifetime
+            self._deadline = self._clock() + self.lifetime
+            self._outcome = None
+            log.info("Issued launch code %s of %s.", self._issued, self._attempts)
             return f"{self.origin}/desktop/start?code={self._code}"
 
     def redeem(self, code: str) -> str | None:
-        """Exchange the launch code for a session token; None when the code is refused."""
-        with self._lock:
-            if self._code is None:
+        """Exchange the current launch code for a session token; None when it is refused."""
+        with self._changed:
+            current = self._code
+            if current is None or not hmac.compare_digest(str(code).encode(), current.encode()):
+                # A guess, or a code that has been used or replaced. The current code, if any,
+                # is not spent: a wrong guess must not lock the window out.
+                log.warning("Refused a launch code that is not the current one.")
                 return None
+            self._code = None  # used once, whether or not it is in time
             if self._clock() > self._deadline:
-                self._code = None
                 log.warning("Refused a launch code presented after it expired.")
+                self._finish_attempt(self.REFUSED)
                 return None
-            if not hmac.compare_digest(str(code).encode(), self._code.encode()):
-                log.warning("Refused an incorrect launch code.")
-                return None
+        token = self._open_session()
+        with self._changed:
+            self._finish_attempt(self.SIGNED_IN if token else self.REFUSED)
+        return token
+
+    def _finish_attempt(self, outcome: str):
+        self._outcome = outcome
+        if outcome == self.SIGNED_IN:
+            self._finished = True
+        self._changed.notify_all()
+
+    def wait(self, timeout: float) -> str | None:
+        """How the current code ended, or None if nothing happened within timeout seconds."""
+        with self._changed:
+            self._changed.wait_for(lambda: self._outcome is not None, timeout)
+            return self._outcome
+
+    def close(self):
+        """Refuse every code from now on and wake anyone waiting."""
+        with self._changed:
             self._code = None
-        return self._open_session()
+            self._finished = True
+            self._outcome = self.CLOSED
+            self._changed.notify_all()
 
     def _open_session(self) -> str | None:
         token = secrets.token_urlsafe(40)
@@ -350,6 +434,37 @@ class LaunchSignIn:
             with self.store.write() as con:
                 con.executemany("DELETE FROM sessions WHERE token_hash=?", [(h,) for h in hashes])
         self._sessions.clear()
+
+
+def sign_in_window(signin: LaunchSignIn, navigate, give_up) -> bool:
+    """Send the window launch codes until it signs in, at most LAUNCH_ATTEMPTS times.
+
+    ``navigate(url)`` points the window at a start URL; ``give_up()`` shows it a final message.
+    The server reports a code that arrived late or was refused, and a code that never arrived
+    is replaced once its time is up, so a slow window gets a fresh code instead of a dead end.
+    Returns whether the window signed in.
+    """
+    attempt = 0
+    while True:
+        try:
+            url = signin.issue()
+        except RuntimeError:
+            break  # closing, or out of codes
+        attempt += 1
+        navigate(url)
+        # A little longer than the code's lifetime, so a request that arrived just in time can
+        # finish opening its session.
+        outcome = signin.wait(signin.lifetime + LAUNCH_GRACE_SECONDS)
+        if outcome == signin.SIGNED_IN:
+            return True
+        if outcome == signin.CLOSED:
+            return False
+        reason = "its code was refused" if outcome == signin.REFUSED else "its code was not used in time"
+        log.warning("The window did not sign in (attempt %s): %s.", attempt, reason)
+    if signin.wait(0) != signin.CLOSED:
+        log.error("The window could not sign in after %s launch codes.", attempt)
+        give_up()
+    return False
 
 
 # Server -------------------------------------------------------------------------------------
@@ -385,8 +500,9 @@ class RequestLog:
 class DesktopApp:
     """The local server and its sign-in, independent of any window (tested without one)."""
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, *, launch_seconds: float = LAUNCH_CODE_SECONDS):
         self.data_dir = Path(data_dir)
+        self.launch_seconds = launch_seconds
         self.db_path = self.data_dir / "foundry.db"
         self.signin: LaunchSignIn | None = None
         self.server = None
@@ -395,11 +511,15 @@ class DesktopApp:
         self._stop_lock = threading.Lock()
 
     @property
+    def stopped(self) -> bool:
+        return self._stopped
+
+    @property
     def port(self) -> int:
         return int(self.signin.host.rsplit(":", 1)[1])
 
-    def start(self) -> str:
-        """Start serving; return the window's single-use start URL."""
+    def start(self) -> LaunchSignIn:
+        """Start serving; return the sign-in that issues the window's launch codes."""
         import uvicorn
 
         from .api import create_app
@@ -410,7 +530,7 @@ class DesktopApp:
         sock = bind_loopback()
         address, port = sock.getsockname()[:2]
         host = f"{address}:{port}"
-        self.signin = LaunchSignIn(store, host)
+        self.signin = LaunchSignIn(store, host, lifetime=self.launch_seconds)
         app = create_app(self.db_path, allowed_hosts=["127.0.0.1"], desktop=self.signin)
         config = uvicorn.Config(
             RequestLog(app),
@@ -431,8 +551,14 @@ class DesktopApp:
                 raise DesktopError("Business Foundry could not start its local server. See desktop.log.")
             time.sleep(0.02)
         log.info("Serving on %s", host)
-        # The code's time limit starts now, when the window can actually use it.
-        return self.signin.issue()
+        if os.getenv("FOUNDRY_PUBLIC_ORIGIN"):
+            log.info(
+                "FOUNDRY_PUBLIC_ORIGIN is set; the desktop app ignores it and accepts writes only "
+                "from its own window at %s.",
+                self.signin.origin,
+            )
+        # No code yet: it is issued as the window is told to open it (see sign_in_window).
+        return self.signin
 
     def stop(self):
         """Stop the server, end the window's session and checkpoint the database. Idempotent."""
@@ -440,6 +566,7 @@ class DesktopApp:
             if self._stopped or self.server is None:
                 return
             self._stopped = True
+            self.signin.close()
             self.server.should_exit = True
             self._thread.join(SHUTDOWN_SECONDS)
             if self._thread.is_alive():
@@ -472,41 +599,121 @@ def _require_edge_chromium():
         raise DesktopError(WEBVIEW2_MISSING)
 
 
-def _close_on_signals(window):
-    """Ctrl+C or a termination signal closes the window, so shutdown runs the normal way.
+class SignalShutdown:
+    """Turn Ctrl+C and termination signals into the app's normal shutdown.
 
-    The GUI loop holds the main thread in native code, where Python signal handlers do not
-    run, so the signals are blocked and a helper thread waits for them instead.
+    A Python handler is installed for each signal, which makes the signal's disposition "caught"
+    for the whole process, and ``signal.set_wakeup_fd`` makes Python's low-level handler write
+    the signal number to a socket. That happens on whichever thread the operating system picks,
+    including threads started by other code before ``main`` (a packaged app's bootstrap, or a
+    GUI toolkit), and while the main thread is held in the GUI's native loop, where the Python
+    handler itself would not run. A helper thread reads the socket and closes the window, which
+    runs the same shutdown as the close button. If the window has not closed within
+    SIGNAL_EXIT_SECONDS, the helper stops the app itself and exits.
+
+    Must be created on the main thread (Python allows signal handlers to be set only there).
     """
-    if not hasattr(signal, "pthread_sigmask"):
-        return
-    signals = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 
-    def wait():
-        received = signal.sigwait(signals)
-        log.info("Received signal %s; closing the window.", received)
-        window.events.shown.wait(SERVER_START_SECONDS)
-        window.destroy()
+    def __init__(self, app: DesktopApp, signals=None):
+        names = ("SIGINT", "SIGTERM", "SIGHUP")
+        self.signals = signals or [getattr(signal, n) for n in names if hasattr(signal, n)]
+        self.app = app
+        self.received = threading.Event()
+        self.close_window = None  # set once there is a window to close
+        self._reader, self._writer = socket.socketpair()
+        self._writer.setblocking(False)
+        self._previous = {sig: signal.getsignal(sig) for sig in self.signals}
+        for sig in self.signals:
+            signal.signal(sig, self._noted)
+        self._previous_fd = signal.set_wakeup_fd(self._writer.fileno(), warn_on_full_buffer=False)
+        threading.Thread(target=self._watch, name="foundry-signals", daemon=True).start()
 
-    threading.Thread(target=wait, name="foundry-signals", daemon=True).start()
+    @staticmethod
+    def _noted(signum, frame):
+        """The Python-level handler. The wakeup socket does the work; see the class notes."""
+
+    def _watch(self):
+        while True:
+            try:
+                data = self._reader.recv(1)
+            except OSError:
+                return
+            if not data:
+                return
+            signum = data[0]
+            if signum in self.signals and not self.received.is_set():
+                break
+        self.received.set()
+        log.info("Received signal %s; closing the window.", signum)
+        # main() checks ``received`` after setting ``close_window``, and this reads
+        # ``close_window`` after setting ``received``, so one of the two always acts.
+        close = self.close_window
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                log.exception("Could not close the window after a signal.")
+        if self._wait_for_exit():
+            return
+        log.warning(
+            "The app did not stop within %s seconds of the signal; stopping now.", SIGNAL_EXIT_SECONDS
+        )
+        self.app.stop()
+        logging.shutdown()
+        os._exit(128 + signum)
+
+    def _wait_for_exit(self) -> bool:
+        """Whether the app stopped within SIGNAL_EXIT_SECONDS (the process is then ending)."""
+        deadline = time.monotonic() + SIGNAL_EXIT_SECONDS
+        while time.monotonic() < deadline:
+            if self.app.stopped:
+                return True
+            time.sleep(0.1)
+        return self.app.stopped
+
+    def restore(self):
+        """Put the previous handlers back (main thread only). Used by tests and on exit."""
+        signal.set_wakeup_fd(self._previous_fd)
+        for sig, handler in self._previous.items():
+            signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+        self._writer.close()
+        self._reader.close()
 
 
-def open_window(app: DesktopApp, start_url: str):
+def open_window(app: DesktopApp, signals: SignalShutdown | None = None):
     import webview
 
     _require_edge_chromium()
     webview.settings["ALLOW_DOWNLOADS"] = True  # exports and document downloads
-    window = webview.create_window(APP_NAME, start_url, width=1280, height=860, min_size=(900, 600))
+    # The window opens on a local placeholder. The start address, and with it the launch code's
+    # clock, follows once the web engine has shown that page.
+    window = webview.create_window(APP_NAME, html=OPENING_PAGE, width=1280, height=860, min_size=(900, 600))
 
     def closing():
         # Runs synchronously on the GUI thread before the window closes, and also when the app
         # is quit from its menu, which ends the process without returning from webview.start.
         app.stop()
 
+    def sign_in():
+        if not window.events.loaded.wait(WINDOW_READY_SECONDS):
+            log.warning(
+                "The window took over %s seconds to start; sending it the start address.",
+                WINDOW_READY_SECONDS,
+            )
+        try:
+            sign_in_window(app.signin, window.load_url, lambda: window.load_html(SIGN_IN_FAILED_PAGE))
+        except Exception:
+            if not app.stopped:
+                log.exception("Could not sign in the window.")
+
     window.events.closing += closing
-    _close_on_signals(window)
+    if signals is not None:
+        signals.close_window = window.destroy
+        if signals.received.is_set():
+            return  # a signal arrived before there was a window to close
     gui = "edgechromium" if sys.platform == "win32" else None
     webview.start(
+        sign_in,
         gui=gui,
         # Clears the window's cookies and site data at startup (InPrivate on WebView2; on macOS
         # pywebview clears WebKit's default store for the app instead).
@@ -542,9 +749,6 @@ def show_error(message: str):
 def main(argv=None):
     multiprocessing.freeze_support()
     replace_missing_streams()
-    if hasattr(signal, "pthread_sigmask"):
-        # Before any thread starts, so every thread inherits the mask; see _close_on_signals.
-        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
     parser = argparse.ArgumentParser(prog="foundry-desktop", description="Open Business Foundry.")
     parser.add_argument("--data-dir", type=Path, help="Folder for the private database (default: per-user)")
     # A Finder launch can add its own arguments; ignore anything unrecognised.
@@ -554,11 +758,20 @@ def main(argv=None):
         configure_logging(data_dir)
         with instance_lock(data_dir):
             app = DesktopApp(data_dir)
+            signals = SignalShutdown(app)
+            # A last resort for an exit that bypasses both the window's closing event and the
+            # finally below, such as SystemExit raised inside the GUI toolkit. Idempotent.
+            atexit.register(app.stop)
             try:
-                url = app.start()
-                open_window(app, url)
+                app.start()
+                if signals.received.is_set():
+                    log.info("Stopping before the window opened.")
+                else:
+                    open_window(app, signals)
             finally:
                 app.stop()
+                atexit.unregister(app.stop)
+                signals.restore()
     except DesktopError as exc:
         show_error(str(exc))
         raise SystemExit(1) from None

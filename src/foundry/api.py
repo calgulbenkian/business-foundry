@@ -156,9 +156,10 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
     """Build the web application.
 
     ``desktop`` is the desktop app's launch sign-in (``foundry.desktop.LaunchSignIn``). When it
-    is given, only its exact ``host`` (127.0.0.1 and the port) is accepted, the window signs in
-    at ``/desktop/start`` with the launch code, and a page opened without that session gets a
-    plain instruction page instead of the sign-in form.
+    is given, only its exact ``host`` (127.0.0.1 and the port) is accepted, writes are judged
+    against its exact ``origin`` (``FOUNDRY_PUBLIC_ORIGIN`` is ignored), the window signs in at
+    ``/desktop/start`` with the launch code, and a page opened without that session gets a plain
+    instruction page instead of the sign-in form.
     """
     store = Store(db_path or os.getenv("FOUNDRY_DB", ".foundry/foundry.db"))
     service, app = (
@@ -212,7 +213,12 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
                     status_code=403,
                 )
             origin = request.headers.get("origin")
-            expected = os.getenv("FOUNDRY_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
+            if desktop is not None:
+                # The window's origin is known exactly. FOUNDRY_PUBLIC_ORIGIN describes a server
+                # deployment; left over in the environment, it would silently refuse every save.
+                expected = desktop.origin
+            else:
+                expected = os.getenv("FOUNDRY_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
             if origin and origin != expected:
                 return JSONResponse({"detail": "Cross-origin writes are not accepted."}, status_code=403)
             fetch_site = request.headers.get("sec-fetch-site")
