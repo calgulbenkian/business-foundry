@@ -2,7 +2,9 @@
 
 ## 1. Create the workspace
 
-Start with the README setup. Sign in, choose **New business**, and enter the concept, intended buyer, entry path, accountable person, currency and planning jurisdiction. Leave jurisdiction undecided until there is a reviewed basis for selecting it. A workspace creates work and records; it does not register a legal entity.
+Start with the README setup. Sign in, choose **+ New business**, and enter the concept, intended buyer, entry path, accountable person, currency and planning jurisdiction. Leave jurisdiction undecided until there is a reviewed basis for selecting it. A workspace creates work and records; it does not register a legal entity.
+
+The workspace opens on **Today**: what needs review, what waits on you, what waits on an outside body, and the money figures Business Foundry calculated. The source list on the left holds the **Journey** map, one entry per line of steps (each catalog group, such as Market, Setup or Sales to cash, is a coloured line), and the records. On a phone the panes stack: the list first, the detail on tap, with a back control. A fresh installation with no business opens on a short first-run page with a **Create a business** button.
 
 To start from configuration instead:
 
@@ -31,9 +33,9 @@ Choose **external receipt** for evidence of an action outside the app. A reviewe
 
 ## 4. Model operations or an acquisition
 
-**Financial model** creates linked monthly statements and explicit base/downside/upside cases. Start with believable quantities and unit economics; include real labor and support costs. Examine collection timing and negative cash. Save new versions as assumptions improve.
+**Money** shows the latest model's position and recorded cash; **+ Build model** creates linked monthly statements and explicit base/downside/upside cases. Start with believable quantities and unit economics; include real labor and support costs. Examine collection timing and negative cash. Save new versions as assumptions improve.
 
-**Acquisitions** creates an earnings/valuation/financing analysis and seven target-specific diligence steps. Attach independent evidence to add-backs, check replacement management and financing costs, and inspect the cash available after debt service. A target is not approved because its spreadsheet looks attractive.
+**Acquisition analyses** creates an earnings/valuation/financing analysis and seven target-specific diligence steps, which appear as their own line on the Journey map. Attach independent evidence to add-backs, check replacement management and financing costs, and inspect the cash available after debt service. A target is not approved because its spreadsheet looks attractive.
 
 ```sh
 uv run foundry forecast BUSINESS_ID examples/forecast.json
@@ -42,7 +44,9 @@ uv run foundry acquire BUSINESS_ID examples/acquisition.json
 
 ## 5. Work through the decisions
 
-Open a step in **Work & decisions**. Prepare it, attach evidence and explain the decision. Approval requires a human owner/reviewer, reviewed evidence, required record types and resolved prerequisites. External execution goes through a separate submitted state and requires an external receipt. Verification means the reviewer checked the recorded result. Review a non-applicability decision explicitly rather than silently omitting a requirement.
+Open a step from its line, from **Today** or from a stop on the **Journey** map. Its inspector shows the four stages (prepared, approved, submitted, verified) separately, with who recorded each and when; an internal step shows submission as not needed. Record a decision with the step's action button (for example **Approve…** or **I’ve submitted it…**), which opens a confirmation where you choose the evidence and write a note. Prepare it, attach evidence and explain the decision. Approval requires a human owner/reviewer, reviewed evidence, required record types and resolved prerequisites. External execution goes through a separate submitted state and requires an external receipt. Verification means the reviewer checked the recorded result. Review a non-applicability decision explicitly rather than silently omitting a requirement.
+
+When the facts change, for example when evidence is withdrawn or a record of a required kind is edited, the server reopens the affected completed steps and their dependents. They show as **Needs review**, the only amber state, with the server's reason; earlier stages stay visible as history, not as the current standing. Document drafts made from records that have since changed, and acquisition analyses whose evidence changed, are marked out of date, and invoices or payments whose evidence is withdrawn are flagged.
 
 Legal, formation, banking, licensing and tax work happens with qualified people and providers. Keep submitted and accepted evidence distinct. Source guidance is a starting point; activity, location, ownership and financing facts determine actual requirements.
 
@@ -57,7 +61,7 @@ uv run foundry document BUSINESS_ID investment_memo --deal-id DEAL_ID
 
 ## 7. Record a first sale through payment
 
-Add a customer, agreement evidence and delivery-acceptance evidence. Draft an invoice in **Sales to cash**. Once you actually issue it using your invoicing provider, attach a reviewed external issue receipt and choose **Record issue**. This does not email a customer.
+Add a customer, agreement evidence and delivery-acceptance evidence. Draft an invoice in **Invoices & payments**. Once you actually issue it using your invoicing provider, attach a reviewed external issue receipt and choose **Record issue**. This does not email a customer.
 
 When money is actually received, choose **Record payment**, use the bank/provider reference, attach reviewed receipt evidence and enter the amount/date. Partial payments reduce the balance; duplicate references and overpayments are rejected. The result is an operational invoice/receipt register, not a replacement for the business's accounting ledger. There is no tax calculation, refund, credit note or void flow in v0.1; retain errors in history and reconcile them with the accounting system.
 

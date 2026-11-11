@@ -6,7 +6,7 @@ Turn a concept into a connected business workspace: customers, offers, assets an
 
 **v0.1 is a working local-first alpha.** It prepares and tracks real work with human review. Government filings, bank onboarding, signatures and payments happen with the relevant providers; Foundry records their receipts. It does not certify legal compliance or replace legal, tax, accounting or investment judgment.
 
-![Synthetic Polymer workspace](docs/images/workspace.png)
+![The synthetic Polymer demo workspace: a source list of journey lines and records, Today's list with a strip of the journey map, and a step's inspector](docs/images/workspace.png)
 
 ## Run it
 
@@ -29,6 +29,7 @@ Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `fou
 
 ## What works
 
+- A three-pane browser workspace: each group of steps is a coloured line on a Journey map generated from the step data, every task state has its own glyph, and the panes stack on a phone.
 - Separate business workspaces, scoped access keys, human review roles and an agent role that cannot approve evidence or attest external execution.
 - Dependency-aware startup and acquisition work, with distinct preparation, approval, submission and verification states.
 - Immutable evidence bodies, human review notes, versioned records, optimistic concurrency and idempotent write requests.
@@ -81,4 +82,4 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-The test starts an isolated local server with a temporary synthetic database, exercises real browser forms, checks desktop/mobile layout and tears it down. Screenshots go to the ignored `test-results/` directory.
+The test starts an isolated local server with a temporary synthetic database, exercises real browser forms, the Journey map and the state glyphs, withdraws evidence to check that dependent work reopens, checks desktop, medium and phone layouts and an empty first run, and tears it down. Screenshots go to the ignored `test-results/` directory. `FOUNDRY_UPDATE_DOCS_IMAGE=1 npm run test:browser` also regenerates `docs/images/workspace.png` from the synthetic demo workspace.

@@ -83,6 +83,6 @@ JSON export is a portable inspection artifact containing records, events, docume
 - `src/foundry/catalog.py`: versioned work and reference sources.
 - `src/foundry/api.py`, `cli.py`, `mcp_server.py`: three interfaces over the same rules.
 - `src/foundry/ai.py`: optional provider review and request accounting.
-- `src/foundry/static/`: responsive, dependency-free browser interface.
+- `src/foundry/static/`: responsive, dependency-free browser interface: a source list, a grouped list and an inspector, with each catalog group drawn as a coloured line on a Journey map generated from the step data. It formats server values and never calculates money or derives a state the records do not hold.
 - `tests/`: independent financial expectations, authority and workflow failures, persistence and provider tests.
-- `tests/browser.cjs`: actual browser creation, review, modeling, document and payment flows.
+- `tests/browser.cjs`: actual browser creation, review, modeling, document and payment flows; the Journey map, distinct state glyphs, evidence withdrawal reopening work, phone and medium layouts, and the empty first run.
