@@ -11,6 +11,7 @@ import pytest
 from conftest import reviewed
 
 from foundry import models
+from foundry.service import evidence_basis
 
 WITHDRAWN = "Synthetic evidence deliberately withdrawn."
 
@@ -323,15 +324,23 @@ def test_withdrawing_preparation_evidence_reopens_step_resting_in_approved(setup
 def test_withdrawing_approval_evidence_reopens_step_resting_in_submitted(setup):
     finish_structure(setup, source(setup, "Structure decision"))
     draft = source(setup, "Registration draft")
+    approval = source(setup, "Registration approval")
     filed = source(setup, "Filing receipt", "external_receipt")
     t = move(setup, tasks(setup)["registration"], "prepared", [draft])
-    t = move(setup, t, "approved", [draft])
+    t = move(setup, t, "approved", [approval])
     t = move(setup, t, "submitted", [filed])
     assert (t["state"], t["version"]) == ("submitted", 4)
-    withdraw(setup, draft)
+    # The approval source is cited only at approval: not at preparation, and not attached now.
+    assert t["data"]["evidence_ids"] == [filed["id"]]
+    assert [e["evidence_ids"] for e in t["data"]["history"]] == [
+        [draft["id"]],
+        [approval["id"]],
+        [filed["id"]],
+    ]
+    withdraw(setup, approval)
     after = tasks(setup)["registration"]
     assert (after["state"], after["version"]) == ("needs_review", 5)
-    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Registration draft"
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Registration approval"
 
 
 def test_preparation_citing_no_evidence_keeps_later_evidence_in_the_basis(setup):
@@ -357,3 +366,225 @@ def test_preparation_citing_no_evidence_replaces_earlier_citations(setup):
     withdraw(setup, early)
     after = tasks(setup)["jurisdiction"]
     assert (after["state"], after["version"]) == ("verified", 5)
+
+
+# Damaged stored history. Ordinary transitions never write these shapes; they stand in for direct
+# database edits or a defect elsewhere. Reading rule: anything unreadable contributes nothing to the
+# history-derived basis and is otherwise ignored, so it can never stop a withdrawal.
+
+COMPLETED_STATES = ["approved", "submitted", "verified", "not_applicable"]
+
+NON_LIST_HISTORIES = {
+    "history_null": None,
+    "history_string": "not a history",
+    "history_number": 7,
+    "history_object": {"to": "verified", "evidence_ids": ["evidence_x"]},
+}
+
+
+def damaged_entries(state):
+    """Single history entries that cannot be read, keyed by shape."""
+    return {
+        "entry_null": None,
+        "entry_string": "verified",
+        "entry_number": 3,
+        "entry_list": [{"to": state, "evidence_ids": []}],
+        "to_missing": {"from": "pending", "evidence_ids": []},
+        "to_null": {"from": "pending", "to": None, "evidence_ids": []},
+        "to_number": {"from": "pending", "to": 4, "evidence_ids": []},
+        "to_list": {"from": "pending", "to": ["needs_review"], "evidence_ids": []},
+        "ids_missing": {"from": "pending", "to": state},
+        "ids_null": {"from": "pending", "to": state, "evidence_ids": None},
+        "ids_string": {"from": "pending", "to": state, "evidence_ids": "evidence_x"},
+        "ids_number": {"from": "pending", "to": state, "evidence_ids": 5},
+        "ids_object": {"from": "pending", "to": state, "evidence_ids": {"evidence_x": 1}},
+        "id_number": {"from": "pending", "to": state, "evidence_ids": [1]},
+        "id_null": {"from": "pending", "to": state, "evidence_ids": [None]},
+        "id_list": {"from": "pending", "to": state, "evidence_ids": [["evidence_x"]]},
+        "id_object": {"from": "pending", "to": state, "evidence_ids": [{"id": "evidence_x"}]},
+        "ids_mixed": {"from": "pending", "to": state, "evidence_ids": ["evidence_x", 1, None, [], {}]},
+    }
+
+
+ENTRY_SHAPES = list(damaged_entries("verified"))
+
+
+def preparation(evidence_id):
+    return {"from": "pending", "to": "prepared", "evidence_ids": [evidence_id], "actor_id": "x", "at": "t"}
+
+
+@pytest.mark.parametrize("placement", ["alone", "after_preparation", "before_preparation"])
+@pytest.mark.parametrize("shape", ENTRY_SHAPES)
+@pytest.mark.parametrize("state", COMPLETED_STATES)
+def test_damaged_entry_does_not_stop_withdrawal_of_attached_evidence(setup, state, shape, placement):
+    x = source(setup, "Attached source")
+    other = source(setup, "Other source")
+    t = tasks(setup)["jurisdiction"]
+    assert (t["state"], t["version"]) == ("pending", 1)
+    damaged = damaged_entries(state)[shape]
+    history = {
+        "alone": [damaged],
+        "after_preparation": [preparation(other["id"]), damaged],
+        "before_preparation": [damaged, preparation(other["id"])],
+    }[placement]
+    t = rewrite(setup, t, state, {"evidence_ids": [x["id"]], "history": history})
+    assert (t["state"], t["version"]) == (state, 2)
+    withdraw(setup, x)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+    assert after["data"]["history"][:-1] == history
+    newest = after["data"]["history"][-1]
+    assert (newest["from"], newest["to"], newest["note"]) == (
+        state,
+        "needs_review",
+        "Evidence withdrawn: Attached source",
+    )
+
+
+def test_mixed_type_ids_in_history_do_not_stop_withdrawal(setup):
+    """Finding 2: a basis holding a string id and an integer must not be ordered."""
+    x = source(setup, "Attached source")
+    t = tasks(setup)["jurisdiction"]
+    history = [{"to": "verified", "evidence_ids": [x["id"], 1]}]
+    t = rewrite(setup, t, "verified", {"evidence_ids": [x["id"]], "history": history})
+    assert (t["state"], t["version"]) == ("verified", 2)
+    withdraw(setup, x)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: Attached source"
+
+
+def test_string_id_beside_unreadable_ids_in_history_still_counts(setup):
+    """Only the string items of an entry's evidence_ids count; the rest are skipped, not fatal."""
+    x, y = source(setup, "Attached source"), source(setup, "History-only source")
+    t = tasks(setup)["jurisdiction"]
+    history = [
+        {"from": "pending", "to": "prepared", "evidence_ids": [None, y["id"], 2, ["z"]]},
+        {"from": "prepared", "to": "verified", "evidence_ids": [x["id"]]},
+    ]
+    t = rewrite(setup, t, "verified", {"evidence_ids": [x["id"]], "history": history})
+    assert (t["state"], t["version"]) == ("verified", 2)
+    withdraw(setup, y)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+    assert after["data"]["history"][-1]["note"] == "Evidence withdrawn: History-only source"
+
+
+def unrelated_damage(state):
+    return {
+        **{name: history for name, history in NON_LIST_HISTORIES.items()},
+        **{f"{name}_in_list": [entry] for name, entry in damaged_entries(state).items()},
+    }
+
+
+UNRELATED_SHAPES = list(unrelated_damage("verified"))
+
+
+@pytest.mark.parametrize("shape", UNRELATED_SHAPES)
+@pytest.mark.parametrize("state", COMPLETED_STATES)
+def test_damaged_unrelated_task_does_not_block_withdrawal(setup, state, shape):
+    x = source(setup, "Relied-on source")
+    unrelated = source(setup, "Unrelated source")
+    t = move(setup, tasks(setup)["jurisdiction"], "prepared", [x])
+    t = move(setup, t, "approved", [x])
+    t = move(setup, t, "verified", [x])
+    assert (t["state"], t["version"]) == ("verified", 4)
+    damaged = tasks(setup)["demand"]
+    assert (damaged["state"], damaged["version"]) == ("pending", 1)
+    history = unrelated_damage(state)[shape]
+    damaged = rewrite(setup, damaged, state, {"evidence_ids": [unrelated["id"]], "history": history})
+    assert (damaged["state"], damaged["version"]) == (state, 2)
+    withdraw(setup, x)
+    after = tasks(setup)
+    assert (after["jurisdiction"]["state"], after["jurisdiction"]["version"]) == ("needs_review", 5)
+    assert after["jurisdiction"]["data"]["history"][-1]["note"] == "Evidence withdrawn: Relied-on source"
+    assert (after["demand"]["state"], after["demand"]["version"]) == (state, 2)
+    assert after["demand"]["data"]["history"] == history
+
+
+@pytest.mark.parametrize("shape", ENTRY_SHAPES)
+@pytest.mark.parametrize("withdrawn", ["preparation", "approval"])
+def test_readable_history_around_a_damaged_entry_still_counts(setup, shape, withdrawn):
+    """Evidence cited only in history (not attached now) still reopens the step when a damaged entry
+    sits between readable ones."""
+    prepared, approval, check = (
+        source(setup, "Preparation source"),
+        source(setup, "Approval source"),
+        source(setup, "Verification source"),
+    )
+    history = [
+        {"from": "pending", "to": "prepared", "evidence_ids": [prepared["id"]], "actor_id": "x", "at": "t"},
+        damaged_entries("approved")[shape],
+        {"from": "prepared", "to": "approved", "evidence_ids": [approval["id"]], "actor_id": "x", "at": "t"},
+        {"from": "approved", "to": "verified", "evidence_ids": [check["id"]], "actor_id": "x", "at": "t"},
+    ]
+    t = rewrite(
+        setup, tasks(setup)["jurisdiction"], "verified", {"evidence_ids": [check["id"]], "history": history}
+    )
+    assert (t["state"], t["version"]) == ("verified", 2)
+    target = prepared if withdrawn == "preparation" else approval
+    withdraw(setup, target)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+    assert after["data"]["history"][-1]["note"] == f"Evidence withdrawn: {target['title']}"
+
+
+def test_damaged_entry_does_not_count_as_a_reopening(setup):
+    """Only an object whose "to" is exactly "needs_review" starts a new cycle."""
+    prepared, check = source(setup, "Preparation source"), source(setup, "Verification source")
+    history = [
+        {"from": "pending", "to": "prepared", "evidence_ids": [prepared["id"]]},
+        {"from": "prepared", "to": ["needs_review"], "evidence_ids": []},
+        "needs_review",
+        {"from": "prepared", "to": "verified", "evidence_ids": [check["id"]]},
+    ]
+    t = rewrite(
+        setup, tasks(setup)["jurisdiction"], "verified", {"evidence_ids": [check["id"]], "history": history}
+    )
+    assert (t["state"], t["version"]) == ("verified", 2)
+    withdraw(setup, prepared)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+
+
+def test_damaged_entry_does_not_count_as_a_preparation(setup):
+    """A damaged entry cannot replace the surviving preparation; evidence cited there still counts."""
+    prepared, check = source(setup, "Preparation source"), source(setup, "Verification source")
+    history = [
+        {"from": "pending", "to": "prepared", "evidence_ids": [prepared["id"]]},
+        {"from": "prepared", "to": ["prepared"], "evidence_ids": []},
+        "prepared",
+        {"from": "prepared", "to": "verified", "evidence_ids": [check["id"]]},
+    ]
+    t = rewrite(
+        setup, tasks(setup)["jurisdiction"], "verified", {"evidence_ids": [check["id"]], "history": history}
+    )
+    assert (t["state"], t["version"]) == ("verified", 2)
+    withdraw(setup, prepared)
+    after = tasks(setup)["jurisdiction"]
+    assert (after["state"], after["version"]) == ("needs_review", 3)
+
+
+@pytest.mark.parametrize("shape", list(NON_LIST_HISTORIES))
+def test_history_that_is_not_a_list_has_an_empty_basis(shape):
+    assert evidence_basis(NON_LIST_HISTORIES[shape]) == set()
+
+
+def test_basis_reads_only_string_ids_from_readable_entries():
+    history = [
+        {"to": "verified", "evidence_ids": ["old"]},
+        {"to": "needs_review"},
+        {"to": ["needs_review"], "evidence_ids": ["a"]},
+        None,
+        {"to": "prepared", "evidence_ids": ["b", 1, None, ["c"], {"d": 1}]},
+        "prepared",
+        {"to": "approved", "evidence_ids": "e"},
+        {"to": "verified", "evidence_ids": ["f"]},
+        {"evidence_ids": ["g"]},
+    ]
+    assert evidence_basis(history) == {"b", "f", "g"}
+    # With no readable preparation in the cycle, only the last entry counts, and here it is unreadable.
+    assert evidence_basis([{"to": "approved", "evidence_ids": ["a"]}, None]) == set()
+    assert evidence_basis([{"to": "approved", "evidence_ids": ["a"]}, {"to": 1, "evidence_ids": ["h"]}]) == {
+        "h"
+    }

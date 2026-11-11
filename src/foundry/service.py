@@ -15,20 +15,35 @@ FINISHED = {"verified", "not_applicable"}
 COMPLETED = {"approved", "submitted", "verified", "not_applicable"}
 
 
+def moves_to(entry, state):
+    return isinstance(entry, dict) and entry.get("to") == state
+
+
+def cited(entry):
+    ids = entry.get("evidence_ids") if isinstance(entry, dict) else None
+    return {eid for eid in ids if isinstance(eid, str)} if isinstance(ids, list) else set()
+
+
 def evidence_basis(history):
     """Evidence ids that a task's current standing relies on, derived from its history.
 
     The current cycle is everything after the most recent move to needs_review. Within it, the basis
     is the most recent move to prepared and every later entry; with no such move, the last entry.
     Entries written by invalidation carry no evidence_ids and contribute nothing.
+
+    Stored history that cannot be read contributes nothing and never raises: a history that is not a
+    list is empty, an entry moves to a state only if it is an object whose "to" is that string, and
+    ids are read only from an object's "evidence_ids" list, keeping its string items.
     """
-    starts = [i for i, entry in enumerate(history) if entry.get("to") == "needs_review"]
+    if not isinstance(history, list):
+        return set()
+    starts = [i for i, entry in enumerate(history) if moves_to(entry, "needs_review")]
     cycle = history[starts[-1] + 1 :] if starts else history
     if not cycle:
         return set()
-    prepared = [i for i, entry in enumerate(cycle) if entry.get("to") == "prepared"]
+    prepared = [i for i, entry in enumerate(cycle) if moves_to(entry, "prepared")]
     basis = cycle[prepared[-1] :] if prepared else cycle[-1:]
-    return {eid for entry in basis for eid in entry.get("evidence_ids", [])}
+    return set().union(*(cited(entry) for entry in basis))
 
 
 class Service:
@@ -229,10 +244,9 @@ class Service:
                 if obj["kind"] == "task" and obj["state"] in COMPLETED:
                     # A completed task relies on its currently attached evidence and on everything
                     # cited since its latest preparation. The current ids always count, so a task
-                    # whose stored history is missing or incomplete reopens at least as before.
-                    refs = list(data.get("evidence_ids", [])) + sorted(
-                        evidence_basis(data.get("history", []))
-                    )
+                    # whose stored history is missing or incomplete reopens at least as before, and
+                    # history that cannot be read contributes nothing rather than stopping withdrawal.
+                    refs = list(data.get("evidence_ids", [])) + list(evidence_basis(data.get("history", [])))
                 else:
                     refs = data.get("evidence_ids", [])
                 refs = refs + [
