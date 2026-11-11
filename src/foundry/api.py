@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import MutableHeaders
@@ -152,7 +152,14 @@ def validation_message(error, route=None):
     return where + ": " + ("an unexpected field was sent" if extra else error["msg"])
 
 
-def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
+def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=None):
+    """Build the web application.
+
+    ``desktop`` is the desktop app's launch sign-in (``foundry.desktop.LaunchSignIn``). When it
+    is given, only its exact ``host`` (127.0.0.1 and the port) is accepted, the window signs in
+    at ``/desktop/start`` with the launch code, and a page opened without that session gets a
+    plain instruction page instead of the sign-in form.
+    """
     store = Store(db_path or os.getenv("FOUNDRY_DB", ".foundry/foundry.db"))
     service, app = (
         Service(store),
@@ -189,6 +196,10 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
 
     @app.middleware("http")
     async def boundaries(request: Request, call_next):
+        # The host middleware ignores the port. The desktop server accepts only its own exact
+        # 127.0.0.1:<port>, so a web page reaching it through a rebound DNS name is refused.
+        if desktop is not None and request.headers.getlist("host") != [desktop.host]:
+            return PlainTextResponse("Invalid host header", status_code=400)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             # Two Origin (or Sec-Fetch-Site) headers are ambiguous: a browser never sends them,
             # and judging by whichever comes first would let one value hide the other.
@@ -422,8 +433,36 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 
-    @app.get("/")
-    def index():
-        return FileResponse(static / "index.html")
+    if desktop is not None:
+        from .desktop import BROWSER_PAGE
+
+        def signed_in(request):
+            try:
+                store.authenticate(request.cookies.get("foundry_session", ""), session=True)
+                return True
+            except DomainError:
+                return False
+
+        @app.get("/desktop/start", include_in_schema=False)
+        def desktop_start(code: str = ""):
+            token = desktop.redeem(code)
+            if not token:
+                return HTMLResponse(BROWSER_PAGE, status_code=403)
+            # Redirect so the code leaves the address. No max_age: the cookie ends with the window.
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie("foundry_session", token, httponly=True, samesite="strict")
+            return response
+
+        @app.get("/")
+        def desktop_index(request: Request):
+            if not signed_in(request):
+                return HTMLResponse(BROWSER_PAGE, status_code=403)
+            return FileResponse(static / "index.html")
+
+    else:
+
+        @app.get("/")
+        def index():
+            return FileResponse(static / "index.html")
 
     return app
