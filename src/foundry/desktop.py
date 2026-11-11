@@ -233,7 +233,7 @@ def instance_lock(data_dir: Path):
     The operating system releases the lock when the process ends, even after a crash.
     """
     path = data_dir / "desktop.lock"
-    stream = open(path, "a+")  # closed below
+    stream = os.fdopen(os.open(path, os.O_CREAT | os.O_RDWR, 0o600), "r+")  # closed below
     try:
         try:
             if os.name == "nt":

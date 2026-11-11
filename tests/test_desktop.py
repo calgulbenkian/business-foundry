@@ -329,7 +329,9 @@ def test_stopping_closes_the_port_ends_the_session_and_checkpoints(tmp_path):
 
 def test_a_second_instance_is_refused_plainly(tmp_path):
     data = desktop.prepare_data_dir(tmp_path / "data")
-    with desktop.instance_lock(data):
+    with desktop.instance_lock(data) as lock_file:
+        if os.name == "posix":
+            assert lock_file.stat().st_mode & 0o777 == 0o600
         with pytest.raises(DesktopError, match="already open"), desktop.instance_lock(data):
             pass
         script = (
