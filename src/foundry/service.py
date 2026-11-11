@@ -193,10 +193,18 @@ class Service:
         )
 
     def invalidate(
-        self, con, bid, actor, kinds=None, evidence_id=None, all_tasks=False, reason="Inputs changed"
+        self,
+        con,
+        bid,
+        actor,
+        kinds=None,
+        evidence_id=None,
+        all_tasks=False,
+        reason="Inputs changed",
+        task_ids=None,
     ):
         tasks = self.store.objects(con, bid, "task")
-        affected = set()
+        affected = set(task_ids or ())
         related_kinds = set(kinds or ())
         if evidence_id:
             for obj in self.store.objects(con, bid):
@@ -329,18 +337,7 @@ class Service:
             }
             result = self.store.update(con, old, data, state, actor, payload["expected_version"])
             if state == "needs_review":
-                for child in self.store.objects(con, bid, "task"):
-                    if tid in child["data"]["depends_on"]:
-                        self.invalidate(
-                            con,
-                            bid,
-                            actor,
-                            kinds=set(old["data"]["required_record_kinds"]),
-                            evidence_id=None,
-                            all_tasks=not old["data"]["required_record_kinds"],
-                            reason=f"Reopened: {old['title']}",
-                        )
-                        break
+                self.invalidate(con, bid, actor, task_ids={tid}, reason=f"Reopened: {old['title']}")
             return result
 
         return self.command(actor, bid, key, "task.transition", {**payload, "id": tid}, run, review)
