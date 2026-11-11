@@ -15,10 +15,17 @@ FINISHED = {"verified", "not_applicable"}
 UNREADABLE = (TypeError, ValueError, RecursionError)
 
 
-def read_json(text):
-    """Parse a stored JSON column for verification; None when it cannot be read."""
+def read_json(value, encoding="utf-8"):
+    """Parse a stored JSON column for verification; None when it cannot be read.
+
+    Bytes are decoded strictly in ``encoding`` first, so a byte-order mark, a lone
+    surrogate or another encoding is unreadable rather than auto-detected: the bytes of
+    a TEXT value read the same as they would through sqlite3's own str conversion.
+    """
     try:
-        return json.loads(text)
+        if isinstance(value, bytes):
+            value = value.decode(encoding)
+        return json.loads(value)
     except UNREADABLE:
         return None
 
@@ -597,6 +604,11 @@ class Service:
             for event in events:
                 event["payload"] = json.loads(event["payload"])
             integrity = self.store.verify_chain(con, bid)
+            # Revision snapshots are selected as CAST(snapshot AS BLOB): sqlite3 raises while
+            # fetching TEXT that is not valid UTF-8, before Python sees it. The cast returns
+            # TEXT as its bytes in the database encoding, BLOB unchanged, a number as its text
+            # and NULL as NULL; read_json decodes those bytes in this encoding, or reports them.
+            encoding = con.execute("PRAGMA encoding").fetchone()[0]
             errors, latest, ai_latest, versions = [], {}, {}, {}
             for event in events:
                 p = event["payload"]
@@ -616,13 +628,13 @@ class Service:
                     errors.append(f"Content hash mismatch: {obj['id']}")
                 if obj.get("kind"):
                     revision = con.execute(
-                        "SELECT snapshot FROM revisions WHERE object_id=? AND version=?",
+                        "SELECT CAST(snapshot AS BLOB) AS snapshot FROM revisions WHERE object_id=? AND version=?",
                         (obj["id"], obj["version"]),
                     ).fetchone()
-                    if not revision or not same_json(read_json(revision[0]), obj):
+                    if not revision or not same_json(read_json(revision["snapshot"], encoding), obj):
                         errors.append(f"Revision mismatch: {obj['id']}")
             errors.extend(f"Historical record missing: {oid}" for oid in latest)
-            errors.extend(self._revision_errors(con, bid, versions))
+            errors.extend(self._revision_errors(con, bid, versions, encoding))
             for run in con.execute("SELECT * FROM ai_calls WHERE business_id=?", (bid,)):
                 recorded = ai_latest.pop(run["id"], {})
                 if recorded.get("state") != run["state"] or recorded.get("data_sha256") != digest(
@@ -661,7 +673,7 @@ class Service:
             return {"integrity": integrity, "events": events}
 
     @staticmethod
-    def _revision_errors(con, bid, recorded):
+    def _revision_errors(con, bid, recorded, encoding):
         """Compare every stored revision with the chained event that recorded that version.
 
         Store.add/update write one revision row and one event per object version. The
@@ -671,7 +683,7 @@ class Service:
         """
         errors = []
         rows = con.execute(
-            "SELECT object_id,version,snapshot FROM revisions WHERE object_id=? "
+            "SELECT object_id,version,CAST(snapshot AS BLOB) AS snapshot FROM revisions WHERE object_id=? "
             "OR object_id IN (SELECT id FROM objects WHERE business_id=?) "
             "OR object_id IN (SELECT object_id FROM events WHERE business_id=?) "
             "ORDER BY object_id,version",
@@ -688,7 +700,7 @@ class Service:
             if event is None:
                 errors.append(f"Revision has no recorded history: {oid} version {version}")
                 continue
-            if not same_json(read_json(row["snapshot"]), event):
+            if not same_json(read_json(row["snapshot"], encoding), event):
                 errors.append(f"Historical revision differs from history: {oid} version {version}")
         errors.extend(
             f"Historical revision missing: {oid} version {version}"

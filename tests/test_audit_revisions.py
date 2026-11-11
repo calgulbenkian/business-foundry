@@ -1,13 +1,15 @@
 """Integrity verification covers every stored revision, not only the current one."""
 
 import json
+import sqlite3
 from uuid import uuid4
 
 import pytest
 
 from foundry import models
 from foundry.demo import seed
-from foundry.store import canonical
+from foundry.service import Service, read_json
+from foundry.store import Store, canonical
 
 
 def key():
@@ -379,6 +381,17 @@ TAMPERS = {
         "UPDATE revisions SET snapshot=X'FFFE007B' WHERE object_id=? AND version=1",
         ["Historical revision differs from history: {id} version 1"],
     ),
+    "invalid-utf8-text-current-revision": (
+        "UPDATE revisions SET snapshot=CAST(X'FF7B' AS TEXT) WHERE object_id=? AND version=2",
+        [
+            "Revision mismatch: {id}",
+            "Historical revision differs from history: {id} version 2",
+        ],
+    ),
+    "invalid-utf8-text-historical-revision": (
+        "UPDATE revisions SET snapshot=CAST(X'FF7B' AS TEXT) WHERE object_id=? AND version=1",
+        ["Historical revision differs from history: {id} version 1"],
+    ),
     "type-only-historical-revision": (
         "UPDATE revisions SET snapshot=replace(snapshot,'\"flag\":false','\"flag\":0') "
         "WHERE object_id=? AND version=1",
@@ -412,3 +425,238 @@ def test_tampered_business_does_not_affect_another_business(setup, tamper):
     other_result = service.audit(actor, other["id"])["integrity"]
     assert other_result["valid"], other_result["record_errors"]
     assert other_result["record_errors"] == []
+
+
+# Revision snapshots in every SQLite storage class. sqlite3 raises while fetching TEXT that
+# is not valid UTF-8, so these values cannot be bound from Python as str; they are written
+# with SQL expressions and their storage class is checked before the audit runs.
+
+
+def untyped_snapshot_column(store):
+    """Rewrite the revisions schema so snapshot has no type affinity and accepts NULL.
+
+    With the shipped schema (snapshot TEXT NOT NULL) an INTEGER or REAL is stored as TEXT
+    and NULL is refused, so INTEGER, REAL and NULL storage only exist after a rewrite.
+    """
+    con = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        con.execute("PRAGMA writable_schema=ON")
+        changed = con.execute(
+            "UPDATE sqlite_schema SET sql=replace(sql,'snapshot TEXT NOT NULL','snapshot') "
+            "WHERE type='table' AND name='revisions'"
+        ).rowcount
+        con.execute("PRAGMA writable_schema=OFF")
+    finally:
+        con.close()
+    assert changed == 1
+
+
+def test_shipped_schema_stores_numbers_as_text_and_refuses_null(setup):
+    store = setup[0]
+    item = history(setup)
+    with store.write() as con:
+        con.execute("UPDATE revisions SET snapshot=? WHERE object_id=? AND version=1", (5, item["id"]))
+        con.execute("UPDATE revisions SET snapshot=? WHERE object_id=? AND version=2", (1.5, item["id"]))
+        rows = con.execute(
+            "SELECT version,typeof(snapshot),snapshot FROM revisions WHERE object_id=? AND version<3 "
+            "ORDER BY version",
+            (item["id"],),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [(1, "text", "5"), (2, "text", "1.5")]
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("UPDATE revisions SET snapshot=NULL WHERE object_id=? AND version=3", (item["id"],))
+
+
+STORED_SNAPSHOTS = [
+    pytest.param("CAST(X'FF7B' AS TEXT)", "text", False, id="invalid-utf8-text"),
+    pytest.param("CAST(X'7B22223AFF7D' AS TEXT)", "text", False, id="invalid-utf8-text-inside-object"),
+    pytest.param("CAST(X'22EDA08022' AS TEXT)", "text", False, id="lone-surrogate-utf8-text"),
+    pytest.param("CAST(X'' AS TEXT)", "text", False, id="empty-text"),
+    pytest.param("X''", "blob", False, id="empty-blob"),
+    pytest.param("CAST(X'EFBBBF' AS TEXT) || snapshot", "text", False, id="utf8-bom-text"),
+    pytest.param("CAST(X'EFBBBF' || snapshot AS BLOB)", "blob", False, id="utf8-bom-blob"),
+    pytest.param("5", "integer", True, id="integer"),
+    pytest.param("-9223372036854775808", "integer", True, id="integer-minimum"),
+    pytest.param("1.5", "real", True, id="real"),
+    pytest.param("1e308 * 10", "real", True, id="real-infinity"),
+    pytest.param("NULL", "null", True, id="null"),
+]
+
+
+def store_snapshot(store, object_id, version, expression, storage, untyped):
+    if untyped:
+        untyped_snapshot_column(store)
+    with store.write() as con:
+        changed = con.execute(
+            f"UPDATE revisions SET snapshot={expression} WHERE object_id=? AND version=?",
+            (object_id, version),
+        ).rowcount
+        stored = con.execute(
+            "SELECT typeof(snapshot) FROM revisions WHERE object_id=? AND version=?", (object_id, version)
+        ).fetchone()[0]
+    assert changed == 1
+    assert stored == storage
+
+
+@pytest.mark.parametrize(("expression", "storage", "untyped"), STORED_SNAPSHOTS)
+def test_current_revision_in_any_storage_class_is_reported_without_raising(
+    setup, expression, storage, untyped
+):
+    store = setup[0]
+    item = history(setup)
+    store_snapshot(store, item["id"], 3, expression, storage, untyped)
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision mismatch: {item['id']}",
+        f"Historical revision differs from history: {item['id']} version 3",
+    ]
+
+
+@pytest.mark.parametrize(("expression", "storage", "untyped"), STORED_SNAPSHOTS)
+def test_historical_revision_in_any_storage_class_is_reported_without_raising(
+    setup, expression, storage, untyped
+):
+    store = setup[0]
+    item = history(setup)
+    store_snapshot(store, item["id"], 1, expression, storage, untyped)
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [f"Historical revision differs from history: {item['id']} version 1"]
+
+
+def test_invalid_utf8_text_could_not_be_fetched_by_sqlite3(setup):
+    # The failure this change avoids: fetching the column itself raises in sqlite3.
+    store = setup[0]
+    item = history(setup)
+    store_snapshot(store, item["id"], 1, "CAST(X'FF7B' AS TEXT)", "text", False)
+    with store.read() as con, pytest.raises(sqlite3.OperationalError, match="UTF-8"):
+        con.execute(
+            "SELECT snapshot FROM revisions WHERE object_id=? AND version=1", (item["id"],)
+        ).fetchone()
+
+
+def test_other_business_verifies_while_revisions_hold_every_storage_class(setup):
+    store, service, actor, bid, _ = setup
+    other = service.create_business(
+        actor,
+        key(),
+        models.BusinessCreate(name="Second business", concept="Another synthetic business.").model_dump(
+            mode="json"
+        ),
+    )
+    other_item = service.add_record(actor, other["id"], key(), record(title="Other buyer", properties=TYPED))
+    other_item = revise(service, actor, other["id"], other_item, "Other buyer revision 2")
+    item = history(setup, versions=5)
+    untyped_snapshot_column(store)
+    damage = {1: "CAST(X'FF7B' AS TEXT)", 2: "5", 3: "1.5", 4: "NULL", 5: "CAST(X'FF7B' AS TEXT)"}
+    with store.write() as con:
+        for version, expression in damage.items():
+            con.execute(
+                f"UPDATE revisions SET snapshot={expression} WHERE object_id=? AND version=?",
+                (item["id"], version),
+            )
+        stored = con.execute(
+            "SELECT typeof(snapshot) FROM revisions WHERE object_id=? ORDER BY version", (item["id"],)
+        ).fetchall()
+    assert [row[0] for row in stored] == ["text", "integer", "real", "null", "text"]
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [
+        f"Revision mismatch: {item['id']}",
+        f"Historical revision differs from history: {item['id']} version 1",
+        f"Historical revision differs from history: {item['id']} version 2",
+        f"Historical revision differs from history: {item['id']} version 3",
+        f"Historical revision differs from history: {item['id']} version 4",
+        f"Historical revision differs from history: {item['id']} version 5",
+    ]
+    other_result = service.audit(actor, other["id"])["integrity"]
+    assert other_result["valid"], other_result["record_errors"]
+    assert other_result["record_errors"] == []
+
+
+def test_valid_snapshot_stored_as_utf8_blob_is_valid(setup):
+    # Documented: the same JSON stored as a BLOB instead of text is not told apart.
+    store = setup[0]
+    item = history(setup)
+    store_snapshot(store, item["id"], 1, "CAST(snapshot AS BLOB)", "blob", False)
+    store_snapshot(store, item["id"], 3, "CAST(snapshot AS BLOB)", "blob", False)
+    result = integrity(setup)
+    assert result["valid"], result["record_errors"]
+    assert result["record_errors"] == []
+
+
+def test_valid_snapshot_in_utf16_blob_is_reported(setup):
+    # Bytes are decoded in the database encoding, not guessed: UTF-16 in a UTF-8 database differs.
+    store = setup[0]
+    item = history(setup)
+    text = canonical(snapshot(store, item["id"], 1))
+    with store.write() as con:
+        con.execute(
+            "UPDATE revisions SET snapshot=? WHERE object_id=? AND version=1",
+            (text.encode("utf-16"), item["id"]),
+        )
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [f"Historical revision differs from history: {item['id']} version 1"]
+
+
+@pytest.mark.parametrize("encoding", ["UTF-16le", "UTF-16be"])
+def test_utf16_database_verifies_text_snapshots_and_reports_damage(tmp_path, encoding):
+    path = tmp_path / "private" / "foundry.db"
+    path.parent.mkdir()
+    con = sqlite3.connect(path)
+    con.execute(f"PRAGMA encoding='{encoding}'")
+    con.execute("CREATE TABLE encoding_marker(x)")
+    con.close()
+    store = Store(path)
+    with store.read() as con:
+        assert con.execute("PRAGMA encoding").fetchone()[0] == encoding
+    actor = store.authenticate(store.bootstrap()["token"])
+    service = Service(store)
+    bid = service.create_business(
+        actor,
+        key(),
+        models.BusinessCreate(name="Encoded business", concept="A synthetic business.").model_dump(
+            mode="json"
+        ),
+    )["id"]
+    setup = (store, service, actor, bid, None)
+    item = history(setup)
+    result = integrity(setup)
+    assert result["valid"], result["record_errors"]
+    assert result["record_errors"] == []
+    with store.write() as con:
+        con.execute(
+            "UPDATE revisions SET snapshot=replace(snapshot,'Example buyer','Rewritten buyer') "
+            "WHERE object_id=? AND version=1",
+            (item["id"],),
+        )
+    result = integrity(setup)
+    assert result["record_errors"] == [f"Historical revision differs from history: {item['id']} version 1"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(5, id="int"),
+        pytest.param(1.5, id="float"),
+        pytest.param(b"\xff{", id="invalid-utf8"),
+        pytest.param(b"\xef\xbb\xbf{}", id="utf8-bom"),
+        pytest.param("{}".encode("utf-16"), id="utf16-with-bom"),
+        pytest.param("{}".encode("utf-32"), id="utf32-with-bom"),
+        pytest.param("{}".encode("utf-16-le"), id="utf16le-without-bom"),
+        pytest.param(b'"\xed\xa0\x80"', id="utf8-lone-surrogate"),
+        pytest.param("﻿{}", id="str-with-bom"),
+    ],
+)
+def test_read_json_returns_none_for_unreadable_values(value):
+    assert read_json(value) is None
+
+
+def test_read_json_reads_utf8_bytes_and_text_alike():
+    assert read_json(b'{"a": [1, 2.5, true]}') == {"a": [1, 2.5, True]}
+    assert read_json('{"a": [1, 2.5, true]}') == {"a": [1, 2.5, True]}
+    assert read_json('{"a":"é"}'.encode()) == {"a": "é"}
+    assert read_json('{"a":"é"}'.encode("utf-16-le"), "UTF-16le") == {"a": "é"}
