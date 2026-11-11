@@ -1,5 +1,7 @@
 """Deterministic, versioned working documents. No fabricated business facts."""
 
+import re
+import string
 from decimal import Decimal
 
 from foundry.finance import period_rollups
@@ -14,10 +16,40 @@ TITLES = {
 }
 
 
-def cell(value) -> str:
-    """Make any value safe for a single GitHub-Flavored Markdown table cell."""
-    text = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
-    return text.replace("|", "\\|")
+ASCII_PUNCTUATION = frozenset(string.punctuation)
+MARKUP_CHARACTERS = re.compile(r"[`*\[|\\~_<&]")
+ENTITY = re.compile(r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
+# Text at the start of a line that a parser would read as a block: a heading, a bullet, a numbered item,
+# a quote, a thematic break or a setext underline. The group marks the one character to escape.
+LINE_START = re.compile(r"(#)#{0,5}(?: |$)|([-+])(?: |$)|[0-9]{1,9}([.)])(?: |$)|(>)|(-)(?: ?-)+$|(=)=*$")
+# A heading's closing sequence: a space followed by hashes at the end of the text.
+CLOSING_HASHES = re.compile(r" (#)#*$")
+
+
+def is_markup(text, i) -> bool:
+    """Whether a parser would read the character at position i of a Markdown line as markup."""
+    ch, before, after = text[i], text[i - 1 : i], text[i + 1 : i + 2]
+    return bool(
+        ch in "`*[|"  # code spans, emphasis, links and images, table cells
+        or (ch == "\\" and (after in ASCII_PUNCTUATION or not after))  # would escape the next character
+        or (ch == "~" and "~" in (before, after))  # strikethrough
+        or (ch == "_" and not (before.isalnum() and after.isalnum()))  # emphasis, unless inside a word
+        or (ch == "<" and after.strip())  # raw HTML and autolinks
+        or (ch == "&" and ENTITY.match(text, i))  # character references
+    )
+
+
+def inline(value) -> str:
+    """Print text typed by a person or an agent as literal Markdown on one line.
+
+    Whitespace collapses to single spaces. A backslash goes before a character only where a parser would
+    otherwise read markup there, so ordinary punctuation reads exactly as typed. The same rule is used
+    for headings, own-line text, list items and table cells; pipes are always escaped.
+    """
+    text = " ".join(str(value).split())
+    marks = {m.start(m.lastindex) for m in (LINE_START.match(text), CLOSING_HASHES.search(text)) if m}
+    marks.update(m.start() for m in MARKUP_CHARACTERS.finditer(text) if is_markup(text, m.start()))
+    return "".join("\\" + ch if i in marks else ch for i, ch in enumerate(text)) if marks else text
 
 
 def fmt_money(value) -> str:
@@ -34,7 +66,7 @@ def fmt_rate(value) -> str:
 
 def fmt_table(headers: list[str], rows: list[list[str]], numeric_cols: set[int] = frozenset()) -> list[str]:
     """Render a padded GFM table. Every cell is escaped; numeric columns are right-aligned."""
-    body = [[cell(c) for c in headers]] + [[cell(c) for c in row] for row in rows]
+    body = [[inline(c) for c in headers]] + [[inline(c) for c in row] for row in rows]
     widths = [max(3, *(len(r[i]) for r in body)) for i in range(len(headers))]
 
     def line(values):
@@ -132,7 +164,7 @@ def financial_section(p, currency) -> list[str]:
     data = p["data"]
     scenarios = data["scenarios"]
     out = [
-        f"Model: {cell(p['title'])}. Currency: {currency}. "
+        f"Model: {inline(p['title'])}. Currency: {currency}. "
         f"Horizon: {data['inputs']['months']} months. These are forecasts, not booked actuals.",
         "",
         "### Scenario comparison",
@@ -147,7 +179,7 @@ def financial_section(p, currency) -> list[str]:
         {1, 2, 3},
     )
     definitions = data.get("scenario_definitions", {})
-    out += [f"- {label}: {cell(definitions.get(c, ''))}" for c, label in SCENARIOS] + [""]
+    out += [f"- {label}: {inline(definitions.get(c, ''))}" for c, label in SCENARIOS] + [""]
     rollups = period_rollups(scenarios["base"]["months"])
     periods = ["Line item", *(r["period"] for r in rollups)]
     numeric = set(range(1, len(rollups) + 1))
@@ -193,7 +225,7 @@ def financial_section(p, currency) -> list[str]:
         {1, 2, 3, 4, 5},
     )
     if basis:
-        out += [f"DCF basis: {basis}", ""]
+        out += [f"DCF basis: {inline(basis)}", ""]
     inputs = data["inputs"]
     out += ["### Model inputs", ""]
     out += fmt_table(
@@ -202,10 +234,10 @@ def financial_section(p, currency) -> list[str]:
         {1},
     )
     out += ["### Model assumptions", ""]
-    out += [f"- {a}" for a in data.get("assumptions", [])]
+    out += [f"- {inline(a)}" for a in data.get("assumptions", [])]
     out += [
         "",
-        f"Full monthly statements are stored in the financial plan {cell(p['title'])} "
+        f"Full monthly statements are stored in the financial plan {inline(p['title'])} "
         "(Financial model view and JSON export; see the reference index).",
         "",
     ]
@@ -326,14 +358,8 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
         {1, 2, 3, 4},
     )
     out += ["### Screening limitations", ""]
-    out += [f"- {x}" for x in a.get("limitations", [])] + [""]
+    out += [f"- {inline(x)}" for x in a.get("limitations", [])] + [""]
     return out
-
-
-def inline(value) -> str:
-    """Make user text safe on one Markdown line: no line breaks, no pipes, no leading heading marker."""
-    text = " ".join(cell(value).split())
-    return "\\" + text if text.startswith("#") else text
 
 
 KIND_LABELS = {
@@ -390,7 +416,7 @@ def upper_first(text) -> str:
 
 
 def kind_label(kind) -> str:
-    return KIND_LABELS.get(kind) or OTHER_KIND_LABELS.get(kind) or inline(kind)
+    return KIND_LABELS.get(kind) or OTHER_KIND_LABELS.get(kind) or str(kind)
 
 
 def state_label(state) -> str:
@@ -407,11 +433,11 @@ def step_class(state) -> str:
 
 
 def review_standing(evidence) -> str:
-    """Plain-words review standing of one evidence item; None means it is not in the snapshot."""
+    """Plain-words review standing of one evidence item, unescaped; None means it is not in the snapshot."""
     if evidence is None:
         return "unknown — this evidence is not in the snapshot"
     review = evidence["data"].get("review") or {}
-    who = inline(review.get("actor_name") or "a reviewer")
+    who = review.get("actor_name") or "a reviewer"
     when = str(review.get("at") or "")[:10]
     on = f" on {when}" if when else ""
     if evidence["state"] == "verified":
@@ -420,7 +446,7 @@ def review_standing(evidence) -> str:
         return f"rejected on review by {who}{on}"
     if evidence["state"] == "unverified":
         return "not yet reviewed"
-    return f'in the unrecognised review state "{inline(evidence["state"])}"'
+    return f'in the unrecognised review state "{evidence["state"]}"'
 
 
 def latest_reopen_reason(task):
@@ -475,7 +501,7 @@ class Render:
             for eid in evidence_ids:
                 evidence = self.mention(eid)
                 name = inline(evidence["title"]) if evidence else "Unknown evidence"
-                out.append(f"- {name}: {review_standing(evidence)}.")
+                out.append(f"- {name}: {inline(review_standing(evidence))}.")
         return out + [""]
 
     def reference_index(self) -> list[str]:
@@ -569,11 +595,23 @@ def readiness_audit(r, tasks, currency) -> list[str]:
     out += ["## What needs a person now", "", "### Evidence waiting for review", ""]
     out += bullets([inline(e["title"]) for e in waiting], "No evidence is waiting for review.")
     out += ["### Steps prepared and waiting for approval", ""]
-    out += bullets([r.step_name(t) for t in of("prepared")], "No step is waiting for approval.")
+    out += bullets(
+        [
+            f"{r.step_name(t)} — cannot be approved yet; needs first: {needs_first(t)}."
+            if t.get("blockers")
+            else r.step_name(t)
+            for t in of("prepared")
+        ],
+        "No step is waiting for approval.",
+    )
     out += ["### Steps waiting for the next human action", ""]
     actions = []
     for t in of("approved", "submitted"):
-        if t["state"] == "submitted":
+        # The service refuses approved, submitted and verified while a step has unmet prerequisites.
+        if t.get("blockers"):
+            move = "submitted" if t["state"] == "approved" and t["data"].get("external") else "verified"
+            action = f"{t['state']}, but cannot be {move} yet; needs first: {needs_first(t)}"
+        elif t["state"] == "submitted":
             action = "submitted; confirm the result against the reviewed receipt"
         elif t["data"].get("external"):
             action = "approved; record the external submission with its receipt"
@@ -618,13 +656,17 @@ def readiness_audit(r, tasks, currency) -> list[str]:
     none_yet = "No business records have been added yet."
     out += ["## What is still an assumption", "", "### Records marked as assumptions", ""]
     out += bullets(
-        [f"{kind_label(o['kind'])}: {inline(o['title'])}" for o in records if o["state"] == "assumption"],
+        [
+            f"{inline(kind_label(o['kind']))}: {inline(o['title'])}"
+            for o in records
+            if o["state"] == "assumption"
+        ],
         none_yet if not records else "No record is marked as an assumption.",
     )
     out += ["### Records with no evidence attached", ""]
     out += bullets(
         [
-            f"{kind_label(o['kind'])}: {inline(o['title'])}"
+            f"{inline(kind_label(o['kind']))}: {inline(o['title'])}"
             for o in records
             if not o["data"].get("evidence_ids")
         ],
@@ -637,9 +679,23 @@ def readiness_audit(r, tasks, currency) -> list[str]:
         money.append(f"Outstanding invoice balance: {fmt_money(stats['outstanding_invoices'])} {currency}.")
     if Decimal(str(stats.get("cash_collected") or 0)):
         money.append(f"Cash collected: {fmt_money(stats['cash_collected'])} {currency}.")
-    if stats.get("overdue_obligations"):
-        money.append(f"Obligations past their due date: {stats['overdue_obligations']}.")
-    out += bullets(money, "No outstanding invoices, collected payments or overdue obligations are recorded.")
+    flagged = [o for o in r.objects if o["kind"] == "obligation" and "overdue" in o]
+    overdue = sorted((o for o in flagged if o["overdue"]), key=lambda o: str(o["data"].get("due_date")))
+    if overdue or (not flagged and stats.get("overdue_obligations")):
+        # A snapshot built without per-obligation flags carries only the count.
+        money.append(f"Obligations past their due date: {len(overdue) or stats['overdue_obligations']}.")
+    money = [f"- {x}" for x in money]
+    for o in overdue:
+        r.mention(o["id"])
+        money.append(f"  - {inline(o['title'])} — due {inline(o['data'].get('due_date'))}.")
+    out += (
+        [*money, ""]
+        if money
+        else [
+            "No outstanding invoices, collected payments or overdue obligations are recorded.",
+            "",
+        ]
+    )
 
     out += ["## Every step", ""]
     listed = [t for t in tasks if step_class(t["state"]) != "replaced"]
@@ -694,7 +750,8 @@ def cited_sources(r, tasks, catalog) -> list[str]:
         }
     )
     out = [
-        f"Sources cited by these steps (planning guide {', '.join(versions)}; sources checked on {', '.join(checked)}):",
+        f"Sources cited by these steps (planning guide {inline(', '.join(versions))}; "
+        f"sources checked on {inline(', '.join(checked))}):",
         "",
     ]
     for uri, ts in cited.items():
@@ -706,7 +763,7 @@ def render_document(template, snapshot, deal=None):
     business = snapshot["business"]["data"]
     r = Render(snapshot)
     objects = r.objects
-    currency = business["currency"]
+    currency = inline(business["currency"])
     title = f"{business['name']} — {TITLES[template]}"
     lines = [f"# {inline(title)}", "", "Status: DRAFT — human review required.", ""]
     if business["is_demo"]:
@@ -716,7 +773,8 @@ def render_document(template, snapshot, deal=None):
         ]
     lines += [
         f"Concept: {inline(business['concept'])}",
-        f"Entry path: {business['route']}. Planning jurisdiction: {business['jurisdiction']}. Currency: {currency}.",
+        f"Entry path: {inline(business['route'])}. Planning jurisdiction: {inline(business['jurisdiction'])}. "
+        f"Currency: {currency}.",
         f"Intended customer: {inline(business['customer']) or 'Unknown — research required.'}",
         "",
     ]

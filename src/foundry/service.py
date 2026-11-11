@@ -539,6 +539,7 @@ class Service:
         business = self.store.business(con, bid)
         objects = self.store.objects(con, bid)
         by_id = {o["id"]: o for o in objects}
+        today = date.today().isoformat()
         fingerprint = digest(
             canonical({"business": business, "objects": [o for o in objects if o["kind"] != "document"]})
         )
@@ -562,18 +563,16 @@ class Service:
                     )
                 ]
                 obj["evidence_warning"] = any(by_id[e]["state"] != "verified" for e in refs if e)
+            if obj["kind"] == "obligation":
+                due = obj["data"].get("due_date")
+                obj["overdue"] = bool(due) and due < today
         tasks = [o for o in objects if o["kind"] == "task"]
         stats = {
             "verified": sum(t["state"] == "verified" for t in tasks),
             "not_applicable": sum(t["state"] == "not_applicable" for t in tasks),
             "tasks": len(tasks),
             "needs_review": sum(t["state"] == "needs_review" for t in tasks),
-            "overdue_obligations": sum(
-                o["kind"] == "obligation"
-                and bool(o["data"].get("due_date"))
-                and o["data"]["due_date"] < date.today().isoformat()
-                for o in objects
-            ),
+            "overdue_obligations": sum(o["kind"] == "obligation" and o["overdue"] for o in objects),
             "outstanding_invoices": finance.money(
                 sum(
                     (

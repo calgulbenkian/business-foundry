@@ -5,6 +5,7 @@ Expected lines are written by hand from the synthetic business built below, not 
 
 import copy
 import re
+from datetime import date
 from uuid import uuid4
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from foundry import models
 from foundry.demo import seed
 from foundry.documents import render_document
+from foundry.store import DomainError, canonical, digest
 
 ID = re.compile(r"[a-z_]+_[0-9a-f]{20}")
 INDEX = "## Reference index"
@@ -197,7 +199,7 @@ def test_readiness_report_audits_the_workspace_in_order(harbor):
         "### Evidence waiting for review",
         "- Draft quote",
         "### Steps prepared and waiting for approval",
-        "- Verify data, software and asset rights",
+        "- Verify data, software and asset rights — cannot be approved yet; needs first: Add asset record.",
         "### Steps waiting for the next human action",
         "- Define the offer and acceptance standard — approved; confirm it as verified.",
         "### Steps sent back for review",
@@ -224,7 +226,10 @@ def test_readiness_report_audits_the_workspace_in_order(harbor):
         "- Obligation: Quarterly sales tax filing",
         "- Risk: Clients may not switch",
     ]
-    assert section(report, "## Money and deadlines") == ["- Obligations past their due date: 1."]
+    assert section(report, "## Money and deadlines") == [
+        "- Obligations past their due date: 1.",
+        "  - Quarterly sales tax filing — due 2020-01-31.",
+    ]
     steps = section(report, "## Every step")
     assert steps[:3] == [
         "- Establish customer demand — verified as done",
@@ -661,3 +666,144 @@ def test_a_single_step_and_a_missing_deal_read_correctly():
         "—",
         "—",
     ] in index_rows(report)
+
+
+def test_a_prepared_step_with_open_prerequisites_says_it_cannot_be_approved_yet(harbor):
+    _, s, a, _, _ = harbor["setup"]
+    bid = harbor["bid"]
+    founders = next(
+        o for o in s.snapshot(a, bid)["objects"] if o["kind"] == "task" and o["data"]["key"] == "founders"
+    )
+    founders = s.transition(
+        a,
+        bid,
+        founders["id"],
+        key(),
+        dump(models.TaskTransition, state="prepared", expected_version=founders["version"], note="Draft."),
+    )
+    report = generate(harbor, "readiness_report")
+    needs = "Decide the entity and ownership structure; Add contract record"
+    assert section(report, "## What needs a person now")[2:5] == [
+        "### Steps prepared and waiting for approval",
+        "- Record founder and IP arrangements — cannot be approved yet; needs first: " + needs + ".",
+        "- Verify data, software and asset rights — cannot be approved yet; needs first: Add asset record.",
+    ]
+    assert f"- Record founder and IP arrangements — needs first: {needs}." in section(
+        report, "## What is blocked"
+    )
+    # The sentence and the service agree: approval really is refused, for the same reasons.
+    interview = harbor["evidence"]["interview"]["id"]
+    with pytest.raises(DomainError) as refused:
+        s.transition(
+            a,
+            bid,
+            founders["id"],
+            key(),
+            dump(
+                models.TaskTransition,
+                state="approved",
+                expected_version=founders["version"],
+                note="Synthetic approval attempt.",
+                evidence_ids=[interview],
+            ),
+        )
+    assert refused.value.message == "Complete: Decide the entity and ownership structure; Add contract record"
+    stored = next(o for o in s.snapshot(a, bid)["objects"] if o["id"] == founders["id"])
+    assert stored["state"] == "prepared" and stored["version"] == founders["version"]
+
+
+def test_an_approved_or_submitted_step_with_open_prerequisites_names_the_refused_move():
+    # The service reopens a completed step when a prerequisite reopens, so this state is hand-built.
+    blocked = ["Complete: Earlier step", "Add contract record"]
+    tasks = [
+        step(1, "Internal step", "approved", external=False),
+        step(2, "Filing step", "approved", external=True),
+        step(3, "Sent step", "submitted", external=True),
+        step(4, "Open internal step", "approved", external=False),
+    ]
+    for t in tasks[:3]:
+        t["blockers"] = blocked
+    _, report = render_document("readiness_report", bare_snapshot(tasks))
+    assert section(report, "## What needs a person now")[4:9] == [
+        "### Steps waiting for the next human action",
+        "- Internal step — approved, but cannot be verified yet; needs first: Earlier step; Add contract record.",
+        "- Filing step — approved, but cannot be submitted yet; needs first: Earlier step; Add contract record.",
+        "- Sent step — submitted, but cannot be verified yet; needs first: Earlier step; Add contract record.",
+        "- Open internal step — approved; confirm it as verified.",
+    ]
+
+
+def test_overdue_obligations_are_named_with_their_due_dates(harbor):
+    _, s, a, _, _ = harbor["setup"]
+    bid = harbor["bid"]
+    for title, due in (
+        ("Licence renewal", "2999-12-31"),
+        ("Annual return", None),
+        ("Old payroll filing", "2001-06-30"),
+    ):
+        s.add_record(
+            a,
+            bid,
+            key(),
+            dump(models.RecordCreate, kind="obligation", title=title, certainty="reported", due_date=due),
+        )
+    snapshot = s.snapshot(a, bid)
+    flags = {o["title"]: o["overdue"] for o in snapshot["objects"] if o["kind"] == "obligation"}
+    assert flags == {
+        "Quarterly sales tax filing": True,
+        "Licence renewal": False,
+        "Annual return": False,
+        "Old payroll filing": True,
+    }
+    assert snapshot["stats"]["overdue_obligations"] == 2
+    report = generate(harbor, "readiness_report")
+    assert section(report, "## Money and deadlines") == [
+        "- Obligations past their due date: 2.",
+        "  - Old payroll filing — due 2001-06-30.",
+        "  - Quarterly sales tax filing — due 2020-01-31.",
+    ]
+    # The flag is derived: nothing is stored and the source fingerprint is computed without it.
+    store = harbor["setup"][0]
+    with store.read() as con:
+        business, objects = store.business(con, bid), store.objects(con, bid)
+    assert not any("overdue" in o for o in objects)
+    unflagged = [o for o in objects if o["kind"] != "document"]
+    assert snapshot["source_fingerprint"] == digest(canonical({"business": business, "objects": unflagged}))
+
+
+def test_an_obligation_due_today_is_not_overdue(setup, monkeypatch):
+    _, s, a, bid, _ = setup
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2030, 6, 1)
+
+    monkeypatch.setattr("foundry.service.date", FixedDate)
+    for title, due in (("Yesterday", "2030-05-31"), ("Today", "2030-06-01"), ("Tomorrow", "2030-06-02")):
+        s.add_record(
+            a,
+            bid,
+            key(),
+            dump(models.RecordCreate, kind="obligation", title=title, certainty="reported", due_date=due),
+        )
+    snapshot = s.snapshot(a, bid)
+    assert {o["title"]: o["overdue"] for o in snapshot["objects"] if o["kind"] == "obligation"} == {
+        "Yesterday": True,
+        "Today": False,
+        "Tomorrow": False,
+    }
+    _, report = render_document("readiness_report", snapshot)
+    assert section(report, "## Money and deadlines") == [
+        "- Obligations past their due date: 1.",
+        "  - Yesterday — due 2030-05-31.",
+    ]
+
+
+def test_a_snapshot_without_obligation_flags_falls_back_to_the_count():
+    snapshot = bare_snapshot(
+        [obj("obligation", 1, "Filing", "reported", due_date="2001-01-01", evidence_ids=[])]
+    )
+    snapshot["stats"] = {"overdue_obligations": 1}
+    _, report = render_document("readiness_report", snapshot)
+    assert section(report, "## Money and deadlines") == ["- Obligations past their due date: 1."]

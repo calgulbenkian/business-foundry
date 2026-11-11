@@ -21,7 +21,7 @@ Make the offer specific: buyer, problem, deliverable, exclusions, price, timing,
 
 A connected MCP client (see [AI.md](AI.md)) can run the `founder_intake`, `acquisition_intake` and `readiness_review` prompt workflows to interview you and draft these records. They record only assumptions or reported claims; human review gates are unchanged.
 
-Use obligations for tax/reporting reviews, renewals, licenses, customer commitments and similar dated work. v0.1 lists overdue obligations; it does not send reminders or automatically establish recurrence.
+Use obligations for tax/reporting reviews, renewals, licenses, customer commitments and similar dated work. v0.1 lists overdue obligations by name with their due dates in the readiness report; it does not send reminders or automatically establish recurrence.
 
 ## 3. Preserve and review evidence
 
@@ -50,9 +50,9 @@ Legal, formation, banking, licensing and tax work happens with qualified people 
 
 Use **Documents** to generate a business plan, structure decision brief, customer contract brief, operating manual, readiness report or investment memo. Read the unknowns. Contract briefs are instructions for preparation and review, not binding agreements. A document records the source state used to create it; later changes flag it for regeneration.
 
-Documents are written for a reader, not a database. Each record shows its certainty in plain words (assumption, reported or verified), its owner and due date, and its evidence by title with its review standing: reviewed by whom and when, not yet reviewed, or rejected on review. Machine identifiers, versions and the start of each evidence content hash appear only in the closing **Reference index**, so every statement can still be traced to the workspace. The source list names only the guidance that this business's own steps cite, with the guide version and the date the sources were checked.
+Documents are written for a reader, not a database. Each record shows its certainty in plain words (assumption, reported or verified), its owner and due date, and its evidence by title with its review standing: reviewed by whom and when, not yet reviewed, or rejected on review. Machine identifiers, versions and the start of each evidence content hash appear only in the closing **Reference index**, so every statement can still be traced to the workspace. Titles, details, notes and other typed text are shown literally: Markdown characters that would otherwise start a heading, list, quote, code block, link, image or HTML are preceded by a backslash, and ordinary punctuation is left as typed. The source list names only the guidance that this business's own steps cite, with the guide version and the date the sources were checked.
 
-The **readiness report** is the audit to read first. It is computed from the recorded workspace alone, with no AI, in this order: where things stand (steps counted by state); what needs a person now (evidence waiting for review, steps waiting for approval, approved or submitted steps waiting for the next action, and steps sent back for review with the latest reason); what can be worked on next; what is blocked and by what; what is still an assumption or has no evidence; money and deadlines; and every step. An empty section says so. The business plan adds the decisions made and the commitments and duties recorded; it, the operating manual and the investment memo end with a short open-work summary and point to the readiness report rather than repeating every step. An excerpt from a synthetic business:
+The **readiness report** is the audit to read first. It is computed from the recorded workspace alone, with no AI, in this order: where things stand (steps counted by state); what needs a person now (evidence waiting for review, steps waiting for approval, approved or submitted steps waiting for the next action, each saying when its next move would be refused for unmet prerequisites and what it needs first, and steps sent back for review with the latest reason); what can be worked on next; what is blocked and by what; what is still an assumption or has no evidence; money and deadlines, naming each obligation past its due date; and every step. An empty section says so. The business plan adds the decisions made and the commitments and duties recorded; it, the operating manual and the investment memo end with a short open-work summary and point to the readiness report rather than repeating every step. An excerpt from a synthetic business:
 
 ```text
 ## What needs a person now
@@ -63,7 +63,7 @@ The **readiness report** is the audit to read first. It is computed from the rec
 
 ### Steps prepared and waiting for approval
 
-- Verify data, software and asset rights
+- Verify data, software and asset rights — cannot be approved yet; needs first: Add asset record.
 
 ### Steps waiting for the next human action
 
