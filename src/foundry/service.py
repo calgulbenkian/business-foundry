@@ -576,11 +576,12 @@ class Service:
             for event in events:
                 event["payload"] = json.loads(event["payload"])
             integrity = self.store.verify_chain(con, bid)
-            errors, latest, ai_latest = [], {}, {}
+            errors, latest, ai_latest, recorded = [], {}, {}, {}
             for event in events:
                 p = event["payload"]
                 if p.get("id") == event["object_id"] and "version" in p and "data" in p:
                     latest[p["id"]] = p
+                    recorded[(p["id"], p["version"])] = p
                 if p.get("run_id") and p.get("data_sha256"):
                     ai_latest[p["run_id"]] = p
             objects = self.store.objects(con, bid)
@@ -600,6 +601,7 @@ class Service:
                     if not revision or json.loads(revision[0]) != obj:
                         errors.append(f"Revision mismatch: {obj['id']}")
             errors.extend(f"Historical record missing: {oid}" for oid in latest)
+            errors.extend(self._revision_errors(con, bid, recorded))
             for run in con.execute("SELECT * FROM ai_calls WHERE business_id=?", (bid,)):
                 recorded = ai_latest.pop(run["id"], {})
                 if recorded.get("state") != run["state"] or recorded.get("data_sha256") != digest(
@@ -636,6 +638,47 @@ class Service:
                 }
                 return {**archive, "sha256": digest(canonical(archive))}
             return {"integrity": integrity, "events": events}
+
+    @staticmethod
+    def _revision_errors(con, bid, recorded):
+        """Compare every stored revision with the chained event that recorded that version.
+
+        Store.add/update write one revision row and one event per object version. The
+        business record itself is versioned through events only and never has revisions.
+        Revisions carry no business id, so rows are attributed to this business through
+        its current objects and the object ids named by its events, in one query.
+        """
+        errors = []
+        rows = con.execute(
+            "SELECT object_id,version,snapshot FROM revisions WHERE object_id=? "
+            "OR object_id IN (SELECT id FROM objects WHERE business_id=?) "
+            "OR object_id IN (SELECT object_id FROM events WHERE business_id=?) "
+            "ORDER BY object_id,version",
+            (bid, bid, bid),
+        ).fetchall()
+        stored = {}
+        for row in rows:
+            oid, version = row["object_id"], row["version"]
+            stored[(oid, version)] = True
+            if oid == bid:
+                errors.append(f"Unexpected revision for business record: {oid} version {version}")
+                continue
+            event = recorded.get((oid, version))
+            if event is None:
+                errors.append(f"Revision has no recorded history: {oid} version {version}")
+                continue
+            try:
+                snapshot = json.loads(row["snapshot"])
+            except (TypeError, ValueError):
+                snapshot = None
+            if snapshot != event:
+                errors.append(f"Historical revision differs from history: {oid} version {version}")
+        errors.extend(
+            f"Historical revision missing: {oid} version {version}"
+            for oid, version in recorded
+            if oid != bid and (oid, version) not in stored
+        )
+        return errors
 
     def principals(self, actor):
         if actor["role"] != "owner":
