@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from typing import NamedTuple
 from uuid import uuid4
 
 import pytest
@@ -1854,36 +1855,109 @@ def assert_audit_and_export(service, actor, bid, expected):
         assert result["valid"] is (expected == [])
 
 
-def test_ai_review_of_one_business_is_not_in_another_business_audit(setup):
-    store, service, actor, bid, _ = setup
-    other = second_business(setup)
-    add_ai_review(store, actor, bid)
-    assert_audit_and_export(service, actor, bid, [])
+# Which business holds the only AI review: the first-created one (the fixture's) or the
+# second-created one. A version that picked rows by position, not by business id, would pass
+# whenever the business under test was the first created and its row the first inserted.
+
+
+class Holder(NamedTuple):
+    first_created: bool
+    run_id: str
+    differs: list
+    missing: list
+    entry: dict
+
+
+HOLDERS = [
+    pytest.param(
+        Holder(
+            True,
+            "review_synthetic",
+            ["AI review differs from history: review_synthetic"],
+            ["Historical AI review missing: review_synthetic"],
+            SYNTHETIC_RUN_ENTRY,
+        ),
+        id="first-created-business-holds-it",
+    ),
+    pytest.param(
+        Holder(
+            False,
+            "review_second_business",
+            ["AI review differs from history: review_second_business"],
+            ["Historical AI review missing: review_second_business"],
+            SECOND_RUN_ENTRY,
+        ),
+        id="second-created-business-holds-it",
+    ),
+]
+
+
+def holder_and_other(setup, holder):
+    """Create the second business; return the business that holds the review, then the other."""
+    first = setup[3]
+    second = second_business(setup)
+    return (first, second) if holder.first_created else (second, first)
+
+
+def ai_call_ids_in_insertion_order(store):
+    with store.read() as con:
+        return [row[0] for row in con.execute("SELECT id FROM ai_calls ORDER BY rowid")]
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_ai_review_of_one_business_is_not_in_another_business_audit(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    assert_audit_and_export(service, actor, owner, [])
     assert_audit_and_export(service, actor, other, [])
 
 
-def test_altered_ai_review_of_one_business_is_reported_only_there(setup):
-    store, service, actor, bid, _ = setup
-    other = second_business(setup)
-    add_ai_review(store, actor, bid)
-    alter_ai_review(store, "review_synthetic")
-    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_altered_ai_review_of_one_business_is_reported_only_there(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    alter_ai_review(store, holder.run_id)
+    assert_audit_and_export(service, actor, owner, holder.differs)
     assert_audit_and_export(service, actor, other, [])
 
 
-def test_ai_review_without_history_of_one_business_is_reported_only_there(setup):
-    store, service, actor, bid, _ = setup
-    other = second_business(setup)
-    add_ai_review(store, actor, bid, chained=False)
-    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_ai_review_without_history_of_one_business_is_reported_only_there(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, chained=False, run_id=holder.run_id)
+    assert_audit_and_export(service, actor, owner, holder.differs)
     assert_audit_and_export(service, actor, other, [])
 
 
-def test_each_business_checks_only_its_own_ai_review(setup):
-    store, service, actor, bid, _ = setup
+# Where both businesses hold a review, either business's row may be inserted first.
+INSERTION_ORDERS = [
+    pytest.param(True, id="first-created-business-row-inserted-first"),
+    pytest.param(False, id="second-created-business-row-inserted-first"),
+]
+
+
+def add_both_ai_reviews(setup, first_inserted_first):
+    """Create the second business and give each business one AI review, in the order asked."""
+    store, _, actor, bid, _ = setup
     other = second_business(setup)
-    add_ai_review(store, actor, bid)
-    add_ai_review(store, actor, other, run_id=SECOND_RUN)
+    if first_inserted_first:
+        add_ai_review(store, actor, bid)
+        add_ai_review(store, actor, other, run_id=SECOND_RUN)
+        assert ai_call_ids_in_insertion_order(store) == ["review_synthetic", "review_second_business"]
+    else:
+        add_ai_review(store, actor, other, run_id=SECOND_RUN)
+        add_ai_review(store, actor, bid)
+        assert ai_call_ids_in_insertion_order(store) == ["review_second_business", "review_synthetic"]
+    return other
+
+
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+def test_each_business_checks_only_its_own_ai_review(setup, first_inserted_first):
+    store, service, actor, bid, _ = setup
+    other = add_both_ai_reviews(setup, first_inserted_first)
     assert_audit_and_export(service, actor, bid, [])
     assert_audit_and_export(service, actor, other, [])
     alter_ai_review(store, "review_synthetic")
@@ -1894,28 +1968,27 @@ def test_each_business_checks_only_its_own_ai_review(setup):
     assert_audit_and_export(service, actor, other, ["AI review differs from history: review_second_business"])
 
 
-def test_event_in_another_business_chain_stands_for_nothing_here(setup):
-    store, service, actor, bid, _ = setup
-    other = second_business(setup)
-    add_ai_review(store, actor, bid)
-    changed = alter_ai_review(store, "review_synthetic")
-    # An event appended to the second business's chain carries the first business's run id and the
-    # state and digest of its altered row: it would make that row verify if it were in this chain.
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_event_in_another_business_chain_stands_for_nothing_here(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    changed = alter_ai_review(store, holder.run_id)
+    # An event appended to the other business's chain carries the holder's run id and the state
+    # and digest of its altered row: it would make that row verify if it were in the holder's chain.
     append_event(
         store,
         other,
-        "review_synthetic",
-        canonical(
-            {"run_id": "review_synthetic", "state": "succeeded", "data_sha256": digest(canonical(changed))}
-        ),
+        holder.run_id,
+        canonical({"run_id": holder.run_id, "state": "succeeded", "data_sha256": digest(canonical(changed))}),
         "ai.succeeded",
     )
     # Rule: a business's AI reviews are compared with its own events only. The event in the other
     # chain hides nothing here, so the altered row is still reported.
-    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
-    # Rule: an AI review a business's own history names must be a row of that business. The second
+    assert_audit_and_export(service, actor, owner, holder.differs)
+    # Rule: an AI review a business's own history names must be a row of that business. The other
     # business holds no row for this run id, whichever business does.
-    assert_audit_and_export(service, actor, other, ["Historical AI review missing: review_synthetic"])
+    assert_audit_and_export(service, actor, other, holder.missing)
 
 
 # A business's export carries its own AI review rows and no other business's.
@@ -1925,19 +1998,19 @@ def exported_archive(service, actor, bid):
     return service.audit(actor, bid, True)
 
 
-def test_export_of_a_business_without_ai_reviews_carries_none_of_another_business(setup):
-    store, service, actor, bid, _ = setup
-    other = second_business(setup)
-    add_ai_review(store, actor, bid)
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_export_of_a_business_without_ai_reviews_carries_none_of_another_business(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
     assert exported_archive(service, actor, other)["ai_runs"] == []
-    assert exported_archive(service, actor, bid)["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
+    assert exported_archive(service, actor, owner)["ai_runs"] == [holder.entry]
 
 
-def test_export_of_each_business_carries_only_its_own_ai_review(setup):
-    store, service, actor, bid, _ = setup
-    other = second_business(setup)
-    add_ai_review(store, actor, bid)
-    add_ai_review(store, actor, other, run_id=SECOND_RUN)
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+def test_export_of_each_business_carries_only_its_own_ai_review(setup, first_inserted_first):
+    _, service, actor, bid, _ = setup
+    other = add_both_ai_reviews(setup, first_inserted_first)
     assert exported_archive(service, actor, bid)["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
     assert exported_archive(service, actor, other)["ai_runs"] == [SECOND_RUN_ENTRY]
 
