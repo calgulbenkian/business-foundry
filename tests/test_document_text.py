@@ -1,8 +1,8 @@
 """Text typed by a person or an agent is printed literally: it cannot add, remove or restyle Markdown.
 
-A CommonMark parser (with GFM tables and strikethrough, as most viewers render) is the judge. Every string
-in the snapshot's business and objects is replaced, one at a time, by each hostile string, and the parsed
-document is compared with the same field holding plain words.
+A CommonMark parser (with GFM tables and strikethrough, as most viewers render) is the judge. Every value
+in the snapshot, of any type, is replaced, one at a time, by each hostile string, and the parsed document is
+compared with the same field holding plain words.
 """
 
 import copy
@@ -80,6 +80,18 @@ HOSTILE = [
     "\\",
     "two trailing spaces  ",
     "\\*not em\\* and \\_not em\\_",
+    "* * *",
+    "_ _ _",
+    "* starts the text",
+    "_ starts the text",
+    "the text ends *",
+    "the text ends _",
+    "a ** b ** c",
+    "a __ b __ c",
+    "a *b * c",
+    "a * b* c",
+    "a _b _ c",
+    "a _ b_ c",
 ]
 
 ORDINARY = [
@@ -201,21 +213,23 @@ def compact(tmp_path_factory):
     work = [o for o in objects if o["kind"] in {"evidence", "customer", "offer", "obligation", "risk"}]
     work += [o for o in objects if o["kind"] == "task" and o["data"]["key"] in KEPT_STEPS]
     money = [o for o in objects if o["kind"] in {"evidence", "financial_plan", "deal"}] + [deal_step]
+    # A snapshot built without per-obligation flags prints the overdue count from the stats instead.
+    count = [{k: v for k, v in o.items() if k != "overdue"} for o in objects if o["kind"] == "obligation"]
     halves = {}
-    for name, kept in (("work", work), ("money", money)):
+    for name, kept in (("work", work), ("money", money), ("count", count)):
         half = copy.deepcopy({**snapshot, "objects": kept})
         halves[name] = half, next((o for o in half["objects"] if o["id"] == deal["id"]), None)
     return halves
 
 
 def leaves(value, path=()):
-    """Every string in a nested structure, as (container, key, path)."""
+    """Every leaf of a nested structure, of any type (text, numbers, booleans, None), as (container, key, path)."""
     items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
     for k, v in items:
-        if isinstance(v, str):
-            yield value, k, (*path, k)
-        else:
+        if isinstance(v, dict | list):
             yield from leaves(v, (*path, k))
+        else:
+            yield value, k, (*path, k)
 
 
 def text_of(token) -> str:
@@ -247,19 +261,20 @@ def substituted(compact, container, k, value, templates=TITLES):
         for template in templates:
             try:
                 out[template] = render(template, snapshot, deal)
-            except (ArithmeticError, ValueError, TypeError, KeyError):
+            except (ArithmeticError, ValueError, TypeError, KeyError, AttributeError):
                 out[template] = None
         return out
     finally:
         container[k] = original
 
 
-@pytest.mark.parametrize("half", ["work", "money"])
-def test_no_string_in_the_snapshot_can_change_document_structure_or_add_markup(compact, half):
+@pytest.mark.parametrize("half", ["work", "money", "count"])
+def test_no_value_in_the_snapshot_can_change_document_structure_or_add_markup(compact, half):
     compact = compact[half]
     snapshot, deal = compact
     baseline = {t: render(t, snapshot, deal) for t in TITLES if t != "investment_memo" or deal}
-    fields = [*leaves(snapshot["business"], ("business",)), *leaves(snapshot["objects"], ("objects",))]
+    fields = list(leaves(snapshot))
+    assert {"stats", "source_fingerprint", "catalog"} <= {p[0] for _, _, p in fields}
     checked, failures = set(), []
     for container, k, path in fields:
         plain = substituted(compact, container, k, PLAIN)
@@ -276,15 +291,22 @@ def test_no_string_in_the_snapshot_can_change_document_structure_or_add_markup(c
                 if rendered[t] is None or shape(rendered[t])[:2] != expected[t]:
                     failures.append((path, repr(hostile), t))
     assert failures == []
-    # The walk reached free text in the business, records, evidence, steps (blockers included) and deals.
+    # The walk reached free text in the business, records, evidence, steps (blockers included) and deals,
+    # and the values the service writes itself: versions, the fingerprint, the horizon and the count.
     printed = {p[-1] for p in checked}
-    assert {"name", "concept", "customer", "title", "currency", "route", "jurisdiction"} <= printed
+    assert {"name", "concept", "customer", "currency", "route", "jurisdiction"} <= printed
+    assert {("business", "version"), ("source_fingerprint",)} <= checked
     blockers = [p for _, _, p in fields if "blockers" in p]
-    assert set(blockers) <= checked and (blockers or half == "money")
+    assert set(blockers) <= checked and (blockers or half != "work")
     assert {
-        "work": {"details", "owner", "due_date", "description", "note", "actor_name", "source_uri"},
-        "money": {"thesis", "label", "reason", "basis", "base"},
+        "work": {"title", "details", "owner", "due_date", "description", "note", "actor_name", "source_uri"},
+        "money": {"title", "thesis", "label", "reason", "basis", "base"},
+        "count": set(),
     }[half] <= printed
+    if half == "money":
+        assert any(p[-2:] == ("inputs", "months") for p in checked)
+    if half == "count":
+        assert ("stats", "overdue_obligations") in checked
 
 
 def field(snapshot, deal, name):
@@ -390,3 +412,134 @@ def test_ordinary_text_is_printed_byte_for_byte(text):
     start = lines.index(f"### {text}")
     assert lines[start + 2] == text
     assert any(x.startswith(f"| {text} ") for x in lines)
+
+
+def bare(record):
+    return {
+        "business": {
+            "id": "business_" + "0" * 20,
+            "version": 1,
+            "data": {
+                "name": "Bare business",
+                "concept": "A synthetic business.",
+                "route": "start",
+                "jurisdiction": "undecided",
+                "currency": "USD",
+                "customer": "",
+                "is_demo": False,
+            },
+        },
+        "objects": [record],
+        "stats": {},
+        "source_fingerprint": "f" * 64,
+        "catalog": {},
+    }
+
+
+def assumption(title, details="", **data):
+    return {
+        "id": "customer_" + "1" * 20,
+        "kind": "customer",
+        "title": title,
+        "state": "assumption",
+        "version": 1,
+        "data": {"details": details, "evidence_ids": [], **data},
+    }
+
+
+def shown(content):
+    """The text a parser shows, one line per paragraph, heading or list item, and any markup it found."""
+    tokens = MD.parse(content)
+    markup = [c.type for t in tokens for c in [t, *(t.children or [])] if c.type in MARKUP]
+    return "\n".join(text_of(t) for t in tokens if t.type == "inline"), markup
+
+
+SPACED = ["Cost * quantity", "Hours * rate = fee", "a _ b"]
+
+
+@pytest.mark.parametrize("text", SPACED)
+def test_an_asterisk_or_underscore_with_a_space_on_each_side_is_printed_as_typed(text):
+    assert inline(text) == text
+    snapshot = bare(assumption(text, details=text))
+    plan = render_document("business_plan", snapshot)[1]
+    lines = plan.splitlines()
+    start = lines.index(f"### {text}")  # as a title
+    assert lines[start + 2] == text  # as details
+    report = render_document("readiness_report", snapshot)[1]
+    assert f"- Customer: {text}" in report.splitlines()  # as a list item
+    text_shown, markup = shown(plan)
+    assert markup == [] and f"\n{text}\n" in text_shown and f" {text} " in text_shown
+    text_shown, markup = shown(report)
+    assert markup == [] and f"\nCustomer: {text}\n" in text_shown
+
+
+@pytest.mark.parametrize(
+    ("owner", "due", "line"),
+    [
+        ("Cost * rate *", "* tax * due", "Owner: Cost * rate \\*. Due: \\* tax * due."),
+        ("Cost _ rate _", "_ tax _ due", "Owner: Cost _ rate \\_. Due: \\_ tax _ due."),
+    ],
+)
+def test_two_typed_fields_in_one_paragraph_cannot_pair_into_emphasis(owner, due, line):
+    plan = render_document("business_plan", bare(assumption("Pilot buyers", owner=owner, due_date=due)))[1]
+    assert line in plan.splitlines()
+    text_shown, markup = shown(plan)
+    assert markup == []
+    assert f" Owner: {owner}. Due: {due}. " in text_shown
+
+
+@pytest.mark.parametrize(
+    ("text", "printed"),
+    [
+        ("* item", "\\* item"),
+        ("_ item", "\\_ item"),
+        ("Price*", "Price\\*"),
+        ("Price *", "Price \\*"),
+        ("Price _", "Price \\_"),
+        ("a ** b", "a \\*\\* b"),
+        ("a __ b", "a \\_\\_ b"),
+        ("a *b c", "a \\*b c"),
+        ("a b* c", "a b\\* c"),
+        ("a _b c", "a \\_b c"),
+        ("a b_ c", "a b\\_ c"),
+        ("* * *", "\\* * \\*"),
+        ("_ _ _", "\\_ _ \\_"),
+        ("snake_case_name", "snake_case_name"),
+    ],
+)
+def test_other_asterisks_and_underscores_keep_their_backslash(text, printed):
+    # Behaviour this round leaves unchanged: only a character with a space on each side loses its backslash.
+    assert inline(text) == printed
+
+
+@pytest.mark.parametrize(
+    ("text", "printed"),
+    [
+        ("Invoice [draft]", "Invoice \\[draft]"),
+        ("Run `make` first", "Run \\`make\\` first"),
+        ("Cash | card", "Cash \\| card"),
+    ],
+)
+def test_brackets_backticks_and_pipes_are_always_escaped(text, printed):
+    # Behaviour this round leaves unchanged: what these mean can depend on text printed after them.
+    assert inline(text) == printed
+    plan = render_document("business_plan", bare(assumption(text, details=text)))[1]
+    assert f"### {printed}" in plan.splitlines() and printed in plan.splitlines()
+    text_shown, markup = shown(plan)
+    assert markup == []
+    assert f"\n{text}\n" in text_shown and f" {text} " in text_shown
+
+
+@pytest.mark.parametrize("control", ["\x00", "\x1b", "\x07", "\x7f", "\x80"])
+def test_a_control_character_is_printed_as_the_replacement_character(control):
+    assert inline(f"hello{control}world") == "hello�world"
+    record = assumption(f"Pilot{control}buyers", details=f"Two{control}firms")
+    plan = render_document("business_plan", bare(record))[1]
+    assert "### Pilot�buyers" in plan.splitlines() and "Two�firms" in plan.splitlines()
+    assert control not in plan
+    text_shown, _ = shown(plan)
+    assert "\nPilot�buyers\n" in text_shown and " Two�firms " in text_shown
+    # Control characters that count as whitespace still collapse to one space.
+    for space in ("\t", "\n", "\x85", "\x1f"):
+        assert inline(f"hello{space}world") == "hello world"
+        assert inline(f"hello {space} world{control}") == "hello world�"

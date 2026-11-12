@@ -314,7 +314,8 @@ def test_plan_and_manual_summarize_open_work_instead_of_listing_every_step(harbo
     assert len(work) == 7 + 1 + 15 + 2
     assert "- Establish customer demand — verified as done" not in content
     assert work[-2] == (
-        "The readiness report lists what needs a person now, what can be worked on next and what is blocked."
+        "The readiness report lists every step, what needs a person now, what can be worked on next "
+        "and what is blocked."
     )
     assert "Record the buyer, problem, alternatives" not in content  # step descriptions stay in the report
 
@@ -395,10 +396,15 @@ def test_ids_appear_only_in_the_reference_index_and_every_relied_id_is_there(har
         "contract_brief": {records["customer"]["id"], records["offer"]["id"]}
         | {e["id"] for e in evidence.values()},
         "operating_manual": {records["offer"]["id"], records["obligation"]["id"], records["risk"]["id"]},
-        "readiness_report": {records[k]["id"] for k in records} | {evidence["quote"]["id"]},
+        # The report names only records that are assumptions or have no evidence.
+        "readiness_report": {records["risk"]["id"], records["obligation"]["id"], evidence["quote"]["id"]},
     }[template] | {harbor["bid"]}
-    if template in {"business_plan", "operating_manual", "readiness_report"}:
+    tasks = [o for o in snapshot["objects"] if o["kind"] == "task"]
+    if template == "readiness_report":
         expected |= task_ids(harbor)
+    elif template in {"business_plan", "operating_manual"}:
+        # The two finished steps are counted, not named; every unfinished one is named.
+        expected |= {t["id"] for t in tasks if t["state"] not in {"verified", "not_applicable"}}
     assert expected <= indexed
     assert indexed <= {o["id"] for o in snapshot["objects"]} | {harbor["bid"]}
 
@@ -644,7 +650,8 @@ def test_superseded_steps_are_listed_as_replaced_and_unknown_states_are_never_fi
         "Unfinished steps:",
         "- Open step — not started",
         '- Odd step — in a state this version does not recognise ("archived")',
-        "The readiness report lists what needs a person now, what can be worked on next and what is blocked.",
+        "The readiness report lists every step, what needs a person now, what can be worked on next "
+        "and what is blocked.",
         "A completed checklist reflects recorded reviews. It does not establish legal compliance, "
         "commercial viability or an independently audited result.",
     ]
@@ -807,3 +814,106 @@ def test_a_snapshot_without_obligation_flags_falls_back_to_the_count():
     snapshot["stats"] = {"overdue_obligations": 1}
     _, report = render_document("readiness_report", snapshot)
     assert section(report, "## Money and deadlines") == ["- Obligations past their due date: 1."]
+
+
+NAMED_KINDS = {
+    "customer",
+    "offer",
+    "asset",
+    "contract",
+    "obligation",
+    "role",
+    "entity",
+    "person",
+    "ownership",
+    "decision",
+    "risk",
+    "task",
+    "evidence",
+    "financial_plan",
+    "deal",
+}
+
+
+@pytest.fixture
+def renamed(harbor):
+    """The harbor snapshot with a plan and a deal, every title replaced by one printed nowhere else."""
+    _, s, a, _, _ = harbor["setup"]
+    bid = harbor["bid"]
+    interview = harbor["evidence"]["interview"]["id"]
+    s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Pilot plan"))
+    deal_id = s.save_deal(
+        a,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target="Corner shop",
+            thesis="A synthetic target.",
+            adjustments=[
+                {"label": "Owner salary", "amount": 1000, "evidence_id": interview},
+                {"label": "Unsupported add-back", "amount": 500},
+            ],
+        ),
+    )["id"]
+    snapshot = copy.deepcopy(s.snapshot(a, bid))
+    named = [o for o in snapshot["objects"] if o["kind"] in NAMED_KINDS]
+    old = {o["id"]: o["title"] for o in named}
+    steps = [old[o["id"]] for o in named if o["kind"] == "task"]
+    assert len(set(steps)) == len(steps)
+    new = {o["id"]: f"Item{n:03d}x" for n, o in enumerate(named)}
+    by_title = {old[i]: new[i] for i in new}
+    for o in named:
+        o["title"] = new[o["id"]]
+        if o["kind"] == "task":
+            o["blockers"] = [
+                "Complete: " + by_title[b.removeprefix("Complete: ")] if b.startswith("Complete: ") else b
+                for b in o["blockers"]
+            ]
+    deal = next(o for o in snapshot["objects"] if o["id"] == deal_id)
+    return snapshot, deal, {o["id"]: o for o in named}
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "business_plan",
+        "structure_options",
+        "contract_brief",
+        "operating_manual",
+        "readiness_report",
+        "investment_memo",
+    ],
+)
+def test_the_reference_index_lists_exactly_the_items_the_body_names(renamed, template):
+    snapshot, deal, named = renamed
+    content = render_document(template, snapshot, deal)[1]
+    body, _ = body_and_index(content)
+    rows = index_rows(content)
+    assert rows[0][1] == "Business"
+    indexed = {row[2] for row in rows[1:]}
+    # Every row but the business row names an item whose title the body prints.
+    assert indexed <= set(named)
+    assert [row[0] for row in rows[1:] if row[0] not in body] == []
+    # Every item whose title the body prints has a row.
+    assert {i for i, o in named.items() if o["title"] in body} == indexed
+
+
+def test_the_report_and_the_plan_leave_out_what_they_do_not_name(harbor, renamed):
+    snapshot, _, named = renamed
+    customer = named[harbor["records"]["customer"]["id"]]
+    interview = named[harbor["evidence"]["interview"]["id"]]
+    demand = next(o for o in named.values() if o["kind"] == "task" and o["data"]["key"] == "demand")
+    # A verified record with reviewed evidence needs nobody now: the report names neither.
+    assert customer["state"] == "verified" and interview["state"] == "verified"
+    report = render_document("readiness_report", snapshot)[1]
+    report_ids = {row[2] for row in index_rows(report)}
+    assert customer["title"] not in report and customer["id"] not in report_ids
+    assert interview["title"] not in report and interview["id"] not in report_ids
+    # A finished step is counted in the plan, not named, so it has no row there; the report names it.
+    assert demand["state"] == "verified"
+    plan = render_document("business_plan", snapshot)[1]
+    # 17 business steps and the deal's 7: demand is verified and bank is not applicable.
+    assert section(plan, "## Open work")[0] == "24 steps are tracked: 2 finished and 22 still open."
+    assert demand["title"] not in plan and demand["id"] not in {row[2] for row in index_rows(plan)}
+    assert demand["title"] in report and demand["id"] in report_ids

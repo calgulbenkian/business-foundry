@@ -2,6 +2,7 @@
 
 import re
 import string
+import unicodedata
 from decimal import Decimal
 
 from foundry.finance import period_rollups
@@ -27,26 +28,37 @@ CLOSING_HASHES = re.compile(r" (#)#*$")
 
 
 def is_markup(text, i) -> bool:
-    """Whether a parser would read the character at position i of a Markdown line as markup."""
+    """Whether the character at position i of the text could be read as markup, so it needs a backslash.
+
+    A backquote, an opening bracket and a pipe always count: what they mean can depend on text printed
+    after them, which may come from another field. An asterisk or an underscore with a space on both
+    sides cannot open or close emphasis, and neither can an underscore inside a word; anywhere else,
+    including at the start or the end of the text, they count.
+    """
     ch, before, after = text[i], text[i - 1 : i], text[i + 1 : i + 2]
+    spaced = before == " " and after == " "
     return bool(
-        ch in "`*[|"  # code spans, emphasis, links and images, table cells
+        ch in "`[|"  # code spans, links and images, table cells
+        or (ch == "*" and not spaced)  # emphasis
+        or (ch == "_" and not (spaced or (before.isalnum() and after.isalnum())))  # emphasis
         or (ch == "\\" and (after in ASCII_PUNCTUATION or not after))  # would escape the next character
         or (ch == "~" and "~" in (before, after))  # strikethrough
-        or (ch == "_" and not (before.isalnum() and after.isalnum()))  # emphasis, unless inside a word
         or (ch == "<" and after.strip())  # raw HTML and autolinks
         or (ch == "&" and ENTITY.match(text, i))  # character references
     )
 
 
 def inline(value) -> str:
-    """Print text typed by a person or an agent as literal Markdown on one line.
+    """Print any value read from a snapshot (typed text, a number, an id) as literal Markdown on one line.
 
-    Whitespace collapses to single spaces. A backslash goes before a character only where a parser would
-    otherwise read markup there, so ordinary punctuation reads exactly as typed. The same rule is used
-    for headings, own-line text, list items and table cells; pipes are always escaped.
+    Whitespace collapses to single spaces and any other control character becomes U+FFFD. A backslash
+    goes before a character where is_markup says a parser could read markup, and before the start of a
+    heading, list item, quote, thematic break or setext underline and a heading's closing hashes. Every
+    `[`, backquote and `|` gets one; an `*` or `_` with a space on both sides does not. The same rule is
+    used for headings, own-line text, list items and table cells.
     """
     text = " ".join(str(value).split())
+    text = "".join("\ufffd" if unicodedata.category(ch) == "Cc" else ch for ch in text)
     marks = {m.start(m.lastindex) for m in (LINE_START.match(text), CLOSING_HASHES.search(text)) if m}
     marks.update(m.start() for m in MARKUP_CHARACTERS.finditer(text) if is_markup(text, m.start()))
     return "".join("\\" + ch if i in marks else ch for i, ch in enumerate(text)) if marks else text
@@ -165,7 +177,7 @@ def financial_section(p, currency) -> list[str]:
     scenarios = data["scenarios"]
     out = [
         f"Model: {inline(p['title'])}. Currency: {currency}. "
-        f"Horizon: {data['inputs']['months']} months. These are forecasts, not booked actuals.",
+        f"Horizon: {inline(data['inputs']['months'])} months. These are forecasts, not booked actuals.",
         "",
         "### Scenario comparison",
         "",
@@ -458,7 +470,10 @@ def latest_reopen_reason(task):
 
 
 class Render:
-    """Collects the ids a document mentions so the reference index can trace every one."""
+    """Collects the ids of the items a document names so the reference index lists exactly those.
+
+    An item is registered when its title is printed; counting it does not register it.
+    """
 
     def __init__(self, snapshot):
         self.snapshot = snapshot
@@ -535,11 +550,9 @@ class Render:
 
 
 def step_overview(r, tasks) -> list[str]:
-    """Plain-words counts of steps by state. Replaced steps are listed, never counted."""
+    """Plain-words counts of steps by state. Replaced steps are named, never counted; counted steps are not named."""
     counted = [t for t in tasks if step_class(t["state"]) != "replaced"]
     replaced = [t for t in tasks if step_class(t["state"]) == "replaced"]
-    for t in tasks:
-        r.mention(t["id"])
     out = []
     if not counted:
         out.append("No steps are recorded.")
@@ -610,7 +623,7 @@ def readiness_audit(r, tasks, currency) -> list[str]:
         # The service refuses approved, submitted and verified while a step has unmet prerequisites.
         if t.get("blockers"):
             move = "submitted" if t["state"] == "approved" and t["data"].get("external") else "verified"
-            action = f"{t['state']}, but cannot be {move} yet; needs first: {needs_first(t)}"
+            action = f"{inline(t['state'])}, but cannot be {move} yet; needs first: {needs_first(t)}"
         elif t["state"] == "submitted":
             action = "submitted; confirm the result against the reviewed receipt"
         elif t["data"].get("external"):
@@ -651,25 +664,20 @@ def readiness_audit(r, tasks, currency) -> list[str]:
 
     records = [o for o in r.objects if o["kind"] in KIND_LABELS]
     records.sort(key=lambda o: list(KIND_LABELS).index(o["kind"]))
-    for o in records:
+
+    def named(o):
         r.mention(o["id"])
+        return f"{inline(kind_label(o['kind']))}: {inline(o['title'])}"
+
     none_yet = "No business records have been added yet."
     out += ["## What is still an assumption", "", "### Records marked as assumptions", ""]
     out += bullets(
-        [
-            f"{inline(kind_label(o['kind']))}: {inline(o['title'])}"
-            for o in records
-            if o["state"] == "assumption"
-        ],
+        [named(o) for o in records if o["state"] == "assumption"],
         none_yet if not records else "No record is marked as an assumption.",
     )
     out += ["### Records with no evidence attached", ""]
     out += bullets(
-        [
-            f"{inline(kind_label(o['kind']))}: {inline(o['title'])}"
-            for o in records
-            if not o["data"].get("evidence_ids")
-        ],
+        [named(o) for o in records if not o["data"].get("evidence_ids")],
         none_yet if not records else "Every record has evidence attached.",
     )
 
@@ -683,7 +691,9 @@ def readiness_audit(r, tasks, currency) -> list[str]:
     overdue = sorted((o for o in flagged if o["overdue"]), key=lambda o: str(o["data"].get("due_date")))
     if overdue or (not flagged and stats.get("overdue_obligations")):
         # A snapshot built without per-obligation flags carries only the count.
-        money.append(f"Obligations past their due date: {len(overdue) or stats['overdue_obligations']}.")
+        money.append(
+            f"Obligations past their due date: {inline(len(overdue) or stats['overdue_obligations'])}."
+        )
     money = [f"- {x}" for x in money]
     for o in overdue:
         r.mention(o["id"])
@@ -721,7 +731,8 @@ def open_work(r, tasks, heading) -> list[str]:
     elif tasks:
         out += ["No step is unfinished.", ""]
     return out + [
-        "The readiness report lists what needs a person now, what can be worked on next and what is blocked.",
+        "The readiness report lists every step, what needs a person now, what can be worked on next "
+        "and what is blocked.",
         "",
         CHECKLIST_LIMITATION,
         "",
@@ -879,7 +890,8 @@ def render_document(template, snapshot, deal=None):
         lines += open_work(r, tasks, "Open work on this acquisition")
     lines += [
         "## Source and review trail",
-        f"Business version: {snapshot['business']['version']}. Source fingerprint: {snapshot['source_fingerprint']}.",
+        f"Business version: {inline(snapshot['business']['version'])}. "
+        f"Source fingerprint: {inline(snapshot['source_fingerprint'])}.",
         "This document is an immutable snapshot. Generate a new version when inputs change; retain signed external documents as evidence.",
         "",
     ]
