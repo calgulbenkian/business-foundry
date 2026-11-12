@@ -2182,6 +2182,272 @@ async function main() {
     race.setDefaultTimeout(30000);
     assert.deepEqual(lateFailures, [], 'late answers act only on their own session and business');
 
+    // A jurisdiction change made through the API: the demo's earlier deal analysis and forecast
+    // show the server's own sentence, and the page composes none of its own. It runs on the demo
+    // here, after the demo's last use above: the change replaces the demo's guide steps and
+    // reopens its completed ones, and no check below uses the demo.
+    const demoUrl = `${origin}/api/businesses/${demoBid}`;
+    const changed = await context.request.post(demoUrl + '/jurisdiction', {
+      headers: { Origin: origin, 'Idempotency-Key': 'browser-jurisdiction-change' },
+      data: {
+        expected_version: (await (await context.request.get(demoUrl)).json()).business.version,
+        jurisdiction: 'GB',
+        reason: 'Synthetic browser check of earlier analyses after a jurisdiction change.',
+        evidence_ids: [],
+      },
+    });
+    assert.equal(changed.status(), 200, await changed.text());
+    const marked = await (await context.request.get(demoUrl)).json();
+    const reasonOf = (kind) => {
+      const [reason] = marked.objects.find((o) => o.kind === kind).stale_reasons;
+      assert.equal(reason.code, 'jurisdiction_changed');
+      return reason.message;
+    };
+    const dealReason = reasonOf('deal'),
+      planReason = reasonOf('financial_plan');
+    assert(
+      dealReason.startsWith(
+        'This deal analysis was saved while the planning jurisdiction was undecided. It is now GB.',
+      ),
+    );
+    assert(
+      planReason.startsWith(
+        'This forecast was saved while the planning jurisdiction was undecided. It is now GB.',
+      ),
+    );
+    const plans = marked.objects.filter((o) => o.kind === 'financial_plan'),
+      deal = marked.objects.find((o) => o.kind === 'deal'),
+      gone = marked.objects.filter((o) => o.kind === 'task' && o.state === 'superseded');
+    assert(gone.length > 0, 'the change replaced at least one of the demo’s steps');
+    assert.equal(marked.stats.superseded, gone.length);
+    const jx = await newPage(context);
+    jx.on('pageerror', (e) => errors.push(e.message));
+    const jxSource = async (id) => {
+      await jx.locator(`#src-nav .src[data-src="${id}"]`).click();
+      await jx.locator(`#src-nav .src[data-src="${id}"][aria-current="true"]`).waitFor();
+    };
+    const jxRow = (key) => jx.locator(`#list .row[data-key="${key}"]`);
+    const jxOpen = async (source, key, title) => {
+      await jxSource(source);
+      await jxRow(key).click();
+      await jx.locator('#insp-title', { hasText: title }).waitFor();
+      await quiet(jx);
+    };
+    const noOldSentence = async (where) => {
+      await quiet(jx);
+      for (const pane of ['#list', '#insp'])
+        assert.doesNotMatch(
+          await jx.locator(pane).innerText(),
+          /Supporting evidence changed/i,
+          `${where}: the page writes no reason of its own`,
+        );
+    };
+    await jx.goto(origin);
+    await jx.locator('#list .today-head').waitFor();
+    if ((await jx.locator('#business-select').inputValue()) !== demoBid) {
+      await jx.locator('#business-select').selectOption(demoBid);
+      await jx.locator('#list .th-sub', { hasText: demoName }).waitFor();
+    }
+    await quiet(jx);
+    // the forecast: its full view, the money position that shows the latest one, and its rows
+    const latest = plans.at(-1);
+    const latestReasons = latest.stale_reasons.map((r) => r.message);
+    assert(latestReasons.length > 0, 'the latest forecast needs review');
+    await jxOpen('money', 'plan:' + latest.id, latest.title);
+    for (const m of latestReasons)
+      assert(
+        (await jx.locator('#insp .flag').allInnerTexts()).includes(m),
+        'the forecast’s own view shows the server’s reason',
+      );
+    await noOldSentence('a forecast');
+    for (const p of plans) {
+      assert.equal(
+        await jxRow('plan:' + p.id)
+          .locator('.r-g svg')
+          .getAttribute('data-glyph'),
+        'review',
+        `${p.title}: its row is marked`,
+      );
+      assert.match(await jxRow('plan:' + p.id).innerText(), /needs review/);
+    }
+    assert.equal(
+      await jx.locator('#src-nav .src[data-src="money"] .n svg').first().getAttribute('data-glyph'),
+      'review',
+      'the count beside Money is marked',
+    );
+    for (const p of plans.slice(0, -1)) {
+      await jxRow('plan:' + p.id).click();
+      await jx.locator('#insp-title', { hasText: p.title }).waitFor();
+      await quiet(jx);
+      for (const r of p.stale_reasons)
+        assert(
+          (await jx.locator('#insp .flag').allInnerTexts()).includes(r.message),
+          `an earlier forecast, ${p.title}, shows its own reasons`,
+        );
+    }
+    await jxOpen('money', 'money:ending', 'Money position');
+    for (const m of latestReasons)
+      assert(
+        (await jx.locator('#insp .flag').allInnerTexts()).includes(m),
+        'the money position shows the latest forecast’s reason',
+      );
+    await noOldSentence('the money position');
+    // the deal analysis: its full view and its row
+    await jxOpen('deals', 'deal:' + deal.id, deal.title);
+    for (const r of deal.stale_reasons)
+      assert(
+        (await jx.locator('#insp .flag').allInnerTexts()).includes(r.message),
+        'the deal’s own view shows the server’s reason',
+      );
+    assert.equal(
+      await jxRow('deal:' + deal.id)
+        .locator('.r-right')
+        .innerText(),
+      'Needs review',
+    );
+    await noOldSentence('a deal analysis and the list of deals');
+    // Today's list of what changed holds both, each as needing review, for no named cause
+    await jxSource('today');
+    await quiet(jx);
+    const changedList = jx.getByRole('list', { name: /^Out of date or unreviewed/ });
+    for (const [key, sub] of [
+      ['deal:' + deal.id, 'Acquisition analysis · needs review'],
+      ...plans.map((p) => ['plan:' + p.id, 'Forecast · needs review']),
+    ])
+      assert.equal(
+        await changedList.locator(`.row[data-key="${key}"] .r-sub`).innerText(),
+        sub,
+        `Today lists ${key} as needing review`,
+      );
+    await noOldSentence('Today');
+    // No replaced step is on the map or in any list, and the page counts what the server counts.
+    const stats = marked.stats;
+    const pageCounts = await jx.evaluate(() => ({
+      steps: M.steps.length,
+      verified: M.verified,
+      na: M.na,
+      review: M.steps.filter((x) => x.task.state === 'needs_review').length,
+      replacedInModel: M.steps.filter((x) => x.task.state === 'superseded').length,
+      lineTotal: M.lines.reduce((n, l) => n + l.steps.length, 0),
+      emptyLines: M.lines.filter((l) => !l.steps.length).length,
+    }));
+    assert.deepEqual(
+      pageCounts,
+      {
+        steps: stats.tasks,
+        verified: stats.verified,
+        na: stats.not_applicable,
+        review: stats.needs_review,
+        replacedInModel: 0,
+        lineTotal: stats.tasks,
+        emptyLines: 0,
+      },
+      'the page’s totals are the server’s, and no replaced step is among them',
+    );
+    const todayHead = await jx.locator('#list .today-head').innerText();
+    assert(
+      todayHead.includes(`${stats.tasks} steps on`),
+      `Today counts ${stats.tasks} steps: ${todayHead}`,
+    );
+    assert(todayHead.includes(`${stats.verified} verified`));
+    if (stats.needs_review) assert(todayHead.includes(`${stats.needs_review} need review`));
+    if (stats.not_applicable) assert(todayHead.includes(`${stats.not_applicable} not applicable`));
+    const lineCounts = await jx
+      .locator('#src-nav .src .bul')
+      .evaluateAll((bs) => bs.map((b) => b.closest('.src').querySelector('.n').textContent));
+    assert.equal(
+      lineCounts.reduce((n, c) => n + Number(c.split('/')[1]), 0),
+      stats.tasks,
+      'the lines’ totals add up to the server’s count of steps',
+    );
+    assert.equal(
+      lineCounts.reduce((n, c) => n + Number(c.split('/')[0]), 0),
+      stats.verified,
+      'and their verified counts to its count of verified steps',
+    );
+    assert.equal(
+      await jx.locator('#src-nav .src[data-src="journey"] .n').innerText(),
+      `${stats.tasks - stats.verified - stats.not_applicable} to go`,
+    );
+    const sources = await jx
+      .locator('#src-nav .src')
+      .evaluateAll((x) => x.map((el) => el.dataset.src));
+    for (const id of sources) {
+      await jxSource(id);
+      if (id === 'history')
+        await jx.locator('#list .grp', { hasText: 'Events' }).waitFor({ state: 'attached' });
+      await quiet(jx);
+      for (const t of gone) {
+        assert.equal(
+          await jx.locator(`#list .row[data-key$="${t.id}"]`).count(),
+          0,
+          `${id}: the replaced step “${t.title}” is in no list`,
+        );
+        assert.equal(
+          await jx.locator(`#insp [data-id="${t.id}"]`).count(),
+          0,
+          `${id}: nor on the map`,
+        );
+      }
+    }
+    await jxSource('journey');
+    await jx.locator('#insp .mapbox').waitFor();
+    await quiet(jx);
+    assert.equal(
+      await jx.locator('#insp .mp-tall .stn').count(),
+      stats.tasks,
+      'one station for each live step',
+    );
+    // the business shows its new jurisdiction
+    assert.match(await jx.locator('#insp').innerText(), /Jurisdiction\s+GB/);
+    // A replaced step is reached from the evidence it cites, and opens read-only.
+    const citing = gone.find((t) => (t.data.evidence_ids || []).length);
+    assert(citing, 'a replaced step cites evidence, so it can be reached from that evidence');
+    const cited = marked.objects.find((o) => o.id === citing.data.evidence_ids[0]);
+    await jxOpen('evidence', 'ev:' + cited.id, cited.title);
+    const historyList = jx
+      .locator('#insp .i-sec')
+      .filter({ has: jx.locator('h3', { hasText: 'Cited by replaced steps' }) });
+    assert.doesNotMatch(
+      await jx
+        .locator('#insp .i-sec')
+        .filter({ has: jx.locator('h3', { hasText: /^Used by/ }) })
+        .innerText(),
+      new RegExp(citing.title),
+      'a replaced step is not counted among the evidence’s uses',
+    );
+    await historyList.locator('.att-row', { hasText: citing.title }).getByRole('button').click();
+    await jx.locator('#insp-title', { hasText: citing.title }).waitFor();
+    await quiet(jx);
+    const replacedView = await jx.locator('#insp').innerText();
+    assert(
+      replacedView.includes(
+        'This step was replaced when the planning jurisdiction changed from undecided to GB.',
+      ),
+      'it says in plain words that the step was replaced, and why',
+    );
+    assert.doesNotMatch(replacedView, /undefined|Cannot read|TypeError/);
+    assert.equal(
+      await jx.locator('#insp [data-action="tx"], #insp #tx-form').count(),
+      0,
+      'it offers no decision',
+    );
+    assert.equal(await jx.locator('#list .row[aria-current="true"]').count(), 0);
+    // The business form says how the jurisdiction is changed, and that it cannot change it.
+    await jxRow('map:all').click();
+    await jx.locator('#insp').getByRole('button', { name: 'Edit business', exact: true }).click();
+    const intro = await jx.locator('#dialog #active-form > p').first().innerText();
+    assert.equal(
+      intro,
+      'Changes reopen completed work for review. This form cannot change the jurisdiction: an owner or reviewer changes it as a separate, recorded decision with a reason, using the API or the foundry jurisdiction command.',
+    );
+    await jx.locator('#dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+    // the page remembers the business last opened, for every page on this sign-in; the checks
+    // below reload a page and expect the workflow test business, as it was before this block
+    await jx.locator('#business-select').selectOption(bid);
+    await jx.locator('#list .th-sub', { hasText: testName }).waitFor();
+    await jx.close();
+
     // Stored addresses: only http and https become links. The server refuses anything else, so
     // the snapshot is altered on its way to the page. The currency code is one Intl rejects.
     await onBusiness(bid, testName);
@@ -2332,7 +2598,7 @@ async function main() {
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, marks on earlier analyses after a jurisdiction change, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
