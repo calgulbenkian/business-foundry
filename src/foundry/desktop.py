@@ -41,6 +41,9 @@ APP_NAME = "Business Foundry"
 # far longer. The duration adds little protection: the code is 256 random bits, single use,
 # held only in memory and handed straight to the window. So the limit is generous, and a window
 # that still misses it is sent a fresh code (up to LAUNCH_ATTEMPTS in all) instead of a dead end.
+# It and LAUNCH_GRACE_SECONDS are counted on time.monotonic(), LaunchSignIn's default clock, so on
+# macOS and Linux time the computer spends asleep does not count towards them (SignalShutdown says
+# why, and what Windows does).
 LAUNCH_CODE_SECONDS = 180
 LAUNCH_ATTEMPTS = 3
 LAUNCH_GRACE_SECONDS = 5
@@ -54,11 +57,11 @@ SESSION_DAYS = 30
 SERVER_START_SECONDS = 15
 SHUTDOWN_SECONDS = 10
 # After a termination signal the app ends its own process SIGNAL_EXIT_SECONDS after it read the
-# signal at the latest, whatever the window, the server or the database are doing. Time the
-# computer spends asleep does not count towards it (SignalShutdown says why); if the process is
-# paused, or the computer is too busy to run it, when the time is up, it ends as soon as it runs
-# again. The window first has SIGNAL_CLOSE_SECONDS to close the normal way; if it has not, the
-# app runs the same cleanup itself in the time that remains.
+# signal at the latest, whatever the window, the server or the database are doing. On macOS and
+# Linux, time the computer spends asleep does not count towards it (SignalShutdown says why); if
+# the process is paused, or the computer is too busy to run it, when the time is up, it ends as
+# soon as it runs again. The window first has SIGNAL_CLOSE_SECONDS to close the normal way; if it
+# has not, the app runs the same cleanup itself in the time that remains.
 SIGNAL_EXIT_SECONDS = 30
 SIGNAL_CLOSE_SECONDS = 10
 
@@ -1027,10 +1030,14 @@ class SignalShutdown:
       SIGNAL_EXIT_SECONDS later it ends the process with ``os._exit``. It takes no lock and
       writes no log, so nothing the window, the server, the database or the log does can hold
       it, and it ends the process then even if ``main`` never returns. The time is counted on
-      ``time.monotonic()``, which does not advance while the computer is asleep, so time asleep
-      does not count towards the limit. The reader can end the process only while the process
-      is being run: if it is paused, or the computer is too busy to run it, when the limit is
-      up, the process ends as soon as it runs again.
+      ``time.monotonic()``. On macOS that is ``mach_absolute_time()`` and on Linux
+      ``CLOCK_MONOTONIC``, which by their manuals do not advance while the computer is asleep,
+      so there time asleep does not count towards the limit. On Windows it is
+      ``GetTickCount64()`` before Python 3.13 and ``QueryPerformanceCounter()`` from 3.13, and
+      Microsoft's documentation says both count time asleep; that has not been tested. The
+      reader can end the process only while the process is being run: if it is paused, or the
+      computer is too busy to run it, when the limit is up, the process ends as soon as it runs
+      again.
     - The shutdown thread closes the window, from a thread of its own (pywebview's ``destroy``
       can wait for the GUI for a long time). That runs the same shutdown as the close button.
       If the app has not finished stopping SIGNAL_CLOSE_SECONDS after the signal, it starts
