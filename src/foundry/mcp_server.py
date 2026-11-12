@@ -232,7 +232,7 @@ def build_server():
             "there is none, or it is stale, offer to generate one (generate_document with "
             "template='readiness_report'). Then inspect tasks and their blockers, records still at "
             "assumption or reported certainty without reviewed evidence, and deals, forecasts or "
-            "documents marked stale (a stale deal or forecast lists why in stale_reasons).\n"
+            "documents marked stale (each stale deal, forecast or document lists why in stale_reasons).\n"
             "Step 3: summarize the gaps for the human, grouped by severity, and ask before making any "
             "change.\n\n" + rules
         )

@@ -16,6 +16,10 @@ TITLES = {
     "investment_memo": "Investment memo",
 }
 
+# Templates whose text states which obligations are past their due date. That standing changes when the
+# calendar does, so the snapshot also marks these stale when it would now read differently.
+OVERDUE_TEMPLATES = frozenset({"readiness_report"})
+
 
 ASCII_PUNCTUATION = frozenset(string.punctuation)
 MARKUP_CHARACTERS = re.compile(r"[`*\[|\\~_<&]")
@@ -34,6 +38,11 @@ def is_markup(text, i) -> bool:
     after them, which may come from another field. An asterisk or an underscore with a space on both
     sides cannot open or close emphasis, and neither can an underscore inside a word; anywhere else,
     including at the start or the end of the text, they count.
+
+    A single tilde is left as typed. The parser this rule is checked against strikes through only between
+    double tildes, and a backslash before every tilde would show in plain-text views of ordinary text such
+    as "~3 days". A viewer that also strikes through between single tildes, as GitHub does, will do so;
+    that is a stated limit, and the words stay present.
     """
     ch, before, after = text[i], text[i - 1 : i], text[i + 1 : i + 2]
     spaced = before == " " and after == " "
@@ -696,25 +705,28 @@ def readiness_audit(r, tasks, currency) -> list[str]:
         money.append(f"Outstanding invoice balance: {fmt_money(stats['outstanding_invoices'])} {currency}.")
     if Decimal(str(stats.get("cash_collected") or 0)):
         money.append(f"Cash collected: {fmt_money(stats['cash_collected'])} {currency}.")
+    # The date the snapshot worked out overdue standing for. A snapshot built by hand may have none.
+    as_of = r.snapshot.get("as_of")
+    dated = f" as of {inline(as_of)}" if as_of is not None and inline(as_of) else ""
     flagged = [o for o in r.objects if o["kind"] == "obligation" and "overdue" in o]
     overdue = sorted((o for o in flagged if o["overdue"]), key=lambda o: str(o["data"].get("due_date")))
     if overdue or (not flagged and stats.get("overdue_obligations")):
         # A snapshot built without per-obligation flags carries only the count.
-        money.append(
-            f"Obligations past their due date: {inline(len(overdue) or stats['overdue_obligations'])}."
-        )
+        count = inline(len(overdue) or stats["overdue_obligations"])
+        money.append(f"Obligations past their due date{dated}: {count}.")
+    elif money:
+        money.append(f"No obligation is past its due date{dated}.")
+    else:
+        out += [
+            "No outstanding invoices or collected payments are recorded. "
+            f"No obligation is past its due date{dated}.",
+            "",
+        ]
     money = [f"- {x}" for x in money]
     for o in overdue:
         r.mention(o["id"])
         money.append(f"  - {inline(o['title'])} — due {inline(o['data'].get('due_date'))}.")
-    out += (
-        [*money, ""]
-        if money
-        else [
-            "No outstanding invoices, collected payments or overdue obligations are recorded.",
-            "",
-        ]
-    )
+    out += [*money, ""] if money else []
 
     out += ["## Every step", ""]
     listed = [t for t in tasks if step_class(t["state"]) != "replaced"]

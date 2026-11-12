@@ -1642,7 +1642,8 @@ def test_the_snapshot_fingerprint_is_the_same_hash_of_stored_rows_so_no_document
     assert snapshot["source_fingerprint"] == expected
     documents = [o for o in snapshot["objects"] if o["kind"] == "document"]
     assert [d["stale"] for d in documents] == [True, False]
-    assert all(set(d) == set(documents[0]) for d in documents) and "stale_reasons" not in documents[0]
+    assert all(set(d) == set(documents[0]) for d in documents)
+    assert [[r["code"] for r in d["stale_reasons"]] for d in documents] == [["source_changed"], []]
 
 
 def test_every_reader_sees_the_same_mark_http_agent_adapter_and_document(setup, client):

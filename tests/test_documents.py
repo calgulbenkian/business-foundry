@@ -40,6 +40,17 @@ def index_rows(content):
     return [[c.strip() for c in re.split(r"(?<!\\)\|", x)[1:-1]] for x in rows[2:]]
 
 
+def fix_today(monkeypatch, day):
+    """Fake the calendar date the service reads, as test_an_obligation_due_today_is_not_overdue does."""
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls.fromisoformat(day)
+
+    monkeypatch.setattr("foundry.service.date", FixedDate)
+
+
 def section(content, heading):
     """Lines under a '## ' heading up to the next '## ' heading, blank lines dropped."""
     lines = content.splitlines()
@@ -172,7 +183,8 @@ def task_ids(harbor):
     return {o["id"] for o in s.snapshot(a, harbor["bid"])["objects"] if o["kind"] == "task"}
 
 
-def test_readiness_report_audits_the_workspace_in_order(harbor):
+def test_readiness_report_audits_the_workspace_in_order(harbor, monkeypatch):
+    fix_today(monkeypatch, "2030-06-01")
     report = generate(harbor, "readiness_report")
     headings = [x for x in report.splitlines() if x.startswith("## ")]
     assert headings == [
@@ -227,7 +239,7 @@ def test_readiness_report_audits_the_workspace_in_order(harbor):
         "- Risk: Clients may not switch",
     ]
     assert section(report, "## Money and deadlines") == [
-        "- Obligations past their due date: 1.",
+        "- Obligations past their due date as of 2030-06-01: 1.",
         "  - Quarterly sales tax filing — due 2020-01-31.",
     ]
     steps = section(report, "## Every step")
@@ -476,8 +488,9 @@ def test_rendering_is_pure_and_deterministic(harbor):
     assert snapshot == original
 
 
-def test_empty_business_renders_every_template_with_explicit_empty_sections(setup):
+def test_empty_business_renders_every_template_with_explicit_empty_sections(setup, monkeypatch):
     _, s, a, bid, _ = setup
+    fix_today(monkeypatch, "2030-06-01")
     snapshot = s.snapshot(a, bid)
     for template in ("business_plan", "structure_options", "contract_brief", "operating_manual"):
         _, content = render_document(template, snapshot)
@@ -501,7 +514,8 @@ def test_empty_business_renders_every_template_with_explicit_empty_sections(setu
         "No business records have been added yet.",
     ]
     assert section(report, "## Money and deadlines") == [
-        "No outstanding invoices, collected payments or overdue obligations are recorded."
+        "No outstanding invoices or collected payments are recorded. "
+        "No obligation is past its due date as of 2030-06-01."
     ]
     bare = {**snapshot, "objects": [], "stats": {}}
     _, report = render_document("readiness_report", bare)
@@ -536,7 +550,11 @@ def test_demonstration_business_renders_with_banner_and_unchanged_trail(setup):
     assert (
         section(report, "## Where things stand")[0] == "24 steps are tracked: 17 finished and 7 still open."
     )
-    assert section(report, "## Money and deadlines") == ["- Cash collected: 4,000.00 USD."]
+    # The demonstration's dates follow the day it was seeded, so its obligation is not yet due.
+    assert section(report, "## Money and deadlines") == [
+        "- Cash collected: 4,000.00 USD.",
+        f"- No obligation is past its due date as of {snapshot['as_of']}.",
+    ]
 
 
 def bare_snapshot(objects, **business):
@@ -805,7 +823,8 @@ def test_an_approved_or_submitted_step_with_open_prerequisites_names_the_refused
     ]
 
 
-def test_overdue_obligations_are_named_with_their_due_dates(harbor):
+def test_overdue_obligations_are_named_with_their_due_dates(harbor, monkeypatch):
+    fix_today(monkeypatch, "2030-06-01")
     _, s, a, _, _ = harbor["setup"]
     bid = harbor["bid"]
     for title, due in (
@@ -830,7 +849,7 @@ def test_overdue_obligations_are_named_with_their_due_dates(harbor):
     assert snapshot["stats"]["overdue_obligations"] == 2
     report = generate(harbor, "readiness_report")
     assert section(report, "## Money and deadlines") == [
-        "- Obligations past their due date: 2.",
+        "- Obligations past their due date as of 2030-06-01: 2.",
         "  - Old payroll filing — due 2001-06-30.",
         "  - Quarterly sales tax filing — due 2020-01-31.",
     ]
@@ -867,7 +886,7 @@ def test_an_obligation_due_today_is_not_overdue(setup, monkeypatch):
     }
     _, report = render_document("readiness_report", snapshot)
     assert section(report, "## Money and deadlines") == [
-        "- Obligations past their due date: 1.",
+        "- Obligations past their due date as of 2030-06-01: 1.",
         "  - Yesterday — due 2030-05-31.",
     ]
 
@@ -879,6 +898,61 @@ def test_a_snapshot_without_obligation_flags_falls_back_to_the_count():
     snapshot["stats"] = {"overdue_obligations": 1}
     _, report = render_document("readiness_report", snapshot)
     assert section(report, "## Money and deadlines") == ["- Obligations past their due date: 1."]
+
+
+def test_the_report_states_the_date_overdue_standing_was_worked_out_for_when_the_snapshot_has_one():
+    filing = obj("obligation", 1, "Filing", "reported", due_date="2001-01-01", evidence_ids=[])
+    cases = [
+        (
+            {},
+            [],
+            None,
+            [
+                "No outstanding invoices or collected payments are recorded. No obligation is past its due date."
+            ],
+        ),
+        ({}, [], "2030-06-01", None),
+        (
+            {"cash_collected": "5"},
+            [],
+            None,
+            ["- Cash collected: 5.00 USD.", "- No obligation is past its due date."],
+        ),
+        (
+            {"outstanding_invoices": "7", "overdue_obligations": 0},
+            [{**filing, "overdue": False}],
+            "2030-06-01",
+            [
+                "- Outstanding invoice balance: 7.00 USD.",
+                "- No obligation is past its due date as of 2030-06-01.",
+            ],
+        ),
+        (
+            {"overdue_obligations": 1},
+            [{**filing, "overdue": True}],
+            "# 2030-06-01",
+            ["- Obligations past their due date as of \\# 2030-06-01: 1.", "  - Filing — due 2001-01-01."],
+        ),
+    ]
+    for stats, objects, as_of, expected in cases:
+        snapshot = bare_snapshot(objects)
+        snapshot["stats"] = stats
+        if as_of is not None:
+            snapshot["as_of"] = as_of
+        if expected is None:
+            expected = [
+                "No outstanding invoices or collected payments are recorded. "
+                "No obligation is past its due date as of 2030-06-01."
+            ]
+        _, report = render_document("readiness_report", snapshot)
+        assert section(report, "## Money and deadlines") == expected
+
+
+def test_the_renderer_reads_no_clock():
+    import foundry.documents as documents
+
+    source = open(documents.__file__, encoding="utf-8").read()
+    assert "datetime" not in source and "today" not in source and "time." not in source
 
 
 NAMED_KINDS = {

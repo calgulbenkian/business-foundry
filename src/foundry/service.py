@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal
 
 from . import catalog, finance
+from .documents import OVERDUE_TEMPLATES
 from .models import DealInputs, ForecastInputs
 from .store import DomainError, Store, canonical, digest, now, uid
 
@@ -143,6 +144,72 @@ def jurisdiction_changed_reason(kind, saved, current):
         f"It is now {current}. Check its assumptions, the tax rate among them, and {ANALYSIS_REDO[kind]} "
         "before relying on these figures.",
     }
+
+
+def is_overdue(obligation, on):
+    """Whether an obligation is past its due date on the date ``on``, an ISO date string.
+
+    One due on that date is not overdue. The snapshot's flags, its count and the stale rule for documents
+    all ask this question here, so they cannot disagree.
+    """
+    due = obligation["data"].get("due_date")
+    return bool(due) and due < on
+
+
+def readable_date(value):
+    """Whether a stored value reads as one calendar date and prints back as the same text.
+
+    Python 3.11 and later also read forms such as 20261112, which must not be compared as text with due
+    dates, so only the exact YYYY-MM-DD text a date prints as is accepted.
+    """
+    try:
+        return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+# A generated document keeps the text it was rendered with. The snapshot marks it stale and lists why, in
+# the same shape as a deal analysis or a forecast.
+def source_changed_reason():
+    return {
+        "code": "source_changed",
+        "message": "The business or its records have changed since this document was generated. "
+        "Generate a new version before relying on it.",
+    }
+
+
+def overdue_changed_reason(as_of, today):
+    return {
+        "code": "overdue_changed",
+        "as_of": as_of,
+        "today": today,
+        "message": f"This document says which obligations were past their due date as of {as_of}. "
+        "That has changed since. Generate a new version before relying on it.",
+    }
+
+
+def as_of_unreadable_reason():
+    return {
+        "code": "as_of_unreadable",
+        "message": "The date this document was worked out for cannot be read, so it cannot be shown to be "
+        "current. Generate a new version before relying on it.",
+    }
+
+
+def document_stale_reasons(document, fingerprint, obligations, today):
+    """Why a generated document is out of date, in order; an empty list when it is current."""
+    data = document["data"]
+    reasons = []
+    if data["source_fingerprint"] != fingerprint:
+        reasons.append(source_changed_reason())
+    # A document generated before the date was stored has no as_of key; only the fingerprint applies.
+    if data.get("template") in OVERDUE_TEMPLATES and "as_of" in data:
+        as_of = data["as_of"]
+        if not readable_date(as_of):
+            reasons.append(as_of_unreadable_reason())
+        elif any(is_overdue(o, as_of) != is_overdue(o, today) for o in obligations):
+            reasons.append(overdue_changed_reason(as_of, today))
+    return reasons
 
 
 def evaluate(model, *args):
@@ -815,6 +882,7 @@ class Service:
         business = self.store.business(con, bid)
         objects = self.store.objects(con, bid)
         by_id = {o["id"]: o for o in objects}
+        # The one clock read: every overdue flag, the count, as_of and the document marks use this date.
         today = date.today().isoformat()
         fingerprint = digest(
             canonical({"business": business, "objects": [o for o in objects if o["kind"] != "document"]})
@@ -822,11 +890,14 @@ class Service:
         # Marks below are worked out on every read and added after the fingerprint; nothing is stored.
         saved_under = self.saved_jurisdictions(con, bid)
         jurisdiction = business["data"]["jurisdiction"]
+        obligations = [o for o in objects if o["kind"] == "obligation"]
         for obj in objects:
             if obj["kind"] == "task":
                 obj["blockers"] = self.blockers(con, bid, obj)
             if obj["kind"] == "document":
-                obj["stale"] = obj["data"]["source_fingerprint"] != fingerprint
+                reasons = document_stale_reasons(obj, fingerprint, obligations, today)
+                obj["stale"] = bool(reasons)
+                obj["stale_reasons"] = reasons
             if obj["kind"] in ANALYSIS_NAMES:
                 reasons = []
                 if any(by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()):
@@ -848,8 +919,7 @@ class Service:
                 ]
                 obj["evidence_warning"] = any(by_id[e]["state"] != "verified" for e in refs if e)
             if obj["kind"] == "obligation":
-                due = obj["data"].get("due_date")
-                obj["overdue"] = bool(due) and due < today
+                obj["overdue"] = is_overdue(obj, today)
         # Readiness counts cover live steps only; superseded steps stay in objects as history.
         tasks = [o for o in objects if o["kind"] == "task" and live(o)]
         stats = {
@@ -877,6 +947,7 @@ class Service:
             "business": business,
             "objects": objects,
             "stats": stats,
+            "as_of": today,
             "source_fingerprint": fingerprint,
             "catalog": catalog.description(),
         }
@@ -898,6 +969,8 @@ class Service:
                 "source_ids": [o["id"] for o in snapshot["objects"] if o["kind"] != "document"],
                 "business_version": snapshot["business"]["version"],
                 "generated_at": now(),
+                # The date the text's overdue standing was worked out for, from the same snapshot.
+                "as_of": snapshot["as_of"],
             }
             return self.store.add(con, bid, "document", title, data, actor, "draft")
 
