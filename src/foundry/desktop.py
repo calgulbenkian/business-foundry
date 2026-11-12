@@ -289,7 +289,10 @@ class _Unconvertible(Exception):
 
 
 def _is_number(value) -> bool:
-    """Whether a ``%d`` or ``%f`` format accepts ``value``, as CPython's PyNumber_Check decides."""
+    """The first test a ``%d`` or ``%f`` format makes of ``value``, as CPython's PyNumber_Check decides.
+
+    A ``complex`` passes it, and the format then refuses it.
+    """
     methods = ("__index__", "__int__", "__float__")
     return isinstance(value, complex) or any(hasattr(type(value), name) for name in methods)
 
@@ -299,8 +302,11 @@ class _Argument:
 
     Each conversion the format asks for converts the real argument then and returns the redacted
     text of that conversion, so a precision such as ``%.20s`` shortens text that is already
-    redacted, and the text that was checked is the text that is printed. Number conversions
-    (``%d``, ``%x``, ``%f``, ``%c``) are passed to the real value.
+    redacted, and the text that was checked is the text that is printed. A number conversion
+    (``%d``, ``%x``, ``%f``, ``%c``) reaches the real value only when that value is a number, as
+    Python's own check decides; otherwise it raises ``TypeError``, as the format would without the
+    stand-in. Two things a stand-in cannot be: the character for ``%c`` when the real value is text
+    (an instance of a ``str`` subclass), and a ``*`` width or precision, which must be a real ``int``.
     """
 
     __slots__ = ("_value", "_redaction")
@@ -361,13 +367,17 @@ class LogRedaction(logging.Filter):
     redacted before the format can shorten it (``%.20s``); an exception is formatted once too.
     In the message, the exception text and the stack, a whole secret is replaced, and so is
     everything after ``/desktop/start?`` up to the next whitespace. The record then holds only
-    that text (``args`` and ``exc_info`` are None), so no handler converts anything again: an
-    argument is converted as many times as the format names it, however many handlers there are,
-    and one whose text changes between conversions prints its first text everywhere. A start
-    address is recognised by the text ``/desktop/start?`` only. Outside one, a secret is
-    recognised only as its exact text, not as a piece or written another way (percent-encoded,
-    say). The record's other fields, such as the logger's name, are not checked. A record that
-    cannot be finished is withheld.
+    that text (``args`` and ``exc_info`` are None), so no handler converts anything again. When the
+    arguments fit the message, an argument is converted once for each place the format names it,
+    however many handlers there are, and every handler prints the text of those conversions.
+    Arguments that do not fit are written after the message as their redacted ``repr``, which
+    converts again any the format had already converted. An argument that is not exactly a
+    ``str``, ``int``, ``float``, ``bool`` or ``None`` is given to the format as a stand-in, which is
+    neither a ``str`` nor an ``int``, so three forms that fit for Python alone are written that way
+    too (``SECURITY.md`` names them). A start address is recognised by the text ``/desktop/start?``
+    only. Outside one, a secret is recognised only as its exact text, not as a piece or written
+    another way (percent-encoded, say). The record's other fields, such as the logger's name, are
+    not checked. A record that cannot be finished is withheld.
 
     As second layers it is also a filter on the handlers present when logging is set up and when
     the window library loads, and the log file's formatter redacts each finished line. The first
