@@ -4392,6 +4392,186 @@ print(json.dumps({
         });
       },
     );
+    // Round 11. A person who may write and is not an owner: a reviewer, then an operator. Every
+    // place the page decides by isOwner() is held here against each of them: for a viewer, the
+    // wider questions canWrite() and canReview() are false too, so a version that asks one of them
+    // in place of isOwner() passes every viewer case. The controls each role may use are checked
+    // as well, so the case fails if the page hides too much as well as too little.
+    const writerKeys = {};
+    const writerKey = async (role) =>
+      (writerKeys[role] ||= await call('/principals', 'POST', {
+        name: `Browser ${role} who may write`,
+        role,
+        business_ids: [bid],
+      }));
+    const writerRoles = {
+      reviewer: {
+        label: 'Reviewer',
+        certainty: ['assumption', 'reported', 'verified'],
+        moves: ['Approve…', 'Start work…', 'Reopen for review…', 'Not applicable…'],
+        move: 'approved',
+        other: 'operator',
+      },
+      operator: {
+        label: 'Operator',
+        certainty: ['assumption', 'reported'],
+        moves: ['Start work…', 'Reopen for review…'],
+        move: 'in_progress',
+        other: 'reviewer',
+      },
+    };
+    for (const [role, expected] of Object.entries(writerRoles))
+      lateCase(`round 11: a ${role} may write, and has none of an owner’s controls`, async () => {
+        const me = await writerKey(role);
+        // another key, one that an owner could revoke, for the revoke-key action sent below
+        const other = await writerKey(expected.other);
+        const prepared = (await snapshotOf(bid)).objects.find(
+          (o) => o.kind === 'task' && o.state === 'prepared' && !o.data.deal_id,
+        );
+        assert(prepared, 'the test business has a prepared step');
+        const writer = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
+        try {
+          const p = await newPage(writer);
+          p.on('pageerror', (e) => errors.push(e.message));
+          // every request this page makes about access keys, whatever its method
+          const keyRequests = [];
+          p.on('request', (r) => {
+            const path = new URL(r.url()).pathname;
+            if (path === '/api/principals' || path.startsWith('/api/principals/'))
+              keyRequests.push(`${r.method()} ${path}`);
+          });
+          await p.goto(origin);
+          await signInAs(p, me.token);
+          await quiet(p);
+          assert.equal(await p.evaluate(() => state.actor?.role), role, `the ${role} is named`);
+          assert.equal(await p.locator('#business-select').inputValue(), bid);
+          // the toolbar and the foot of the sources name them and their role, with no + New business
+          assert.equal(
+            await p.locator('#actor-name').innerText(),
+            `${me.name} · ${expected.label}`,
+          );
+          assert.equal(
+            await p.locator('#src-foot .account p').innerText(),
+            `Signed in as ${me.name} · ${expected.label}`,
+          );
+          assert.equal(
+            await p.locator('[data-action="new-business"]:visible').count(),
+            0,
+            'no + New business anywhere on the page',
+          );
+          // the toolbar's control, clicked from the page, opens no form
+          await clickFromPage(p, NEW_BUSINESS);
+          await quiet(p);
+          assert.deepEqual(await dialogIn(p), noDialog, 'a click on + New business opens no form');
+          // Access & assistants: no + Create access key, no key list, no owner's section
+          await p.locator('#src-nav .src[data-src="access"]').click();
+          await p.locator('#list .row[data-key="ai:overview"]').waitFor();
+          await quiet(p);
+          assert.deepEqual(
+            await p.locator('#list-right button').allInnerTexts(),
+            [],
+            'no + Create access key',
+          );
+          assert.deepEqual(await p.locator('#list .grp').allInnerTexts(), [], 'no Access keys');
+          assert.deepEqual(
+            await p.locator('#list .row').evaluateAll((rows) => rows.map((r) => r.dataset.key)),
+            ['ai:overview'],
+            'the one row is Assistants and sharing',
+          );
+          await p.locator('#list .row[data-key="ai:overview"]').click();
+          await p.locator('#insp-title', { hasText: 'Assistants and sharing' }).waitFor();
+          await quiet(p);
+          assert.deepEqual(
+            await p.locator('#insp .i-sec h3').allInnerTexts(),
+            ['Optional assistant review', 'Your business records'],
+            'no People and access keys',
+          );
+          assert.equal(await p.locator('[data-action="revoke-key"]').count(), 0, 'no Revoke');
+          // an owner's forms, reached by actions sent from the page, open nothing
+          for (const [action, id] of [
+            ['new-business', ''],
+            ['new-key', ''],
+            ['revoke-key', other.id],
+          ]) {
+            await actionFromPage(p, action, id);
+            await quiet(p);
+            assert.deepEqual(await dialogIn(p), noDialog, `${action}: no form for the ${role}`);
+          }
+          // a record form they may use, with the evidence statuses of their role
+          await p.locator('#src-nav .src[data-src="records"]').click();
+          await p
+            .locator('#list-right')
+            .getByRole('button', { name: '+ Add record', exact: true })
+            .click();
+          await p.locator('#dialog-title', { hasText: 'Add business record' }).waitFor();
+          assert.deepEqual(await dialogIn(p), { open: true, title: 'Add business record' });
+          assert.deepEqual(
+            await p
+              .locator('#dialog select[name="certainty"] option')
+              .evaluateAll((os) => os.map((o) => o.value)),
+            expected.certainty,
+            'the evidence statuses of the role',
+          );
+          await p.getByRole('button', { name: 'Close dialog', exact: true }).click();
+          assert.equal((await dialogIn(p)).open, false, 'the record form closes');
+          // a decision on a prepared step that their role may make, and only those
+          const category = String(prepared.data.category);
+          await p
+            .locator('#src-nav .src .lbl', {
+              hasText: new RegExp(`^${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`),
+            })
+            .click();
+          await p.locator(`#list .row[data-key="step:${prepared.id}"]`).click();
+          await p.locator('#insp-title', { hasText: prepared.title }).waitFor();
+          await quiet(p);
+          assert.deepEqual(
+            await p.locator('#insp [data-action="tx"]').allInnerTexts(),
+            expected.moves,
+            'the moves of the role',
+          );
+          await p.locator(`#insp [data-action="tx"][data-to="${expected.move}"]`).click();
+          await p.locator('#tx-form').waitFor();
+          assert.equal(
+            await p.locator('#tx-form [type=submit]').innerText(),
+            'Record decision',
+            'the decision form opens',
+          );
+          await p.locator('#tx-form').getByRole('button', { name: 'Not yet', exact: true }).click();
+          await quiet(p);
+          assert.equal(await p.locator('#tx-form').count(), 0, 'and closes unsent');
+          // a key the test serves as covering no business: the start page offers no business form
+          await p.route(
+            (u) => u.pathname === '/api/businesses',
+            (r) => (r.request().method() === 'GET' ? r.fulfill({ json: [] }) : r.continue()),
+          );
+          await p.reload();
+          await p.locator('#insp-title', { hasText: 'Start your first business' }).waitFor();
+          await quiet(p);
+          assert.equal(
+            await p.locator('#actor-name').innerText(),
+            `${me.name} · ${expected.label}`,
+          );
+          assert.equal(
+            await p.locator('#insp .prose').first().innerText(),
+            'This access key does not cover any business yet. Ask the workspace owner to give it access to one.',
+          );
+          assert.deepEqual(
+            await p.locator('#insp button').allInnerTexts(),
+            [],
+            'no Create a business',
+          );
+          assert.equal(
+            await p.locator('[data-action="new-business"]:visible').count(),
+            0,
+            'no + New business anywhere on the start page',
+          );
+          await p.unroute((u) => u.pathname === '/api/businesses');
+          // the page never asked about access keys, in either load
+          assert.deepEqual(keyRequests, [], 'no request about access keys');
+        } finally {
+          await writer.close();
+        }
+      });
     // Round 9, H. A step's history served with entries that are not objects among real ones: its
     // view opens and lists the real entries only.
     lateCase('round 9 H: a history holding entries that are not objects', async () => {
@@ -5370,7 +5550,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
