@@ -1089,6 +1089,115 @@ def test_business_profile_repeated_past_version_is_reported(setup):
     assert_clean(service, actor, other)
 
 
+# An event whose payload id is not its own object id is not a snapshot of any record: it never
+# becomes the newest chained snapshot and records no version, whatever version it carries.
+
+FOREIGN_OBJECT_IDS = [
+    pytest.param("business", id="business-id"),
+    pytest.param("other", id="another-objects-id"),
+    pytest.param("unused", id="id-nothing-else-uses"),
+]
+
+FOREIGN_VERSIONS = [pytest.param(2, id="current-version"), pytest.param(99, id="unrecorded-version")]
+
+
+def foreign_object_id(setup, which):
+    _, service, actor, bid, _ = setup
+    if which == "business":
+        return bid
+    if which == "other":
+        return service.add_record(actor, bid, key(), record(title="Second buyer"))["id"]
+    return "object_nothing_else_uses"
+
+
+def foreign_snapshot(item, version):
+    return {
+        **item,
+        "title": "Never approved",
+        "data": {**item["data"], "details": "Never approved"},
+        "version": version,
+    }
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize("which", FOREIGN_OBJECT_IDS)
+def test_event_whose_payload_id_is_not_its_object_id_is_no_snapshot(setup, which, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    object_id = foreign_object_id(setup, which)
+    assert object_id != item["id"]
+    append_event(store, bid, object_id, canonical(foreign_snapshot(item, version)))
+    assert_clean(service, actor, bid)
+    exported = service.audit(actor, bid, True)["integrity"]
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+def test_event_naming_the_business_under_an_objects_id_is_no_snapshot(setup, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    _, current = business_versions(setup)
+    item = history(setup, versions=2)
+    forged = {**current, "data": {**current["data"], "name": "Never approved"}, "version": version}
+    append_event(store, bid, item["id"], canonical(forged), "business.updated")
+    assert_clean(service, actor, bid)
+    exported = service.audit(actor, bid, True)["integrity"]
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize(
+    "revision", [pytest.param(False, id="row"), pytest.param(True, id="row-and-revision")]
+)
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize("which", FOREIGN_OBJECT_IDS)
+def test_event_whose_payload_id_is_not_its_object_id_hides_no_change(setup, which, version, revision):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    oid = item["id"]
+    object_id = foreign_object_id(setup, which)
+    forged = foreign_snapshot(item, version)
+    with store.write() as con:
+        con.execute(
+            "UPDATE objects SET title=?,data=?,version=? WHERE id=?",
+            (forged["title"], canonical(forged["data"]), version, oid),
+        )
+        if revision and version == 2:
+            con.execute(
+                "UPDATE revisions SET snapshot=? WHERE object_id=? AND version=2", (canonical(forged), oid)
+            )
+        elif revision:
+            con.execute(
+                "INSERT INTO revisions VALUES(?,?,?,?,?)",
+                (oid, 99, canonical(forged), "principal_appender", APPENDED_AT),
+            )
+    if not revision:
+        expected = [f"Current record differs from history: {oid}", f"Revision mismatch: {oid}"]
+    elif version == 2:
+        expected = [
+            f"Current record differs from history: {oid}",
+            f"Historical revision differs from history: {oid} version 2",
+        ]
+    else:
+        expected = [
+            f"Current record differs from history: {oid}",
+            f"Revision has no recorded history: {oid} version 99",
+        ]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    append_event(store, bid, object_id, canonical(forged))
+    after = integrity(setup)
+    assert after["record_errors"] == expected
+    assert not after["valid"]
+    assert_clean(service, actor, other)
+
+
 UNUSABLE_VERSIONS = [
     pytest.param("2.0", id="float-2.0"),
     pytest.param("2e0", id="exponent-2e0"),
@@ -1214,6 +1323,19 @@ def test_documented_limit_appended_new_version_verifies(setup):
             (item["id"], 3, canonical(forged), "principal_appender", APPENDED_AT),
         )
     append_event(store, bid, item["id"], canonical(forged))
+    assert_clean(service, actor, bid)
+
+
+def test_documented_limit_appended_new_business_profile_version_verifies(setup):
+    # The business profile has no revision rows, so a matching profile is all an appended new version needs.
+    store, service, actor, bid, _ = setup
+    _, current = business_versions(setup)
+    forged = {**current, "data": {**current["data"], "name": "Never approved"}, "version": 3}
+    with store.write() as con:
+        con.execute("UPDATE businesses SET data=?,version=3 WHERE id=?", (canonical(forged["data"]), bid))
+    append_event(store, bid, bid, canonical(forged), "business.updated")
+    with store.read() as con:
+        assert con.execute("SELECT count(*) FROM revisions WHERE object_id=?", (bid,)).fetchone()[0] == 0
     assert_clean(service, actor, bid)
 
 
