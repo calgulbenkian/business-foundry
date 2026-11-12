@@ -2015,6 +2015,230 @@ def test_export_of_each_business_carries_only_its_own_ai_review(setup, first_ins
     assert exported_archive(service, actor, other)["ai_runs"] == [SECOND_RUN_ENTRY]
 
 
+# One business may hold several AI reviews, and every one of them is checked, exported and
+# reported on its own. The two reviews below are alike in state, data and created_at and differ
+# only in their ids. The first-stored has the id that sorts last, so storage order and id order
+# disagree: a version that read one row, or picked rows by id, would show.
+
+FIRST_STORED_RUN = "review_zulu"
+SECOND_STORED_RUN = "review_alpha"
+
+
+def add_two_ai_reviews(setup, first_chained=True, second_chained=True):
+    """Give the fixture's business two AI reviews, stored in this order: zulu, then alpha."""
+    store, _, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, chained=first_chained, run_id=FIRST_STORED_RUN)
+    add_ai_review(store, actor, bid, chained=second_chained, run_id=SECOND_STORED_RUN)
+    assert ai_call_ids_in_insertion_order(store) == ["review_zulu", "review_alpha"]
+
+
+def assert_audit_and_export_in_any_order(service, actor, bid, expected):
+    for export in (False, True):
+        result = audited(service, actor, bid, export)
+        assert sorted(result["record_errors"]) == sorted(expected)
+        assert result["valid"] is False
+
+
+# Rule: every AI review row of a business is compared with its event, not only one of them.
+def test_both_ai_reviews_of_one_business_are_checked(setup):
+    _, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    assert_audit_and_export(service, actor, bid, [])
+
+
+# Rule: the export carries every AI review row of a business, not only one of them.
+def test_both_ai_reviews_of_one_business_are_exported(setup):
+    _, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    # The two rows have the same created_at and the export orders by created_at only, so SQL does
+    # not fix which of them comes first. They are compared sorted by id.
+    assert sorted(runs, key=lambda run: run["id"]) == [
+        {
+            "id": "review_alpha",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+        {
+            "id": "review_zulu",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+    ]
+
+
+# Rule: a changed AI review is reported, whichever of a business's reviews it is.
+@pytest.mark.parametrize(
+    ("run_id", "expected"),
+    [
+        pytest.param(
+            "review_zulu", ["AI review differs from history: review_zulu"], id="first-stored-changed"
+        ),
+        pytest.param(
+            "review_alpha", ["AI review differs from history: review_alpha"], id="second-stored-changed"
+        ),
+    ],
+)
+def test_changed_ai_review_is_reported_whichever_of_two_it_is(setup, run_id, expected):
+    store, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    alter_ai_review(store, run_id)
+    assert_audit_and_export(service, actor, bid, expected)
+
+
+# Rule: when both of a business's AI reviews are changed, both are reported and nothing else.
+def test_both_changed_ai_reviews_of_one_business_are_reported(setup):
+    store, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    alter_ai_review(store, FIRST_STORED_RUN)
+    alter_ai_review(store, SECOND_STORED_RUN)
+    # The audit reads the rows with no ORDER BY, so SQL does not fix the order of these two
+    # messages. They are compared without regard to order.
+    assert_audit_and_export_in_any_order(
+        service,
+        actor,
+        bid,
+        ["AI review differs from history: review_zulu", "AI review differs from history: review_alpha"],
+    )
+
+
+# Rule: an AI review with no event is reported, whichever of a business's reviews it is.
+@pytest.mark.parametrize(
+    ("first_chained", "expected"),
+    [
+        pytest.param(
+            False, ["AI review differs from history: review_zulu"], id="first-stored-without-history"
+        ),
+        pytest.param(
+            True, ["AI review differs from history: review_alpha"], id="second-stored-without-history"
+        ),
+    ],
+)
+def test_ai_review_without_history_is_reported_whichever_of_two_it_is(setup, first_chained, expected):
+    _, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup, first_chained=first_chained, second_chained=not first_chained)
+    assert_audit_and_export(service, actor, bid, expected)
+
+
+# Rule: every run the history names and no row answers is reported, whichever it is, and in the
+# order its event entered the chain. The audit walks the chain to collect them, so that order is
+# fixed by the code: here the first-stored review's event comes first.
+@pytest.mark.parametrize(
+    ("deleted", "expected"),
+    [
+        pytest.param(
+            ["review_zulu"], ["Historical AI review missing: review_zulu"], id="first-stored-missing"
+        ),
+        pytest.param(
+            ["review_alpha"], ["Historical AI review missing: review_alpha"], id="second-stored-missing"
+        ),
+        pytest.param(
+            ["review_zulu", "review_alpha"],
+            ["Historical AI review missing: review_zulu", "Historical AI review missing: review_alpha"],
+            id="both-missing",
+        ),
+    ],
+)
+def test_missing_ai_review_is_reported_whichever_of_two_and_both(setup, deleted, expected):
+    store, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    with store.write() as con:
+        for run_id in deleted:
+            assert con.execute("DELETE FROM ai_calls WHERE id=?", (run_id,)).rowcount == 1
+    assert_audit_and_export(service, actor, bid, expected)
+
+
+# Rule: the export lists a business's AI reviews by created_at. The review created later is stored
+# first and has the id that sorts first, so neither storage order nor id order gives this list.
+# Rows with equal created_at come in an order the query does not fix, and no test pins that order.
+def test_export_lists_ai_reviews_of_one_business_by_created_at(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, run_id="review_created_later", created_at="2026-03-01T00:00:00+00:00")
+    add_ai_review(store, actor, bid, run_id="review_created_sooner", created_at="2026-02-01T00:00:00+00:00")
+    assert ai_call_ids_in_insertion_order(store) == ["review_created_later", "review_created_sooner"]
+    # The audit does not check created_at.
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_created_sooner",
+            "state": "unknown",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+        {
+            "id": "review_created_later",
+            "state": "unknown",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+    ]
+
+
+# Three businesses, each holding one AI review. Three give every kind of pair: two created one
+# after the other (first and second, second and third) and two that were not (first and third).
+# A version that grouped businesses, for example by odd and even rowid, would mix the first and
+# third. Known limit: a grouping by rowid modulo 3 or more keeps these three apart, and no fixed
+# number of businesses closes that.
+
+
+def three_businesses_with_ai_reviews(setup):
+    store, _, actor, first, _ = setup
+    second = second_business(setup)
+    third = second_business(setup)
+    add_ai_review(store, actor, first, run_id="review_first_business")
+    add_ai_review(store, actor, second, run_id="review_second_of_three")
+    add_ai_review(store, actor, third, run_id="review_third_business")
+    return first, second, third
+
+
+# Rule: each of three businesses checks and exports only its own AI review.
+def test_each_of_three_businesses_checks_and_exports_only_its_own_ai_review(setup):
+    _, service, actor, _, _ = setup
+    first, second, third = three_businesses_with_ai_reviews(setup)
+    for bid in (first, second, third):
+        assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, first)["ai_runs"] == [
+        {
+            "id": "review_first_business",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        }
+    ]
+    assert exported_archive(service, actor, second)["ai_runs"] == [
+        {
+            "id": "review_second_of_three",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        }
+    ]
+    assert exported_archive(service, actor, third)["ai_runs"] == [
+        {
+            "id": "review_third_business",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        }
+    ]
+
+
+# Rule: a changed AI review of one of three businesses is reported there and nowhere else.
+def test_changed_ai_reviews_of_three_businesses_are_reported_each_only_in_its_own(setup):
+    store, service, actor, _, _ = setup
+    first, second, third = three_businesses_with_ai_reviews(setup)
+    alter_ai_review(store, "review_third_business")
+    assert_audit_and_export(service, actor, first, [])
+    assert_audit_and_export(service, actor, second, [])
+    assert_audit_and_export(service, actor, third, ["AI review differs from history: review_third_business"])
+    alter_ai_review(store, "review_first_business")
+    assert_audit_and_export(service, actor, first, ["AI review differs from history: review_first_business"])
+    assert_audit_and_export(service, actor, second, [])
+    assert_audit_and_export(service, actor, third, ["AI review differs from history: review_third_business"])
+
+
 def test_export_digest_covers_the_archive_with_its_ai_review(setup):
     store, service, actor, bid, _ = setup
     add_ai_review(store, actor, bid)
@@ -2370,12 +2594,12 @@ def test_null_id_of_a_current_record_is_reported(setup):
     assert export_integrity(setup)["record_errors"] == expected
 
 
-def add_ai_review(store, actor, bid, chained=True, run_id="review_synthetic"):
+def add_ai_review(store, actor, bid, chained=True, run_id="review_synthetic", created_at=APPENDED_AT):
     data = {"note": "Synthetic run written for this test."}
     with store.write() as con:
         con.execute(
             "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
-            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), "unknown", APPENDED_AT),
+            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), "unknown", created_at),
         )
         if chained:
             store.event(
