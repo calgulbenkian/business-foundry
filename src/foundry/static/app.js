@@ -458,7 +458,7 @@ function documents() {
           .reverse()
           .map(
             (o) =>
-              `<article class="card doc-card"><div class="card-heading"><span class="eyebrow">${h(templates[o.data.template])}</span>${badge(o.stale ? 'needs_review' : 'draft')}</div><h3>${h(o.title)}</h3><p class="small">${h(dateTime(o.created_at))} · ${o.stale ? 'Source records have changed. Generate a new version.' : 'Reflects the current source records.'}</p><div class="actions">${action('document', 'Read draft', o.id)}<a class="secondary compact" href="/api/businesses/${h(state.bid)}/documents/${h(o.id)}/download">Download</a></div></article>`,
+              `<article class="card doc-card"><div class="card-heading"><span class="eyebrow">${h(templates[o.data.template])}</span>${badge(o.stale ? 'needs_review' : 'draft')}</div><h3>${h(o.title)}</h3><p class="small">${h(dateTime(o.created_at))} · ${o.stale ? (o.stale_reasons?.length ? 'Out of date. Open the draft to see why, then generate a new version.' : 'Out of date. Generate a new version.') : 'Reflects the current source records.'}</p><div class="actions">${action('document', 'Read draft', o.id)}<a class="secondary compact" href="/api/businesses/${h(state.bid)}/documents/${h(o.id)}/download">Download</a></div></article>`,
           )
           .join('')}</div>`
       : empty(
@@ -1085,7 +1085,7 @@ async function handle(a, id) {
     const o = find(id);
     showDialog(
       o.title,
-      `${o.stale ? '<div class="notice">Inputs have changed since this draft was generated.</div>' : ''}<pre class="document">${h(o.data.content)}</pre><a class="secondary" href="/api/businesses/${h(state.bid)}/documents/${h(id)}/download">Download Markdown</a>`,
+      `${o.stale_reasons?.length ? staleNotices(o) : o.stale ? '<div class="notice">This draft is out of date. Generate a new version.</div>' : ''}<pre class="document">${h(o.data.content)}</pre><a class="secondary" href="/api/businesses/${h(state.bid)}/documents/${h(id)}/download">Download Markdown</a>`,
     );
   } else if (a === 'inspect') {
     const o = find(id);
