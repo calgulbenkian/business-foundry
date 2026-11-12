@@ -3996,6 +3996,240 @@ print(json.dumps({
         'its view is drawn',
       );
     });
+    // Round 9, G1 to G6. Histories served by the test, each telling one sentence of the rule for the
+    // evidence a completed step relies on from the code that breaks it. Every step attaches nothing
+    // now, so what the page shows comes from the history alone.
+    lateCase(
+      'round 9 G1 to G6: each sentence of the rule for the evidence a step relies on',
+      async () => {
+        const [a, b] = await reviewedPair();
+        const [c] = await reviewedPair();
+        const steps = (await snapshotOf(bid)).objects.filter(
+          (o) => o.kind === 'task' && o.state !== 'superseded' && !o.data.deal_id,
+        );
+        assert(steps.length >= 7, 'seven steps to serve changed');
+        const [g1, g2, g3, g4, g5, g6, g6b] = steps;
+        const at = new Date().toISOString();
+        const to = (state, ids) => ({ to: state, evidence_ids: ids, at });
+        const served = {
+          // the last entry alone when no entry is prepared: B, not A
+          [g1.id]: ['verified', [to('approved', [a.id]), to('verified', [b.id])]],
+          // the latest preparation and every entry after it: A and B
+          [g2.id]: ['approved', [to('prepared', [a.id]), to('approved', [b.id])]],
+          // every entry after the latest needs_review: C alone
+          [g3.id]: [
+            'not_applicable',
+            [
+              to('prepared', [a.id]),
+              to('approved', []),
+              to('needs_review', []),
+              to('prepared', [b.id]),
+              to('approved', []),
+              to('needs_review', []),
+              to('not_applicable', [c.id]),
+            ],
+          ],
+          // an empty cycle gives nothing (the state and the history disagree, as only a damaged or
+          // foreign snapshot can)
+          [g4.id]: [
+            'verified',
+            [to('prepared', [a.id]), to('approved', []), to('needs_review', [a.id])],
+          ],
+          // ids are read only from an entry that is an object: A
+          [g5.id]: ['approved', [to('prepared', [a.id]), null, to('approved', [])]],
+          // a history that is not a list gives nothing
+          [g6.id]: ['verified', {}],
+          [g6b.id]: ['verified', 7],
+        };
+        await serveChanged((body) => {
+          for (const t of body.objects)
+            if (served[t.id]) {
+              t.state = served[t.id][0];
+              t.data.history = served[t.id][1];
+              t.data.evidence_ids = [];
+            }
+        });
+        await race.reload();
+        await race.locator('#list .today-head').waitFor();
+        await onBusiness(bid, testName);
+        // each evidence item's row and its "Used by" part: the steps, by id, and what each says
+        const usedList = () =>
+          usedBySection()
+            .locator('.att-row')
+            .evaluateAll((rows) =>
+              rows
+                .map((r) => [
+                  r.querySelector('[data-go]').dataset.go.split('|step:')[1],
+                  r.querySelector('.sub').textContent,
+                ])
+                .sort(),
+            );
+        const relied = (step, state) => [step.id, `Task · ${state}${EARLIER}`];
+        const expected = [
+          [a, 2, [relied(g2, 'Approved'), relied(g5, 'Approved')]],
+          [b, 2, [relied(g1, 'Verified'), relied(g2, 'Approved')]],
+          [c, 1, [relied(g3, 'Not applicable')]],
+        ];
+        for (const [e, n, list] of expected) {
+          await raceSource('evidence');
+          assert.match(
+            await evSub(e.id),
+            new RegExp(` · used by ${n}$`),
+            `${e.title}: used by ${n}`,
+          );
+          await openEvidence(e);
+          assert.deepEqual(
+            await usedList(),
+            list.sort(),
+            `${e.title}: what its Used by part lists`,
+          );
+        }
+        await sameAsServer('round 9 G histories');
+        for (const t of [g5, g6, g6b]) {
+          await showStep(t);
+          await quiet(race);
+          assert.doesNotMatch(
+            await race.locator('#insp').innerText(),
+            /could not be shown|TypeError|Cannot read/,
+            `${t.title}: its view is drawn`,
+          );
+        }
+      },
+    );
+    // Round 9, G7. A new key is shown only to the person who asked for it, by id: a second owner
+    // with the same name as the first signs in while the key is held, in a browser without the
+    // signal, so the check before the key is shown is all that keeps it back.
+    lateCase(
+      'round 9 G7: someone else with the same role and the same name does not get the key',
+      async () => {
+        const ownerName = (await (await context.request.get(`${origin}/api/me`)).json()).name;
+        const namesake = await call('/principals', 'POST', {
+          name: ownerName,
+          role: 'owner',
+          business_ids: [bid],
+        });
+        await twoTabs(
+          async ({ a, b }) => {
+            const ownerId = await a.evaluate(() => state.actor.id);
+            assert.notEqual(namesake.id, ownerId, 'two owners');
+            assert.equal(await a.evaluate(() => state.actor.name), namesake.name, 'one name');
+            const held = await hold(a, '/api/principals', { method: 'POST' });
+            await keyFormIn(a, 'Browser key held while a namesake signs in');
+            await a
+              .locator('#dialog')
+              .getByRole('button', { name: 'Create key', exact: true })
+              .click();
+            const secret = (await (await sent(held, 'the key creation')).json()).token;
+            await signOutIn(b);
+            await signInAs(b, namesake.token);
+            await held.release();
+            await a
+              .waitForFunction((id) => state.actor?.id === id, namesake.id, {
+                timeout: 10000 * slowdown,
+              })
+              .catch(() => {
+                throw new Error('the key check did not find that someone else is signed in');
+              });
+            await quiet(a);
+            assert.equal(await a.locator('#dialog').evaluate((d) => d.open), false, 'no dialog');
+            assert(!(await holdsIn(a, secret)), 'the key is nowhere in tab A');
+          },
+          { bare: true },
+        );
+      },
+    );
+    // Round 9, G9. A reload that changes nothing leaves an open view as it is: the selection in
+    // its text, and the elements of its reasons.
+    lateCase(
+      'round 9 G9: a reload that changes nothing leaves an open draft’s view alone',
+      async () => {
+        const doc = await newDraft();
+        await call(`/businesses/${bid}/records`, 'POST', {
+          kind: 'risk',
+          title: 'Browser record that makes a draft stale before its view opens',
+          details: 'Synthetic record for the unchanged-view check.',
+        });
+        await race.reload();
+        await race.locator('#list .today-head').waitFor();
+        await onBusiness(bid, testName);
+        await readDraft(doc);
+        assert.deepEqual(await viewFlags(), [SOURCE_CHANGED]);
+        const reason = await race.locator('#dialog-content .flag').elementHandle();
+        const selected = await race.evaluate(() => {
+          const node = $('#dialog pre.document').firstChild;
+          const range = document.createRange();
+          range.setStart(node, 2);
+          range.setEnd(node, 40);
+          getSelection().removeAllRanges();
+          getSelection().addRange(range);
+          return getSelection().toString();
+        });
+        assert.equal(selected.length, 38, 'part of the text is selected');
+        await race.evaluate(() => refresh());
+        await quiet(race);
+        assert(await race.evaluate(() => $('#dialog').open), 'the view is open');
+        assert.equal(
+          await race.evaluate(() => getSelection().toString()),
+          selected,
+          'still selected',
+        );
+        assert(
+          await race.evaluate(
+            () => getSelection().anchorNode === $('#dialog pre.document').firstChild,
+          ),
+          'in the same text',
+        );
+        assert(await reason.evaluate((el) => el.isConnected), 'the reason is the same element');
+        await reason.dispose();
+      },
+    );
+    // Round 9, G10. A viewer's read-only view of a whole record follows a reload of its business.
+    lateCase('round 9 G10: an open record view shows a change made through the API', async () => {
+      const record = await call(`/businesses/${bid}/records`, 'POST', {
+        kind: 'risk',
+        title: 'Browser record a viewer reads while it changes',
+        details: 'Synthetic details before the change.',
+      });
+      const viewerKey = (
+        await call('/principals', 'POST', {
+          name: 'Browser viewer for a record that changes',
+          role: 'viewer',
+          business_ids: [bid],
+        })
+      ).token;
+      const viewer = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
+      try {
+        const v = await newPage(viewer);
+        v.on('pageerror', (e) => errors.push(e.message));
+        await v.goto(origin);
+        await v.getByLabel('Access key', { exact: true }).fill(viewerKey);
+        await v.getByRole('button', { name: 'Open workspace' }).click();
+        await v.locator('#list .today-head').waitFor();
+        await v.locator('#src-nav .src[data-src="records"]').click();
+        await v.locator('#list .row', { hasText: record.title }).click();
+        await v.locator('#insp').getByRole('button', { name: 'View', exact: true }).click();
+        const pre = v.locator('#dialog-content pre');
+        assert.equal(
+          JSON.parse(await pre.textContent()).data.details,
+          'Synthetic details before the change.',
+        );
+        await call(`/businesses/${bid}/records/${record.id}`, 'PUT', {
+          kind: 'risk',
+          title: record.title,
+          details: 'Synthetic details after the change.',
+          expected_version: record.version,
+        });
+        await v.evaluate(() => refresh());
+        await quiet(v);
+        assert(await v.locator('#dialog').evaluate((d) => d.open), 'the view stayed open');
+        const shown = JSON.parse(await pre.textContent());
+        assert.equal(shown.data.details, 'Synthetic details after the change.', 'the new value');
+        assert.equal(shown.version, record.version + 1);
+        assert(!(await pre.textContent()).includes('before the change'), 'not the old one');
+      } finally {
+        await viewer.close();
+      }
+    });
     race.setDefaultTimeout(10000);
     const lateFailures = [];
     // A failure while the page is loaded again for a case names that case, and lists what the
@@ -4674,7 +4908,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, and a closed form is still named after a second change), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, and a closed form is still named after a second change), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
