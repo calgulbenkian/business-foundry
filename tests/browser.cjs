@@ -2450,6 +2450,111 @@ print(json.dumps({
         );
       }
     });
+    // Round 8, B. A document whose snapshot gives the server's reasons, and one whose does not.
+    const docRow = (id) => race.locator(`#list .row[data-key="doc:${id}"]`);
+    const newDraft = async () => {
+      const doc = await call(`/businesses/${bid}/documents`, 'POST', { template: 'business_plan' });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      await onBusiness(bid, testName);
+      return doc;
+    };
+    const readDraft = async (doc) => {
+      await raceSource('documents');
+      await docRow(doc.id).click();
+      await race.locator('#insp-title', { hasText: doc.title }).waitFor();
+      await race.locator('#insp').getByRole('button', { name: 'Read draft', exact: true }).click();
+      await race.locator('#dialog pre.document').waitFor();
+    };
+    const viewFlags = () => race.locator('#dialog-content .flag').allInnerTexts();
+    const DRAFT_CHANGED =
+      'The records this draft was made from have changed since it was generated.';
+    lateCase('round 8 B: a document with the server’s reasons, from both servers', async () => {
+      const doc = await newDraft();
+      const reasons = [
+        {
+          code: 'synthetic_markup',
+          message: 'Synthetic reason <b>one</b> & “two”, said "plainly".',
+        },
+        { code: 'obligations_overdue', message: 'The number of overdue obligations changed.' },
+      ];
+      // every draft is served stale: with these reasons, or with none, as today's server does
+      let mode = 'reasons';
+      await serveChanged((body) => {
+        for (const d of body.objects.filter((o) => o.kind === 'document')) {
+          delete d.stale_reasons;
+          d.stale = true;
+          if (mode === 'reasons') d.stale_reasons = reasons;
+        }
+      });
+      const related = await call(`/businesses/${bid}/records`, 'POST', {
+        kind: 'risk',
+        title: 'Browser record related to a draft with reasons',
+        details: 'Synthetic record related to a draft.',
+        related_ids: [doc.id],
+      });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      const messages = reasons.map((r) => r.message);
+      const pageWords = /made from records|Source records changed|have changed since/;
+      const everywhere = async (what) => {
+        await raceSource('documents');
+        await docRow(doc.id).click();
+        await race.locator('#insp-title', { hasText: doc.title }).waitFor();
+        await quiet(race);
+        const shown = {
+          row: await docRow(doc.id).locator('.r-sub').innerText(),
+          title: await race.locator('#src-nav .src[data-src="documents"]').getAttribute('title'),
+          state: await race.locator('#insp .i-state .st').innerText(),
+          flags: await race.locator('#insp .flag').allInnerTexts(),
+        };
+        await race
+          .locator('#insp')
+          .getByRole('button', { name: 'Read draft', exact: true })
+          .click();
+        await race.locator('#dialog pre.document').waitFor();
+        shown.view = await viewFlags();
+        await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+        await raceSource('today');
+        shown.today = await race.locator(`#list .row[data-key="doc:${doc.id}"] .r-sub`).innerText();
+        await raceSource('records');
+        await rowIn(related.title).click();
+        await race.locator('#insp-title', { hasText: related.title }).waitFor();
+        shown.related = await race
+          .locator('#insp .att-row', { hasText: doc.title })
+          .locator('.sub')
+          .innerText();
+        return shown;
+      };
+      const withReasons = await everywhere('with reasons');
+      assert.deepEqual(withReasons, {
+        row: 'Needs review',
+        title: 'Some drafts need review',
+        state: 'Needs review',
+        flags: messages,
+        view: messages,
+        today: 'Draft · needs review',
+        related: 'Document · Needs review',
+      });
+      assert.equal(await race.locator('#insp .flag b').count(), 0, 'a reason is shown as text');
+      for (const [where, text] of Object.entries(withReasons))
+        assert.doesNotMatch(String(text), pageWords, `${where}: no reason of the page’s own`);
+      // today's server: stale, and no reasons
+      mode = 'plain';
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      assert.deepEqual(await everywhere('without reasons'), {
+        row: 'Source records changed since this draft',
+        title: 'Some drafts were made from records that changed since',
+        state: 'Out of date',
+        flags: [
+          'The records this draft was made from have changed since. This copy stays as it was generated. Generate a new version to reflect the current records.',
+        ],
+        view: [DRAFT_CHANGED],
+        today: 'Draft made from records that changed since',
+        related: 'Document · Needs review — made from records that changed since',
+      });
+    });
 
     race.setDefaultTimeout(10000);
     const lateFailures = [];
