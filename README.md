@@ -29,7 +29,7 @@ Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `fou
 
 ## What works
 
-- A three-pane browser workspace: each group of steps is a coloured line on a Journey map generated from the step data, every task state has its own glyph, and the panes stack on a phone.
+- A three-pane browser workspace: each group of steps is a coloured line on a Journey map generated from the step data, every state of a live step has its own glyph, and the panes stack on a phone.
 - Separate business workspaces, scoped access keys, human review roles and an agent role that cannot approve evidence or attest external execution.
 - Dependency-aware startup and acquisition work, with distinct preparation, approval, submission and verification states.
 - A human-only, recorded change of planning jurisdiction, with a preview: earlier guide steps stay as superseded history, the new guide's steps are added and completed work is reopened in the same workspace. Earlier documents, deal analyses and forecasts are marked stale; saved figures are never rewritten.
