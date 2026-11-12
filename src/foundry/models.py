@@ -25,6 +25,7 @@ TerminalGrowth = _decimal(ge=Decimal("-0.2"), le=Decimal("0.1"))
 Earnings = _decimal(ge=Decimal("-1000000000"), le=Decimal("1000000000"))
 Multiple = _decimal(ge=0, le=100)
 Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
+Jurisdiction = Literal["undecided", "US-DE", "GB", "SE", "other"]
 
 
 class Model(BaseModel):
@@ -35,7 +36,7 @@ class BusinessCreate(Model):
     name: Short
     concept: Annotated[str, Field(min_length=10, max_length=12000)]
     route: Literal["start", "acquire"] = "start"
-    jurisdiction: Literal["undecided", "US-DE", "GB", "SE", "other"] = "undecided"
+    jurisdiction: Jurisdiction = "undecided"
     currency: Currency = "USD"
     customer: Annotated[str, Field(max_length=2000)] = ""
     owner: Short = "Founder"
@@ -44,6 +45,15 @@ class BusinessCreate(Model):
 
 class BusinessUpdate(BusinessCreate):
     expected_version: Annotated[int, Field(ge=1)]
+
+
+class JurisdictionChange(Model):
+    """A human decision to plan under another jurisdiction. It is not an entity move or legal advice."""
+
+    expected_version: Annotated[int, Field(ge=1)]
+    jurisdiction: Jurisdiction
+    reason: Annotated[str, Field(min_length=3, max_length=4000)]
+    evidence_ids: list[str] = Field(default_factory=list, max_length=30)
 
 
 RecordKind = Literal[
