@@ -2187,17 +2187,105 @@ async function main() {
     // here, after the demo's last use above: the change replaces the demo's guide steps and
     // reopens its completed ones, and no check below uses the demo.
     const demoUrl = `${origin}/api/businesses/${demoBid}`;
-    const changed = await context.request.post(demoUrl + '/jurisdiction', {
-      headers: { Origin: origin, 'Idempotency-Key': 'browser-jurisdiction-change' },
+    const demoSnap = async () => (await context.request.get(demoUrl)).json();
+    const changeTo = async (jurisdiction, key) => {
+      const response = await context.request.post(demoUrl + '/jurisdiction', {
+        headers: { Origin: origin, 'Idempotency-Key': key },
+        data: {
+          expected_version: (await demoSnap()).business.version,
+          jurisdiction,
+          reason: 'Synthetic browser check of earlier analyses after a jurisdiction change.',
+          evidence_ids: [],
+        },
+      });
+      assert.equal(response.status(), 200, await response.text());
+      return response.json();
+    };
+    // A record related to the latest forecast, the deal analysis and a draft document. The page's
+    // form offers only records to relate; the server accepts any object of the business, so the
+    // record is made through the API, before the change.
+    const unchanged = await demoSnap();
+    const relatedTo = {
+      plan: unchanged.objects.filter((o) => o.kind === 'financial_plan').at(-1),
+      deal: unchanged.objects.find((o) => o.kind === 'deal'),
+      doc: unchanged.objects.find((o) => o.kind === 'document' && o.state === 'draft'),
+    };
+    for (const [what, o] of Object.entries(relatedTo))
+      assert(o, `the demo has a ${what} to relate a record to`);
+    const relatedTitle = 'Browser record related to the analyses';
+    const recorded = await context.request.post(demoUrl + '/records', {
+      headers: { Origin: origin, 'Idempotency-Key': 'browser-record-related-to-analyses' },
       data: {
-        expected_version: (await (await context.request.get(demoUrl)).json()).business.version,
-        jurisdiction: 'GB',
-        reason: 'Synthetic browser check of earlier analyses after a jurisdiction change.',
-        evidence_ids: [],
+        kind: 'risk',
+        title: relatedTitle,
+        details: 'Synthetic record related to a forecast, a deal analysis and a draft document.',
+        related_ids: Object.values(relatedTo).map((o) => o.id),
       },
     });
-    assert.equal(changed.status(), 200, await changed.text());
-    const marked = await (await context.request.get(demoUrl)).json();
+    assert.equal(recorded.status(), 201, await recorded.text());
+    const relatedRecord = await recorded.json();
+    // The page is opened before the change, to read what each evidence row counts as its uses.
+    const jx = await newPage(context);
+    jx.on('pageerror', (e) => errors.push(e.message));
+    const jxSource = async (id) => {
+      await jx.locator(`#src-nav .src[data-src="${id}"]`).click();
+      await jx.locator(`#src-nav .src[data-src="${id}"][aria-current="true"]`).waitFor();
+    };
+    const jxRow = (key) => jx.locator(`#list .row[data-key="${key}"]`);
+    const jxOpen = async (source, key, title) => {
+      await jxSource(source);
+      await jxRow(key).click();
+      await jx.locator('#insp-title', { hasText: title }).waitFor();
+      await quiet(jx);
+    };
+    const jxStep = async (t) => {
+      await jx.evaluate((id) => go(`journey|step:${id}`), t.id);
+      await jx.locator('#insp-title', { hasText: t.title }).waitFor();
+      await quiet(jx);
+    };
+    const onDemo = async () => {
+      await jx.locator('#list .today-head').waitFor();
+      if ((await jx.locator('#business-select').inputValue()) !== demoBid) {
+        await jx.locator('#business-select').selectOption(demoBid);
+        await jx.locator('#list .th-sub', { hasText: demoName }).waitFor();
+      }
+      await quiet(jx);
+    };
+    const section = (name) =>
+      jx.locator('#insp .i-sec').filter({ has: jx.locator('h3', { hasText: name }) });
+    // what an inspector's list of properties says for one name; empty when it has no such row
+    const prop = (name) =>
+      jx
+        .locator('#insp dl.props dt')
+        .filter({ hasText: new RegExp(`^${name}$`) })
+        .evaluateAll((dts) => dts.map((dt) => dt.nextElementSibling.textContent));
+    // one row of an attached list: its glyph, the text before its line of state, and that line
+    const attRow = async (list, title, where) => {
+      const r = list.locator('.att-row', { hasText: title });
+      assert.equal(await r.count(), 1, `${where}: “${title}” is listed once`);
+      return r.evaluate((el) => ({
+        glyph: el.firstElementChild.getAttribute('data-glyph'),
+        cls: el.firstElementChild.getAttribute('class'),
+        text: el.querySelector('.an').firstChild.textContent,
+        sub: el.querySelector('.sub').textContent,
+      }));
+    };
+    const usesOnPage = async () => {
+      await jxSource('evidence');
+      await quiet(jx);
+      const subs = await jx
+        .locator('#list .row[data-key^="ev:"]')
+        .evaluateAll((rows) =>
+          rows.map((r) => [r.dataset.key.slice(3), r.querySelector('.r-sub').textContent]),
+        );
+      return new Map(subs.map(([id, sub]) => [id, Number(/used by (\d+)/.exec(sub)?.[1] ?? 0)]));
+    };
+    await jx.goto(origin);
+    await onDemo();
+    const usesBefore = await usesOnPage();
+    assert(usesBefore.size > 0, 'the demo’s evidence is listed');
+    const changed = await changeTo('GB', 'browser-jurisdiction-change');
+    const marked = await demoSnap();
     const reasonOf = (kind) => {
       const [reason] = marked.objects.find((o) => o.kind === kind).stale_reasons;
       assert.equal(reason.code, 'jurisdiction_changed');
@@ -2220,19 +2308,12 @@ async function main() {
       gone = marked.objects.filter((o) => o.kind === 'task' && o.state === 'superseded');
     assert(gone.length > 0, 'the change replaced at least one of the demo’s steps');
     assert.equal(marked.stats.superseded, gone.length);
-    const jx = await newPage(context);
-    jx.on('pageerror', (e) => errors.push(e.message));
-    const jxSource = async (id) => {
-      await jx.locator(`#src-nav .src[data-src="${id}"]`).click();
-      await jx.locator(`#src-nav .src[data-src="${id}"][aria-current="true"]`).waitFor();
-    };
-    const jxRow = (key) => jx.locator(`#list .row[data-key="${key}"]`);
-    const jxOpen = async (source, key, title) => {
-      await jxSource(source);
-      await jxRow(key).click();
-      await jx.locator('#insp-title', { hasText: title }).waitFor();
-      await quiet(jx);
-    };
+    for (const added of changed.added)
+      assert.deepEqual(
+        marked.objects.find((o) => o.id === added.id).data.evidence_ids,
+        [],
+        'a step the change adds cites no evidence',
+      );
     const noOldSentence = async (where) => {
       await quiet(jx);
       for (const pane of ['#list', '#insp'])
@@ -2242,13 +2323,9 @@ async function main() {
           `${where}: the page writes no reason of its own`,
         );
     };
-    await jx.goto(origin);
-    await jx.locator('#list .today-head').waitFor();
-    if ((await jx.locator('#business-select').inputValue()) !== demoBid) {
-      await jx.locator('#business-select').selectOption(demoBid);
-      await jx.locator('#list .th-sub', { hasText: demoName }).waitFor();
-    }
-    await quiet(jx);
+    // the page learns of the change when it is reloaded
+    await jx.reload();
+    await onDemo();
     // the forecast: its full view, the money position that shows the latest one, and its rows
     const latest = plans.at(-1);
     const latestReasons = latest.stale_reasons.map((r) => r.message);
@@ -2320,84 +2397,152 @@ async function main() {
         `Today lists ${key} as needing review`,
       );
     await noOldSentence('Today');
-    // No replaced step is on the map or in any list, and the page counts what the server counts.
-    const stats = marked.stats;
-    const pageCounts = await jx.evaluate(() => ({
-      steps: M.steps.length,
-      verified: M.verified,
-      na: M.na,
-      review: M.steps.filter((x) => x.task.state === 'needs_review').length,
-      replacedInModel: M.steps.filter((x) => x.task.state === 'superseded').length,
-      lineTotal: M.lines.reduce((n, l) => n + l.steps.length, 0),
-      emptyLines: M.lines.filter((l) => !l.steps.length).length,
-    }));
-    assert.deepEqual(
-      pageCounts,
-      {
-        steps: stats.tasks,
-        verified: stats.verified,
-        na: stats.not_applicable,
-        review: stats.needs_review,
-        replacedInModel: 0,
-        lineTotal: stats.tasks,
-        emptyLines: 0,
-      },
-      'the page’s totals are the server’s, and no replaced step is among them',
-    );
-    const todayHead = await jx.locator('#list .today-head').innerText();
-    assert(
-      todayHead.includes(`${stats.tasks} steps on`),
-      `Today counts ${stats.tasks} steps: ${todayHead}`,
-    );
-    assert(todayHead.includes(`${stats.verified} verified`));
-    if (stats.needs_review) assert(todayHead.includes(`${stats.needs_review} need review`));
-    if (stats.not_applicable) assert(todayHead.includes(`${stats.not_applicable} not applicable`));
-    const lineCounts = await jx
-      .locator('#src-nav .src .bul')
-      .evaluateAll((bs) => bs.map((b) => b.closest('.src').querySelector('.n').textContent));
-    assert.equal(
-      lineCounts.reduce((n, c) => n + Number(c.split('/')[1]), 0),
-      stats.tasks,
-      'the lines’ totals add up to the server’s count of steps',
-    );
-    assert.equal(
-      lineCounts.reduce((n, c) => n + Number(c.split('/')[0]), 0),
-      stats.verified,
-      'and their verified counts to its count of verified steps',
-    );
-    assert.equal(
-      await jx.locator('#src-nav .src[data-src="journey"] .n').innerText(),
-      `${stats.tasks - stats.verified - stats.not_applicable} to go`,
-    );
-    const sources = await jx
-      .locator('#src-nav .src')
-      .evaluateAll((x) => x.map((el) => el.dataset.src));
-    for (const id of sources) {
-      await jxSource(id);
-      if (id === 'history')
-        await jx.locator('#list .grp', { hasText: 'Events' }).waitFor({ state: 'attached' });
+    // "Ending cash" is drawn in Money and in Today's Money group. In both it carries the review
+    // glyph and says "needs review" while the latest forecast needs review.
+    for (const source of ['money', 'today']) {
+      await jxSource(source);
       await quiet(jx);
-      for (const t of gone) {
-        assert.equal(
-          await jx.locator(`#list .row[data-key$="${t.id}"]`).count(),
-          0,
-          `${id}: the replaced step “${t.title}” is in no list`,
-        );
-        assert.equal(
-          await jx.locator(`#insp [data-id="${t.id}"]`).count(),
-          0,
-          `${id}: nor on the map`,
-        );
-      }
+      const ending = jxRow('money:ending');
+      assert.equal(
+        await ending.locator('.r-g svg').getAttribute('data-glyph'),
+        'review',
+        `${source}: the Ending cash row has the review glyph`,
+      );
+      assert.match(
+        await ending.locator('.r-sub').innerText(),
+        / · needs review$/,
+        `${source}: the Ending cash row says it needs review`,
+      );
     }
-    await jxSource('journey');
-    await jx.locator('#insp .mapbox').waitFor();
-    await quiet(jx);
+    // The record related to the forecast, the deal analysis and the draft document lists all
+    // three, each with the review glyph. Only the document is said to be made from records that
+    // changed since: for the forecast and the deal the server gives other reasons, in their views.
+    const madeFrom = /made from records that changed since/;
     assert.equal(
-      await jx.locator('#insp .mp-tall .stn').count(),
-      stats.tasks,
-      'one station for each live step',
+      marked.objects.find((o) => o.id === relatedTo.doc.id).stale,
+      true,
+      'the server marks the draft document',
     );
+    await jxOpen('records', 'rec:' + relatedRecord.id, relatedTitle);
+    const relatedList = section('Related records');
+    for (const [o, what] of [
+      [relatedTo.plan, 'forecast'],
+      [relatedTo.deal, 'deal analysis'],
+      [relatedTo.doc, 'draft document'],
+    ]) {
+      const shown = await attRow(relatedList, o.title, 'Related records');
+      assert.equal(shown.glyph, 'review', `a ${what} that needs review has the review glyph`);
+      assert.match(shown.sub, / · Needs review/, `the ${what} reads “Needs review”`);
+      if (o.kind === 'document')
+        assert.match(shown.sub, madeFrom, 'the draft document says why it needs review');
+      else
+        assert.doesNotMatch(shown.sub, madeFrom, `the ${what} carries no reason the page made up`);
+    }
+    // the deal also appears under "Used by" on the evidence its adjustment cites
+    const adjustmentEvidence = marked.objects.find(
+      (o) => o.id === deal.data.inputs.adjustments.find((a) => a.evidence_id).evidence_id,
+    );
+    await jxOpen('evidence', 'ev:' + adjustmentEvidence.id, adjustmentEvidence.title);
+    const dealUse = await attRow(section(/^Used by/), deal.title, 'Used by');
+    assert.equal(dealUse.glyph, 'review', 'the deal analysis under Used by has the review glyph');
+    assert.match(dealUse.sub, / · Needs review$/, 'the deal analysis under Used by needs review');
+    // Each evidence row's count of uses goes down by the replaced steps that cited it; the new
+    // steps cite nothing. The count before is the one the page showed before the change.
+    const usesAfter = await usesOnPage();
+    let uncounted = 0;
+    for (const [id, n] of usesBefore) {
+      const lost = gone.filter((t) => (t.data.evidence_ids || []).includes(id)).length;
+      uncounted += lost;
+      assert.equal(
+        usesAfter.get(id),
+        n - lost,
+        `the row for “${marked.objects.find((o) => o.id === id).title}” counts no replaced step among its uses`,
+      );
+    }
+    assert(uncounted > 0, 'a replaced step cited listed evidence');
+    // No replaced step is on the map or in any list, and the page counts what the server counts.
+    const sameTotals = async (stats, gone) => {
+      await jxSource('today');
+      await quiet(jx);
+      const pageCounts = await jx.evaluate(() => ({
+        steps: M.steps.length,
+        verified: M.verified,
+        na: M.na,
+        review: M.steps.filter((x) => x.task.state === 'needs_review').length,
+        replacedInModel: M.steps.filter((x) => x.task.state === 'superseded').length,
+        lineTotal: M.lines.reduce((n, l) => n + l.steps.length, 0),
+        emptyLines: M.lines.filter((l) => !l.steps.length).length,
+      }));
+      assert.deepEqual(
+        pageCounts,
+        {
+          steps: stats.tasks,
+          verified: stats.verified,
+          na: stats.not_applicable,
+          review: stats.needs_review,
+          replacedInModel: 0,
+          lineTotal: stats.tasks,
+          emptyLines: 0,
+        },
+        'the page’s totals are the server’s, and no replaced step is among them',
+      );
+      const todayHead = await jx.locator('#list .today-head').innerText();
+      assert(
+        todayHead.includes(`${stats.tasks} steps on`),
+        `Today counts ${stats.tasks} steps: ${todayHead}`,
+      );
+      assert(todayHead.includes(`${stats.verified} verified`));
+      if (stats.needs_review) assert(todayHead.includes(`${stats.needs_review} need review`));
+      if (stats.not_applicable)
+        assert(todayHead.includes(`${stats.not_applicable} not applicable`));
+      const lineCounts = await jx
+        .locator('#src-nav .src .bul')
+        .evaluateAll((bs) => bs.map((b) => b.closest('.src').querySelector('.n').textContent));
+      assert.equal(
+        lineCounts.reduce((n, c) => n + Number(c.split('/')[1]), 0),
+        stats.tasks,
+        'the lines’ totals add up to the server’s count of steps',
+      );
+      assert.equal(
+        lineCounts.reduce((n, c) => n + Number(c.split('/')[0]), 0),
+        stats.verified,
+        'and their verified counts to its count of verified steps',
+      );
+      assert.equal(
+        await jx.locator('#src-nav .src[data-src="journey"] .n').innerText(),
+        `${stats.tasks - stats.verified - stats.not_applicable} to go`,
+      );
+      const sources = await jx
+        .locator('#src-nav .src')
+        .evaluateAll((x) => x.map((el) => el.dataset.src));
+      for (const id of sources) {
+        await jxSource(id);
+        if (id === 'history')
+          await jx.locator('#list .grp', { hasText: 'Events' }).waitFor({ state: 'attached' });
+        await quiet(jx);
+        for (const t of gone) {
+          assert.equal(
+            await jx.locator(`#list .row[data-key$="${t.id}"]`).count(),
+            0,
+            `${id}: the replaced step “${t.title}” is in no list`,
+          );
+          assert.equal(
+            await jx.locator(`#insp [data-id="${t.id}"]`).count(),
+            0,
+            `${id}: nor on the map`,
+          );
+        }
+      }
+      await jxSource('journey');
+      await jx.locator('#insp .mapbox').waitFor();
+      await quiet(jx);
+      assert.equal(
+        await jx.locator('#insp .mp-tall .stn').count(),
+        stats.tasks,
+        'one station for each live step',
+      );
+    };
+    await sameTotals(marked.stats, gone);
     // the business shows its new jurisdiction
     assert.match(await jx.locator('#insp').innerText(), /Jurisdiction\s+GB/);
     // A replaced step is reached from the evidence it cites, and opens read-only.
@@ -2416,23 +2561,140 @@ async function main() {
       new RegExp(citing.title),
       'a replaced step is not counted among the evidence’s uses',
     );
+    // in the list of steps that cite it, the replaced step reads "Replaced" and is drawn as a dash
+    const citedBy = await attRow(historyList, citing.title, 'Cited by replaced steps');
+    assert.match(citedBy.sub, / · Replaced$/, 'a replaced step in an attached list reads Replaced');
+    assert.deepEqual(
+      [citedBy.cls, citedBy.glyph],
+      ['g g-off', null],
+      'a replaced step in an attached list is drawn as a dash',
+    );
     await historyList.locator('.att-row', { hasText: citing.title }).getByRole('button').click();
     await jx.locator('#insp-title', { hasText: citing.title }).waitFor();
     await quiet(jx);
-    const replacedView = await jx.locator('#insp').innerText();
-    assert(
-      replacedView.includes(
-        'This step was replaced when the planning jurisdiction changed from undecided to GB.',
-      ),
-      'it says in plain words that the step was replaced, and why',
-    );
-    assert.doesNotMatch(replacedView, /undefined|Cannot read|TypeError/);
-    assert.equal(
-      await jx.locator('#insp [data-action="tx"], #insp #tx-form').count(),
-      0,
-      'it offers no decision',
-    );
+    // what a replaced step's own view shows: why it was replaced, its state, the crumb, the
+    // evidence it cites and its History, with the entry that records the replacement
+    const replacedStep = async (t, from, to) => {
+      const view = await jx.locator('#insp').innerText();
+      assert(
+        view.includes(
+          `This step was replaced when the planning jurisdiction changed from ${from} to ${to}.`,
+        ),
+        `${t.title}: it says in plain words that the step was replaced, and why`,
+      );
+      assert.doesNotMatch(view, /undefined|Cannot read|TypeError/);
+      assert.equal(
+        await jx.locator('#insp [data-action="tx"], #insp #tx-form').count(),
+        0,
+        `${t.title}: it offers no decision`,
+      );
+      assert.equal(
+        await jx.locator('#insp .i-state .st').innerText(),
+        'Replaced',
+        `${t.title}: its state reads Replaced`,
+      );
+      assert.equal(
+        await jx.locator('#crumb').innerText(),
+        `Replaced step › ${t.title}`,
+        `${t.title}: the crumb says it is a replaced step`,
+      );
+      const citesList = section('Evidence it cites');
+      for (const id of t.data.evidence_ids) {
+        const e = marked.objects.find((o) => o.id === id);
+        await attRow(citesList, e.title, `${t.title}: Evidence it cites`);
+      }
+      assert.equal(
+        await citesList.locator('.att-row').count(),
+        t.data.evidence_ids.length,
+        `${t.title}: it lists the evidence it cites`,
+      );
+      const history = section(/^History$/);
+      assert.equal(await history.count(), 1, `${t.title}: its view has a History section`);
+      const entry = await attRow(
+        history,
+        `Jurisdiction changed from ${from} to ${to}`,
+        `${t.title}: History`,
+      );
+      assert(
+        entry.sub.includes(` · Jurisdiction changed from ${from} to ${to}. `),
+        `${t.title}: the History entry records the replacement`,
+      );
+      assert.match(entry.text, / → Replaced$/, `${t.title}: its History says Replaced`);
+      assert.deepEqual(
+        [entry.cls, entry.glyph],
+        ['g g-off', null],
+        `${t.title}: its History draws the replacement as a dash`,
+      );
+    };
+    await replacedStep(citing, 'undecided', 'GB');
     assert.equal(await jx.locator('#list .row[aria-current="true"]').count(), 0);
+
+    // A second change, GB to SE, replaces the UK step, which depends on the structure decision.
+    // The live structure step's "Needed by" then names the Swedish step and not the UK step. The
+    // page learns of the change when it is reloaded.
+    const toSweden = await changeTo('SE', 'browser-jurisdiction-change-se');
+    const remarked = await demoSnap();
+    const allGone = remarked.objects.filter((o) => o.kind === 'task' && o.state === 'superseded');
+    const ukStep = allGone.find((t) => t.id === toSweden.superseded[0]?.id);
+    const seStep = remarked.objects.find((o) => o.id === toSweden.added[0]?.id);
+    const structure = remarked.objects.find(
+      (o) => o.kind === 'task' && !o.data.deal_id && o.data.key === 'structure',
+    );
+    assert.equal(toSweden.superseded.length, 1);
+    assert.equal(ukStep.title, 'Review UK director, registration and reporting duties');
+    assert.equal(seStep.title, 'Review Swedish company and tax setup');
+    assert(ukStep.data.depends_on.includes(structure.id), 'the UK step depends on the structure');
+    assert(seStep.data.depends_on.includes(structure.id), 'and so does the Swedish step');
+    assert.equal(allGone.length, gone.length + 1);
+    assert.equal(remarked.stats.superseded, allGone.length);
+    await jx.reload();
+    await onDemo();
+    await sameTotals(remarked.stats, allGone);
+    assert.match(await jx.locator('#insp').innerText(), /Jurisdiction\s+SE/);
+    await jxStep(structure);
+    const neededBy = (await prop('Needed by')).join('\n');
+    assert(neededBy.includes(seStep.title), `“Needed by” lists the Swedish step: ${neededBy}`);
+    assert(!neededBy.includes(ukStep.title), '“Needed by” lists no replaced step');
+    // the evidence rows count the same: the UK step cited nothing
+    assert.deepEqual(await usesOnPage(), usesAfter);
+    await jxStep(ukStep);
+    await replacedStep(ukStep, 'GB', 'SE');
+    // the first replaced step still says what replaced it
+    await jxStep(citing);
+    await replacedStep(citing, 'undecided', 'GB');
+
+    // No live step depends on a replaced step: no base or deal step depends on a step of a
+    // planning guide. So the snapshot is altered on its way to the page: one live step also names
+    // both replaced steps as prerequisites, and its "Needs these first" must list neither.
+    // Once this check is done, the route passes requests on rather than being removed.
+    const dependent = remarked.objects.find(
+      (o) => o.kind === 'task' && !o.data.deal_id && o.data.key === 'offer',
+    );
+    const rewired = [...dependent.data.depends_on, ...allGone.map((t) => t.id)];
+    let rewiring = true;
+    const rewire = async (route) => {
+      if (!rewiring) return route.fallback();
+      const response = await route.fetch();
+      const body = await response.json();
+      body.objects.find((o) => o.id === dependent.id).data.depends_on = rewired;
+      await route.fulfill({ response, json: body });
+    };
+    await jx.route((url) => url.pathname === `/api/businesses/${demoBid}`, rewire);
+    await jx.reload();
+    await onDemo();
+    assert.deepEqual(
+      await jx.evaluate((id) => find(id).data.depends_on, dependent.id),
+      rewired,
+      'the page holds the altered snapshot',
+    );
+    await jxStep(dependent);
+    const needsFirst = (await prop('Needs these first')).join('\n');
+    for (const t of allGone)
+      assert(
+        !needsFirst.includes(t.title),
+        `“Needs these first” lists no replaced step: ${needsFirst}`,
+      );
+    rewiring = false;
     // The business form says how the jurisdiction is changed, and that it cannot change it.
     await jxRow('map:all').click();
     await jx.locator('#insp').getByRole('button', { name: 'Edit business', exact: true }).click();
@@ -2598,7 +2860,7 @@ async function main() {
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, marks on earlier analyses after a jurisdiction change, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
