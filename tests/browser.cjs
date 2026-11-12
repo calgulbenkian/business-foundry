@@ -2707,10 +2707,10 @@ print(json.dumps({
         await raceSource('records');
         await rowIn(related.title).click();
         await race.locator('#insp-title', { hasText: related.title }).waitFor();
-        shown.related = await race
-          .locator('#insp .att-row', { hasText: doc.title })
-          .locator('.sub')
-          .innerText();
+        const relatedSub = race.locator('#insp .att-row', { hasText: doc.title }).locator('.sub');
+        shown.related = await relatedSub.innerText();
+        // amber when the document needs review, as the line says
+        shown.relatedAmber = await relatedSub.evaluate((e) => e.classList.contains('amber'));
         texts.push(await race.locator('#insp').innerText());
       }
       // the row and the full view agree on whether the draft is out of date
@@ -2741,6 +2741,7 @@ print(json.dumps({
       view: [],
       today: null,
       related: 'Document · Draft',
+      relatedAmber: false,
     };
     const docWithReasons = (messages) => ({
       sourceGlyph: true,
@@ -2755,6 +2756,7 @@ print(json.dumps({
       view: messages,
       today: 'Draft · needs review',
       related: 'Document · Needs review',
+      relatedAmber: true,
     });
     const docNoReason = {
       sourceGlyph: true,
@@ -2771,8 +2773,10 @@ print(json.dumps({
       view: [DRAFT_CHANGED],
       today: 'Draft · out of date',
       related: 'Document · Out of date',
+      relatedAmber: true,
     };
-    const without = (o, key) => Object.fromEntries(Object.entries(o).filter(([k]) => k !== key));
+    const without = (o, ...keys) =>
+      Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
     lateCase('round 9 D: a current draft, then a record saved through the page', async () => {
       const name = 'Browser document checks, real server';
       const { id, doc } = await docBusiness(name);
@@ -2782,7 +2786,11 @@ print(json.dumps({
       assert.equal(fresh.stale, false, 'the server says the draft is current');
       assert.deepEqual(fresh.stale_reasons, [], 'and lists no reason');
       const current = await docPlaces(doc, null);
-      assert.deepEqual(current.shown, without(docCurrent, 'related'), 'a current draft');
+      assert.deepEqual(
+        current.shown,
+        without(docCurrent, 'related', 'relatedAmber'),
+        'a current draft',
+      );
       noPageReason(current.texts, []);
       // a record saved through the page makes the draft out of date on the server
       await raceSource('records');
@@ -3175,6 +3183,7 @@ print(json.dumps({
         ['a field that is a list', [database, command]],
         ['a database that is not a string', { database: 7, backup_command: command }],
         ['no database', { backup_command: command }],
+        ['an empty database', { database: '', backup_command: command }],
       ])
         await plain(what, value, true);
       // the route let go: the ordinary panel again
@@ -4116,6 +4125,130 @@ print(json.dumps({
           await answer.release();
           const shown = await tabShows(b);
           assert.deepEqual(shown, signedOutPage, `no error and no note: ${JSON.stringify(shown)}`);
+        });
+      },
+    );
+    // Round 10, T. Rules of round 9 that no case held.
+    lateCase(
+      'round 10 T: an earlier answer naming a namesake with the same role is cleared before the owner’s records',
+      async () => {
+        const ownerMe = await (await context.request.get(`${origin}/api/me`)).json();
+        const namesake = await call('/principals', 'POST', {
+          name: ownerMe.name,
+          role: 'owner',
+          business_ids: [bid],
+        });
+        assert.notEqual(namesake.id, ownerMe.id, 'two owners, one name');
+        await twoTabs(async ({ a, b }) => {
+          await bothSignedOut(a, b);
+          const first = await holdNext(b, '/api/me');
+          await signInAs(a, namesake.token);
+          const named = await (await sent(first, 'tab B’s question after the signal')).json();
+          assert.deepEqual(
+            [named.id, named.name, named.role],
+            [namesake.id, ownerMe.name, 'owner'],
+          );
+          const login = await hold(b, '/api/login', { method: 'POST' });
+          await typeKey(b, ownerKey());
+          await sent(login, 'tab B’s sign-in');
+          // the namesake's answer arrives while the sign-in is on its way: it is still the latest
+          await first.release();
+          assert.equal(await b.locator('#actor-name').innerText(), `${ownerMe.name} · Owner`);
+          assert.equal(await b.evaluate(() => state.actor.id), namesake.id);
+          const records = await holdNext(b, '/api/businesses');
+          await login.release();
+          // the same name and role, another person: the namesake's records go first
+          const between = await b.evaluate(() => ({
+            actor: state.actor?.id,
+            snapshot: state.snapshot,
+            businesses: state.businesses.length,
+            name: document.querySelector('#actor-name').textContent,
+            list: document.querySelector('#list').innerHTML,
+          }));
+          assert.deepEqual(between, {
+            actor: ownerMe.id,
+            snapshot: null,
+            businesses: 0,
+            name: '',
+            list: '',
+          });
+          await records.release();
+          assert.deepEqual(await tabShows(b), await ownerWorkspace(b), 'tab B shows the owner');
+        });
+      },
+    );
+    lateCase(
+      'round 10 T: a refusal after two changes still says the sign-in changed, when the tab showed a workspace',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          const first = await holdNext(b, '/api/me');
+          // the first change: tab B, showing the owner's workspace, asks who is signed in
+          await bareSignal(a);
+          await sent(first, 'tab B’s first question');
+          // the second: tab A signs out, and tab B's question about it is refused
+          await signOutIn(a);
+          await told(b.getByLabel('Access key', { exact: true }), 'tab B was not told');
+          await quiet(b);
+          assert.deepEqual(await tabShows(b), { ...signedOutPage, note: CHANGED });
+          // the first answer, for a session that has ended, changes nothing
+          await first.release();
+          assert.deepEqual(await tabShows(b), { ...signedOutPage, note: CHANGED });
+        });
+      },
+    );
+    lateCase(
+      'round 10 T: a closed form is named once; the next change of sign-in does not name it again',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          await b.locator('#src-nav .src[data-src="records"]').click();
+          await b.getByRole('button', { name: '+ Add record', exact: true }).click();
+          await b.getByLabel('Title', { exact: true }).fill('Browser record form open, named once');
+          await bareSignal(a);
+          await told(b.locator('#toast', { hasText: CHANGED }), 'tab B did not say so');
+          await quiet(b);
+          assert.equal(
+            await b.locator('#toast').innerText(),
+            `${CHANGED} “Add business record” was closed without saving.`,
+          );
+          assert.equal(await b.evaluate(() => toldPending), null, 'nothing is left to say');
+          await bareSignal(a);
+          await b.waitForFunction(() => document.querySelector('#toast').hidden);
+          await told(b.locator('#toast', { hasText: CHANGED }), 'tab B did not say so again');
+          await quiet(b);
+          assert.equal(await b.locator('#toast').innerText(), CHANGED, 'the form is not named');
+        });
+      },
+    );
+    lateCase(
+      'round 10 T: a load for an earlier start that ends after this tab’s own sign-in says nothing',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          await bothSignedOut(a, b);
+          const first = await holdNext(b, '/api/me');
+          // tab A's sign-in as the owner is the signal; tab B's question about it is held
+          await signInAs(a, ownerKey());
+          const named = await (await sent(first, 'tab B’s question after the signal')).json();
+          assert.equal(named.role, 'owner');
+          // the owner signs in in tab B too; that sign-in is sent before the first answer arrives
+          const login = await hold(b, '/api/login', { method: 'POST' });
+          await typeKey(b, ownerKey());
+          await sent(login, 'tab B’s sign-in');
+          const firstLoad = await holdNext(b, '/api/businesses');
+          await first.release();
+          await sent(firstLoad, 'the load for the first answer');
+          // tab B's own sign-in is answered, and its question is held
+          const own = await holdNext(b, '/api/me');
+          await login.release();
+          await sent(own, 'tab B’s question after its own sign-in');
+          // the first start's load ends: a newer start has begun, so it says nothing
+          await firstLoad.release();
+          assert.equal(
+            await b.locator('#toast').isVisible(),
+            false,
+            'no sentence about another tab',
+          );
+          await own.release();
+          assert.deepEqual(await tabShows(b), await ownerWorkspace(b), 'tab B shows the owner');
         });
       },
     );
