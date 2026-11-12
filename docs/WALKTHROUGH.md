@@ -101,7 +101,7 @@ When money is actually received, choose **Record payment**, use the bank/provide
 
 ## 8. Review and recover
 
-Use **History** to inspect activity and verify the local chain against current records. Export one business as JSON or back up the entire database:
+Use **History** to inspect activity and verify the local chain against current records and stored revisions (see [Architecture](ARCHITECTURE.md) for exactly what is checked). Export one business as JSON or back up the entire database:
 
 ```sh
 uv run foundry verify BUSINESS_ID

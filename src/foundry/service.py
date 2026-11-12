@@ -13,6 +13,68 @@ REVIEWERS = {"owner", "reviewer"}
 WRITERS = {"owner", "operator", "reviewer", "agent"}
 FINISHED = {"verified", "not_applicable"}
 COMPLETED = {"approved", "submitted", "verified", "not_applicable"}
+UNREADABLE = (TypeError, ValueError, RecursionError)
+LIMITATION = (
+    "The hash chain detects a changed recorded event, but anyone who can edit the database can rewrite "
+    "the chain, remove its newest events or append events to it that pass this check. Keep protected "
+    "off-machine backups, and store the head hash outside this machine to show later that the events up "
+    "to it are unchanged."
+)
+
+
+def read_json(value, encoding="utf-8"):
+    """Parse a stored JSON column for verification; None when it cannot be read.
+
+    Bytes are decoded strictly in ``encoding`` first, so a byte-order mark, a lone
+    surrogate or another encoding is unreadable rather than auto-detected: the bytes of
+    a TEXT value read the same as they would through sqlite3's own str conversion.
+    """
+    try:
+        if isinstance(value, bytes):
+            value = value.decode(encoding)
+        return json.loads(value)
+    except UNREADABLE:
+        return None
+
+
+def stored_literal(storage, value, encoding="utf-8"):
+    """Show a stored TEXT, BLOB or NULL value in an error message, as an SQLite literal.
+
+    ``storage`` is the value's typeof() and ``value`` is it as fetched, TEXT as its bytes in
+    ``encoding``. NULL is ``NULL`` and a BLOB is ``X'<hex>'``. TEXT that decodes strictly in
+    ``encoding`` to printable ASCII is quoted, ``'two'``, quotes doubled, while the quoted form
+    is at most 34 characters; any other TEXT is ``CAST(X'<hex>' AS TEXT)`` of its bytes. Hex
+    shows at most the first 16 bytes, then ``...``. The result is always printable ASCII of
+    at most 52 characters, holds no undecoded byte, and when not cut short selects the same
+    value in SQL.
+    """
+    if value is None:
+        return "NULL"
+    if storage == "text":
+        try:
+            text = value.decode(encoding)
+        except UNREADABLE:
+            text = None
+        if text is not None and all(" " <= c <= "~" for c in text):
+            quoted = "'" + text.replace("'", "''") + "'"
+            if len(quoted) <= 34:
+                return quoted
+    shown = "X'" + value[:16].hex().upper() + ("..." if len(value) > 16 else "") + "'"
+    return f"CAST({shown} AS TEXT)" if storage == "text" else shown
+
+
+def same_json(stored, recorded):
+    """Equal by JSON type and value: false and 0, true and 1, 1 and 1.0 are different.
+
+    Key order and whitespace are gone after parsing. A value canonical() cannot encode,
+    such as NaN or Infinity, is never equal to anything.
+    """
+    try:
+        return canonical(stored) == canonical(recorded)
+    except UNREADABLE:
+        return False
+
+
 # Terminal state of a step that belonged to a planning guide the business no longer uses. The step and
 # its history are kept; it is not open work, never blocks another step and never transitions again.
 SUPERSEDED = "superseded"
@@ -851,6 +913,11 @@ class Service:
             for event in events:
                 event["payload"] = json.loads(event["payload"])
             integrity = self.store.verify_chain(con, bid)
+            # Revision snapshots are selected as CAST(snapshot AS BLOB): sqlite3 raises while
+            # fetching TEXT that is not valid UTF-8, before Python sees it. The cast returns
+            # TEXT as its bytes in the database encoding, BLOB unchanged, a number as its text
+            # and NULL as NULL; read_json decodes those bytes in this encoding, or reports them.
+            encoding = con.execute("PRAGMA encoding").fetchone()[0]
             errors, latest, ai_latest = [], {}, {}
             for event in events:
                 p = event["payload"]
@@ -858,9 +925,10 @@ class Service:
                     latest[p["id"]] = p
                 if p.get("run_id") and p.get("data_sha256"):
                     ai_latest[p["run_id"]] = p
+            versions, history_errors = self._recorded_versions(events)
             objects = self.store.objects(con, bid)
             for obj in [business] + objects:
-                if latest.pop(obj["id"], None) != obj:
+                if not same_json(obj, latest.pop(obj["id"], None)):
                     errors.append(f"Current record differs from history: {obj['id']}")
                 if (
                     obj.get("kind") in {"evidence", "document"}
@@ -869,12 +937,14 @@ class Service:
                     errors.append(f"Content hash mismatch: {obj['id']}")
                 if obj.get("kind"):
                     revision = con.execute(
-                        "SELECT snapshot FROM revisions WHERE object_id=? AND version=?",
+                        "SELECT CAST(snapshot AS BLOB) AS snapshot FROM revisions WHERE object_id=? AND version=?",
                         (obj["id"], obj["version"]),
                     ).fetchone()
-                    if not revision or json.loads(revision[0]) != obj:
+                    if not revision or not same_json(read_json(revision["snapshot"], encoding), obj):
                         errors.append(f"Revision mismatch: {obj['id']}")
             errors.extend(f"Historical record missing: {oid}" for oid in latest)
+            errors.extend(history_errors)
+            errors.extend(self._revision_errors(con, bid, versions, encoding))
             for run in con.execute("SELECT * FROM ai_calls WHERE business_id=?", (bid,)):
                 recorded = ai_latest.pop(run["id"], {})
                 if recorded.get("state") != run["state"] or recorded.get("data_sha256") != digest(
@@ -886,7 +956,7 @@ class Service:
                 **integrity,
                 "valid": integrity["valid"] and not errors,
                 "record_errors": errors,
-                "limitation": "Local hash chain detects mismatches. A database administrator can rewrite the chain; use protected off-machine backups for independent anchoring.",
+                "limitation": LIMITATION,
             }
             if export:
                 archive = {
@@ -911,6 +981,87 @@ class Service:
                 }
                 return {**archive, "sha256": digest(canonical(archive))}
             return {"integrity": integrity, "events": events}
+
+    @staticmethod
+    def _recorded_versions(events):
+        """Map (id, version) to the chained event that records that version, and report history faults.
+
+        An event records a version when its payload's id equals the event's object_id, the payload
+        has data, and its version is a JSON integer (not a boolean, a float such as 2.0, text, null,
+        a list or an object). Walking events in chain order, the first event that records a given
+        id and version stands for it; a later one cannot replace it and is reported once per id and
+        version. An event that would record a version but whose version is not a JSON integer is
+        reported once per id and never stands for any version. Messages follow chain order of the
+        event that first causes each one.
+        """
+        recorded, repeated, unusable, errors = {}, set(), set(), []
+        for event in events:
+            p = event["payload"]
+            if not (p.get("id") == event["object_id"] and "version" in p and "data" in p):
+                continue
+            oid, version = p["id"], p["version"]
+            if type(version) is not int:
+                if oid not in unusable:
+                    unusable.add(oid)
+                    errors.append(f"History records an unusable version: {oid}")
+            elif (oid, version) not in recorded:
+                recorded[(oid, version)] = p
+            elif (oid, version) not in repeated:
+                repeated.add((oid, version))
+                errors.append(f"Version recorded more than once in history: {oid} version {version}")
+        return recorded, errors
+
+    @staticmethod
+    def _revision_errors(con, bid, recorded, encoding):
+        """Compare every stored revision with the chained event that stands for that version.
+
+        ``recorded`` comes from _recorded_versions: integer versions only, the first event for each.
+
+        Store.add/update write one revision row and one event per object version. The
+        business record itself is versioned through events only and never has revisions.
+        Revisions carry no business id, so rows are attributed to this business through
+        its current objects and the object ids named by its events, in one query.
+
+        A version stored as INTEGER or REAL is used as fetched. A TEXT version is selected as
+        its bytes, since sqlite3 raises while fetching TEXT that is not valid UTF-8; a TEXT,
+        BLOB or NULL version matches no chained event and is shown by stored_literal(). The
+        object_id column is fetched as is: a row is only selected when its object_id equals
+        this business's id or an id in its objects or events, so it holds the same text as
+        that id, or a number whose text it is, and fails to decode only if that id does.
+        """
+        errors = []
+        rows = con.execute(
+            "SELECT object_id,typeof(version) AS version_type,"
+            "CASE typeof(version) WHEN 'text' THEN CAST(version AS BLOB) ELSE version END AS stored_version,"
+            "CAST(snapshot AS BLOB) AS snapshot FROM revisions WHERE object_id=? "
+            "OR object_id IN (SELECT id FROM objects WHERE business_id=?) "
+            "OR object_id IN (SELECT object_id FROM events WHERE business_id=?) "
+            "ORDER BY object_id,version",
+            (bid, bid, bid),
+        ).fetchall()
+        stored = {}
+        for row in rows:
+            oid, version = row["object_id"], row["stored_version"]
+            numeric = row["version_type"] in {"integer", "real"}
+            if numeric:
+                stored[(oid, version)] = True
+            else:
+                version = stored_literal(row["version_type"], version, encoding)
+            if oid == bid:
+                errors.append(f"Unexpected revision for business record: {oid} version {version}")
+                continue
+            event = recorded.get((oid, version)) if numeric else None
+            if event is None:
+                errors.append(f"Revision has no recorded history: {oid} version {version}")
+                continue
+            if not same_json(read_json(row["snapshot"], encoding), event):
+                errors.append(f"Historical revision differs from history: {oid} version {version}")
+        errors.extend(
+            f"Historical revision missing: {oid} version {version}"
+            for oid, version in recorded
+            if oid != bid and (oid, version) not in stored
+        )
+        return errors
 
     def principals(self, actor):
         if actor["role"] != "owner":
