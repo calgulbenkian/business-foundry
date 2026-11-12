@@ -23,6 +23,7 @@ import operator
 import os
 import re
 import secrets
+import shlex
 import signal
 import socket
 import sys
@@ -110,6 +111,23 @@ def default_data_dir() -> Path:
     from platformdirs import user_data_dir
 
     return Path(user_data_dir(APP_NAME, appauthor=False, roaming=False))
+
+
+BACKUP_DESTINATION = "/private/path/backup.db"
+
+
+def backup_command(database: str, platform: str) -> str | None:
+    """The command line that backs up ``database``, or None where no ready command is given.
+
+    ``platform`` is ``os.name``. On POSIX the path is quoted for the shell. Windows has two
+    shells with different quoting rules, and this app has not been run on Windows, so there the
+    window gives the path and no ready command. A path holding a character that does not print
+    (a newline, another control character, a direction mark) gets no command either, because
+    the command would not read as what it runs.
+    """
+    if platform != "posix" or not database.isprintable():
+        return None
+    return f"uv run foundry --db {shlex.quote(database)} backup {BACKUP_DESTINATION}"
 
 
 NETWORK_FILESYSTEMS = {

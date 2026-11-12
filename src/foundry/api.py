@@ -159,7 +159,9 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
     is given, only its exact ``host`` (127.0.0.1 and the port) is accepted, writes are judged
     against its exact ``origin`` (``FOUNDRY_PUBLIC_ORIGIN`` is ignored), the window signs in at
     ``/desktop/start`` with the launch code, and a page opened without that session gets a plain
-    instruction page instead of the sign-in form.
+    instruction page instead of the sign-in form. An owner's ``/api/me`` then also holds
+    ``desktop``: the path of the database this server opened and the command that backs it up
+    (``foundry.desktop.backup_command``). No other role, and no ordinary server, gets that field.
     """
     store = Store(db_path or os.getenv("FOUNDRY_DB", ".foundry/foundry.db"))
     service, app = (
@@ -179,6 +181,14 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
     hosts = allowed_hosts or os.getenv("FOUNDRY_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
     failed_logins = defaultdict(deque)
+    desktop_database = None
+    if desktop is not None:
+        from .desktop import backup_command
+
+        # The database this server opened, told to the window's owner so the settings page can
+        # name it in the backup command.
+        database = str(store.path)
+        desktop_database = {"database": database, "backup_command": backup_command(database, os.name)}
 
     @app.exception_handler(DomainError)
     async def domain_error(request, exc):
@@ -321,7 +331,10 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
 
     @app.get("/api/me")
     def me(who=Depends(actor)):
-        return {**who, "ai_configured": adviser.configured()}
+        answer = {**who, "ai_configured": adviser.configured()}
+        if desktop_database is not None and who["role"] == "owner":
+            answer["desktop"] = dict(desktop_database)
+        return answer
 
     @app.get("/api/catalog")
     def get_catalog(who=Depends(actor)):

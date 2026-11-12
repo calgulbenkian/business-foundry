@@ -26,6 +26,7 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 import pytest
+from conftest import fake_uv
 from fastapi.testclient import TestClient
 
 from foundry import desktop
@@ -2191,3 +2192,250 @@ def test_windows_refuses_the_internet_explorer_engine(monkeypatch):
         desktop._require_edge_chromium()
     guilib.initialize = lambda gui: types.SimpleNamespace(renderer="edgechromium")
     desktop._require_edge_chromium()
+
+
+# The backup command the window shows --------------------------------------------------------
+#
+# The owner's /api/me names the database this server opened and the command that backs it up.
+# Expected values are written out here; none is built with the quoting the code uses.
+
+BUSINESS = {"name": "Synthetic backup shop", "concept": "A synthetic business used only in this test."}
+
+
+@contextlib.contextmanager
+def window_session(app):
+    """An HTTP client signed in the way the window signs in, with the launch code."""
+    with httpx.Client() as window:
+        assert window.get(app.signin.issue()).status_code == 303
+        yield window
+
+
+def add_business_through_the_window(app, window, key="backup-business"):
+    response = window.post(
+        app.signin.origin + "/api/businesses",
+        json=BUSINESS,
+        headers={"Idempotency-Key": key, "Origin": app.signin.origin},
+    )
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
+def owner_token(data: Path) -> str:
+    return (data / "owner.key").read_text().strip()
+
+
+def test_the_owners_answer_names_this_servers_database_and_other_roles_get_no_field(tmp_path):
+    data = desktop.prepare_data_dir(tmp_path / "my data")
+    app = DesktopApp(data)
+    app.start()
+    try:
+        expected_path = os.path.realpath(tmp_path) + "/my data/foundry.db"
+        with window_session(app) as window:
+            mine = window.get(app.signin.origin + "/api/me").json()
+            bid = add_business_through_the_window(app, window)
+        expected_command = (
+            "uv run foundry --db '" + expected_path + "' backup /private/path/backup.db"
+            if os.name == "posix"
+            else None
+        )
+        assert mine["desktop"] == {"database": expected_path, "backup_command": expected_command}
+        assert expected_path != str(desktop.default_data_dir() / "foundry.db")
+
+        # The rest of the answer is what the ordinary server gives the same owner.
+        with TestClient(
+            create_app(app.signin.store.path, allowed_hosts=["testserver"]),
+            headers={"Authorization": "Bearer " + owner_token(data)},
+        ) as ordinary:
+            plain = ordinary.get("/api/me").json()
+        assert "desktop" not in plain
+        assert {k: v for k, v in mine.items() if k != "desktop"} == plain
+        assert set(plain) == {"id", "name", "role", "business_ids", "ai_configured"}
+
+        bearer = {"Authorization": "Bearer " + owner_token(data)}
+        by_key = httpx.get(app.signin.origin + "/api/me", headers=bearer).json()
+        assert by_key["desktop"] == mine["desktop"]
+
+        for role in ("operator", "reviewer", "viewer", "agent"):
+            made = httpx.post(
+                app.signin.origin + "/api/principals",
+                json={"name": f"Synthetic {role}", "role": role, "business_ids": [bid]},
+                headers=bearer | {"Origin": app.signin.origin},
+            )
+            assert made.status_code == 201, made.text
+            token = made.json()["token"]
+            answer = httpx.get(app.signin.origin + "/api/me", headers={"Authorization": "Bearer " + token})
+            assert answer.status_code == 200
+            assert answer.json()["role"] == role
+            assert "desktop" not in answer.json()
+            assert set(answer.json()) == {"id", "name", "role", "business_ids", "ai_configured"}
+            with httpx.Client() as person:
+                signed_in = person.post(
+                    app.signin.origin + "/api/login",
+                    json={"token": token},
+                    headers={"Origin": app.signin.origin},
+                )
+                assert signed_in.status_code == 200
+                by_session = person.get(app.signin.origin + "/api/me").json()
+                assert by_session["role"] == role and "desktop" not in by_session
+    finally:
+        app.stop()
+
+
+def test_the_ordinary_server_gives_no_owner_the_desktop_field(tmp_path):
+    store = Store(tmp_path / "foundry.db")
+    token = store.bootstrap()["token"]
+    with TestClient(
+        create_app(store.path, allowed_hosts=["testserver"]), headers={"Authorization": "Bearer " + token}
+    ) as client:
+        answer = client.get("/api/me").json()
+        assert answer["role"] == "owner"
+        assert "desktop" not in answer
+        login = client.post("/api/login", json={"token": token})
+        assert login.status_code == 200
+        client.headers.pop("Authorization")
+        assert "desktop" not in client.get("/api/me").json()
+
+
+def test_the_ordinary_server_still_does_not_import_the_desktop_module(tmp_path):
+    script = (
+        "import sys; from foundry.api import create_app; create_app(sys.argv[1]); "
+        "print('foundry.desktop' in sys.modules)"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "FOUNDRY_DB"}
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "foundry.db")], capture_output=True, text=True, env=env
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "False\n"
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        (
+            "/Users/founder/Library/Application Support/Business Foundry/foundry.db",
+            "uv run foundry --db '/Users/founder/Library/Application Support/Business Foundry/foundry.db' "
+            "backup /private/path/backup.db",
+        ),
+        (
+            "/srv/foundry/data/foundry.db",
+            "uv run foundry --db /srv/foundry/data/foundry.db backup /private/path/backup.db",
+        ),
+        (
+            "/Users/founder/Founder's Records/foundry.db",
+            "uv run foundry --db '/Users/founder/Founder'\"'\"'s Records/foundry.db' backup /private/path/backup.db",
+        ),
+        (
+            '/tmp/$HOME `id`; rm & "x"/foundry.db',
+            "uv run foundry --db '/tmp/$HOME `id`; rm & \"x\"/foundry.db' backup /private/path/backup.db",
+        ),
+        (
+            "/Users/zoë/Données/foundry.db",
+            "uv run foundry --db '/Users/zoë/Données/foundry.db' backup /private/path/backup.db",
+        ),
+        ("/tmp/two\nlines/foundry.db", None),
+        ("/tmp/tab\there/foundry.db", None),
+        ("/tmp/\u202ebd.yrdnuof/foundry.db", None),
+    ],
+    ids=[
+        "spaces",
+        "nothing to quote",
+        "single quote",
+        "shell characters",
+        "non-ascii",
+        "newline",
+        "tab",
+        "rlo",
+    ],
+)
+def test_the_backup_command_is_quoted_for_a_posix_shell(path, expected):
+    assert desktop.backup_command(path, "posix") == expected
+
+
+def test_no_backup_command_is_given_off_posix():
+    assert (
+        desktop.backup_command("C:\\Users\\Founder\\AppData\\Local\\Business Foundry\\foundry.db", "nt")
+        is None
+    )
+    assert desktop.backup_command("/srv/foundry/data/foundry.db", "nt") is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the window gives a ready command only on POSIX shells")
+@pytest.mark.parametrize(
+    "folder",
+    ["Foundry data", "plain", "Founder's data", "$HOME data", "back`tick` data"],
+    ids=["space", "plain", "single quote", "dollar", "backtick"],
+)
+def test_the_shown_command_backs_up_the_windows_database_through_a_real_shell(tmp_path, folder):
+    import shlex
+
+    data = desktop.prepare_data_dir(tmp_path / folder)
+    app = DesktopApp(data)
+    app.start()
+    try:
+        with window_session(app) as window:
+            bid = add_business_through_the_window(app, window)
+            command = window.get(app.signin.origin + "/api/me").json()["desktop"]["backup_command"]
+        assert command.startswith("uv run foundry --db ") and command.endswith(
+            " backup /private/path/backup.db"
+        )
+        destination = tmp_path / "backups" / "backup.db"
+        line = command.replace("/private/path/backup.db", shlex.quote(str(destination)))
+        tools = fake_uv(tmp_path / "tools")
+        work = tmp_path / "work"
+        work.mkdir()
+        env = {k: v for k, v in os.environ.items() if k != "FOUNDRY_DB"}
+        env["PATH"] = str(tools) + os.pathsep + env["PATH"]
+        result = subprocess.run(
+            ["/bin/sh", "-c", line], cwd=work, env=env, capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        assert os.listdir(work) == []  # no .foundry/ in the working folder
+        expected_db = os.path.realpath(tmp_path) + "/" + folder + "/foundry.db"
+        assert result.stdout == (
+            f"Saved {os.path.realpath(tmp_path)}/backups/backup.db: a copy of {expected_db} holding 1 business. "
+            "This private backup includes credential hashes and business data.\n"
+        )
+        con = sqlite3.connect(destination)
+        try:
+            assert [row[0] for row in con.execute("SELECT id FROM businesses")] == [bid]
+        finally:
+            con.close()
+    finally:
+        app.stop()
+
+
+def test_a_backup_restored_into_a_new_folder_opens_in_the_desktop_app(tmp_path, capsys):
+    from foundry import cli
+
+    first = desktop.prepare_data_dir(tmp_path / "first")
+    with desktop.instance_lock(first):
+        app = DesktopApp(first)
+        app.start()
+        try:
+            with window_session(app) as window:
+                bid = add_business_through_the_window(app, window)
+            backup = tmp_path / "backups" / "backup.db"
+            cli.main(["--db", str(first / "foundry.db"), "backup", str(backup)])
+            restored = tmp_path / "restored"
+            cli.main(["--db", str(restored / "foundry.db"), "restore", str(backup)])
+            capsys.readouterr()
+            assert sorted(os.listdir(restored)) == ["foundry.db"]  # no owner.key
+            # The lock is per data folder: the restored folder opens while the first is still open.
+            data = desktop.prepare_data_dir(restored)
+            with desktop.instance_lock(data):
+                second = DesktopApp(data)
+                second.start()
+                try:
+                    with window_session(second) as window:
+                        me = window.get(second.signin.origin + "/api/me").json()
+                        businesses = window.get(second.signin.origin + "/api/businesses").json()
+                    assert me["role"] == "owner"
+                    assert me["desktop"]["database"] == os.path.realpath(tmp_path) + "/restored/foundry.db"
+                    assert [b["id"] for b in businesses] == [bid]
+                    assert [b["data"]["name"] for b in businesses] == [BUSINESS["name"]]
+                    assert not (data / "owner.key").exists()
+                finally:
+                    second.stop()
+        finally:
+            app.stop()
