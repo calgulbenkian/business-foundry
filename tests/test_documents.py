@@ -246,6 +246,41 @@ def test_readiness_report_audits_the_workspace_in_order(harbor):
     )
 
 
+def test_a_step_sent_back_twice_shows_only_the_latest_reason(harbor):
+    _, s, a, _, _ = harbor["setup"]
+    bid = harbor["bid"]
+    first = "Founder may move abroad; recheck."
+    second = "Second founder joins from another country; review the structure again."
+
+    def structure():
+        return next(
+            o
+            for o in s.snapshot(a, bid)["objects"]
+            if o["kind"] == "task" and o["data"]["key"] == "structure"
+        )
+
+    # The fixture already sent the structure decision back once, with the first note.
+    for state, note in (("in_progress", "Synthetic rework."), ("needs_review", second)):
+        step = structure()
+        s.transition(
+            a,
+            bid,
+            step["id"],
+            key(),
+            dump(models.TaskTransition, state=state, expected_version=step["version"], note=note),
+        )
+    history = structure()["data"]["history"]
+    assert [e["note"] for e in history if e.get("to") == "needs_review"] == [first, second]
+    report = generate(harbor, "readiness_report")
+    sent_back = report.split("### Steps sent back for review\n\n")[1].split("\n\n")[0]
+    # Sending it back again also reopens the banking step, which depends on it.
+    assert sent_back.splitlines() == [
+        f"- Decide the entity and ownership structure — reason: {second}",
+        "- Establish banking and payment access — reason: Reopened: Decide the entity and ownership structure.",
+    ]
+    assert first not in report
+
+
 def test_record_blocks_state_certainty_and_evidence_review_in_plain_words(harbor):
     plan = generate(harbor, "business_plan")
     reviewed_on = harbor["evidence"]["interview"]["data"]["review"]["at"][:10]
