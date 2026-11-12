@@ -19,6 +19,7 @@ import hmac
 import logging
 import logging.handlers
 import multiprocessing
+import operator
 import os
 import re
 import secrets
@@ -269,26 +270,80 @@ def replace_missing_streams():
 
 
 REDACTED = "[redacted]"
-# The start address's code parameter however it is written, so that even part of a code (a
-# shortened URL, say), which an exact match would miss, is removed, and with it ``code=``, so
-# that a search of the log for ``code=`` finds no start address.
-_START_QUERY = re.compile(r"(/desktop/start\?(?:[^\s#?]*&)?)code=[A-Za-z0-9_-]*")
+# A start address is recognised by the text ``/desktop/start?``, and everything after it up to
+# the next whitespace is replaced, whatever it holds: an encoded name or value, another parameter
+# first, a fragment, a closing quote. So no part of a code in it is left, and a search of the log
+# for ``code=`` finds no start address. A start address written another way, for example with the
+# ``?`` or the path percent-encoded, is not recognised as one, though a whole code in it is still
+# replaced. Outside a start address a code or token is recognised only as its exact text: a piece
+# of one, or one written another way such as percent-encoded, is not.
+_START_QUERY = re.compile(r"(/desktop/start\?)\S*")
 _PLAIN = logging.Formatter()
+# Arguments of these exact types cannot change their text between conversions, and a format's
+# number conversions need them as they are. A ``str`` argument is redacted directly.
+_FIXED_TYPES = (int, float, bool, type(None))
 
 
-class _RedactedArgument:
-    """Stands in for a log argument that held a secret: it prints the argument's redacted text."""
+class _Unconvertible(Exception):
+    """A log argument's or message's ``str()`` or ``repr()`` raised."""
 
-    __slots__ = ("_str", "_repr")
 
-    def __init__(self, text: str, representation: str):
-        self._str, self._repr = text, representation
+def _is_number(value) -> bool:
+    """Whether a ``%d`` or ``%f`` format accepts ``value``, as CPython's PyNumber_Check decides."""
+    methods = ("__index__", "__int__", "__float__")
+    return isinstance(value, complex) or any(hasattr(type(value), name) for name in methods)
+
+
+class _Argument:
+    """Stands in for a log argument while its record's message is formatted, once.
+
+    Each conversion the format asks for converts the real argument then and returns the redacted
+    text of that conversion, so a precision such as ``%.20s`` shortens text that is already
+    redacted, and the text that was checked is the text that is printed. Number conversions
+    (``%d``, ``%x``, ``%f``, ``%c``) are passed to the real value.
+    """
+
+    __slots__ = ("_value", "_redaction")
+
+    def __init__(self, value, redaction: LogRedaction):
+        self._value, self._redaction = value, redaction
+
+    def _text(self, convert) -> str:
+        try:
+            text = convert(self._value)
+        except Exception as error:
+            raise _Unconvertible from error
+        return self._redaction.redact(text)
 
     def __str__(self):
-        return self._str
+        return self._text(str)
 
     def __repr__(self):
-        return self._repr
+        return self._text(repr)
+
+    def _number(self):
+        if not _is_number(self._value):
+            raise TypeError(f"a number is required, not {type(self._value).__name__}")
+        return self._value
+
+    def __int__(self):
+        return int(self._number())
+
+    def __index__(self):
+        return operator.index(self._number())
+
+    def __float__(self):
+        return float(self._number())
+
+
+class _MappingArgument(_Argument):
+    """Stands in for a mapping argument: ``%(name)s`` gets a stand-in for that value, and
+    ``%s`` the redacted text of the real mapping, written its own way."""
+
+    __slots__ = ()
+
+    def __getitem__(self, key):
+        return self._redaction.prepared(self._value[key])
 
 
 class LogRedaction(logging.Filter):
@@ -301,22 +356,29 @@ class LogRedaction(logging.Filter):
     handlers a library adds for itself (pywebview writes to stderr). Each secret is added before
     it exists outside this module.
 
-    Each argument is checked before the message is formatted, so that a format which shortens it
-    (``%.20s``) cannot leave part of a secret behind: an argument whose ``str()`` or ``repr()``
-    holds a whole secret, or a start address, is replaced by its redacted text. Then a whole
-    secret, or a start address, in the formatted message, the text of a logged exception or a
-    stack is replaced. A start address's ``code=`` parameter is replaced even when it holds only
-    part of a code; any other piece of a secret is not recognised. A record that cannot be
-    checked is withheld.
+    It turns each such record into finished text once, as it is made. The message is formatted
+    with its arguments once, and each conversion of an argument that the format asks for is
+    redacted before the format can shorten it (``%.20s``); an exception is formatted once too.
+    In the message, the exception text and the stack, a whole secret is replaced, and so is
+    everything after ``/desktop/start?`` up to the next whitespace. The record then holds only
+    that text (``args`` and ``exc_info`` are None), so no handler converts anything again: an
+    argument is converted as many times as the format names it, however many handlers there are,
+    and one whose text changes between conversions prints its first text everywhere. A start
+    address is recognised by the text ``/desktop/start?`` only. Outside one, a secret is
+    recognised only as its exact text, not as a piece or written another way (percent-encoded,
+    say). The record's other fields, such as the logger's name, are not checked. A record that
+    cannot be finished is withheld.
 
     As second layers it is also a filter on the handlers present when logging is set up and when
-    the window library loads, and the log file's formatter redacts each finished line. Those
-    layers also check a record built another way, which the factory does not check:
+    the window library loads, and the log file's formatter redacts each finished line. The first
+    of those filters to see a record built another way finishes it by the same rule:
     ``logging.makeLogRecord`` fills a record in after the factory has made it, and ``LogRecord``
-    called directly does not use the factory. A handler added later does not check it.
-    A field passed with ``extra=`` is set on the record after the factory has made it, and
+    called directly does not use the factory. A handler added later that sees it first prints it
+    unchecked. A field passed with ``extra=`` is set on the record after the factory has made it, and
     neither the factory nor a handler filter checks it; the log file's format prints no such field.
     """
+
+    _WITHHELD = "(a log record withheld: it could not be checked for secrets)"
 
     def __init__(self):
         super().__init__()
@@ -349,63 +411,51 @@ class LogRedaction(logging.Filter):
             text = text.replace(secret, REDACTED)
         return text
 
-    def _holds_secret(self, value) -> bool:
-        return any(self.redact(text) != text for text in (str(value), repr(value)))
-
-    def _checked(self, value):
-        """``value`` itself when it holds no secret, otherwise a stand-in for its redacted text."""
-        text, representation = str(value), repr(value)
-        clean, clean_representation = self.redact(text), self.redact(representation)
-        if clean == text and clean_representation == representation:
+    def prepared(self, value):
+        """What the format is given in place of the argument ``value``."""
+        if type(value) is str:
+            return self.redact(value)
+        if type(value) in _FIXED_TYPES:
             return value
-        return _RedactedArgument(clean, clean_representation)
+        return _Argument(value, self)
 
-    def _checked_args(self, args):
-        """The arguments with each one that holds a secret replaced; None when none does."""
-        if isinstance(args, tuple):
-            checked = tuple(self._checked(value) for value in args)
-            changed = any(new is not old for new, old in zip(checked, args, strict=True))
-        elif isinstance(args, collections.abc.Mapping):
-            # A key is printed by ``"%s" % mapping``, but one that holds a secret cannot be
-            # replaced without breaking the lookup, so the record is withheld.
-            if any(self._holds_secret(key) for key in args):
-                raise ValueError("a mapping key holds a secret")
-            checked = {key: self._checked(value) for key, value in args.items()}
-            # ``"%s" % mapping`` prints the mapping's own text, which a mapping type may write
-            # its own way; the plain dict printed in its place holds the checked values.
-            changed = any(checked[key] is not args[key] for key in args) or self._holds_secret(args)
-        else:
-            checked = self._checked(args)
-            changed = checked is not args
-        return checked if changed else None
-
-    def scrub(self, record: logging.LogRecord) -> logging.LogRecord:
-        try:
-            # Before formatting: a precision or width in the format can shorten an argument, and
-            # a shortened secret would not be found in the formatted message.
-            checked = self._checked_args(record.args) if record.args else None
-            if checked is not None:
-                record.args = checked
+    def _finished_message(self, record: logging.LogRecord) -> str:
+        message = record.msg
+        if type(message) is not str:
             try:
-                message = record.getMessage()
-                clean = self.redact(message)
+                message = str(message)
+            except Exception as error:
+                raise _Unconvertible from error
+        if record.args:
+            args = record.args
+            if isinstance(args, tuple):
+                args = tuple(self.prepared(value) for value in args)
+            elif isinstance(args, collections.abc.Mapping):
+                args = _MappingArgument(args, self)
+            else:
+                args = self.prepared(args)
+            try:
+                message = message % args
+            except _Unconvertible:
+                raise
             except Exception:
                 # Arguments that do not fit the message would otherwise be printed raw, with the
                 # logging error, to stderr.
-                message, clean = None, self.redact(f"{record.msg} {record.args!r}")
-            if checked is not None or clean != message:
-                record.msg, record.args = clean, None
-            if record.exc_info:
-                text = _PLAIN.formatException(record.exc_info)
-                clean = self.redact(text)
-                if clean != text:
-                    record.exc_info, record.exc_text = None, clean
-            elif record.exc_text:
+                message = f"{message} {args!r}"
+        return self.redact(message)
+
+    def scrub(self, record: logging.LogRecord) -> logging.LogRecord:
+        try:
+            record.msg, record.args = self._finished_message(record), None
+            if record.exc_info and not record.exc_text:
+                record.exc_text = _PLAIN.formatException(record.exc_info)
+            record.exc_info = None
+            if record.exc_text:
                 record.exc_text = self.redact(record.exc_text)
             if record.stack_info:
                 record.stack_info = self.redact(record.stack_info)
         except Exception:
-            record.msg, record.args = "(a log record withheld: it could not be checked for secrets)", None
+            record.msg, record.args = self._WITHHELD, None
             record.exc_info = record.exc_text = record.stack_info = None
         return record
 

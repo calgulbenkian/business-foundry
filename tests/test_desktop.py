@@ -5,6 +5,9 @@ imported by one test only, which is skipped when the desktop extra is not instal
 """
 
 import contextlib
+import decimal
+import enum
+import fractions
 import importlib.util
 import io
 import logging
@@ -19,7 +22,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 import pytest
@@ -1164,28 +1167,60 @@ def messages(where, text):
     return [message for prefix, message in lines if prefix.rsplit(" ", 1)[1].startswith("synthetic.")]
 
 
-def test_a_mapping_argument_without_a_secret_is_formatted_exactly_as_without_the_redaction(
+class Keep(logging.Handler):
+    """Keeps the records it is given, to look at what a handler receives."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def kept(logger):
+    keep = Keep()
+    logger.addHandler(keep)
+    try:
+        yield keep.records
+    finally:
+        logger.removeHandler(keep)
+
+
+def assert_finished(records, expected):
+    """Each record holds only its finished text: no arguments and no exception object."""
+    assert [record.getMessage() for record in records] == expected
+    assert [record.msg for record in records] == expected
+    assert all(type(record.msg) is str for record in records)
+    assert all(record.args is None and record.exc_info is None for record in records)
+
+
+def test_a_mapping_argument_without_a_secret_is_written_as_finished_text_at_every_place(
     three_places, synthetic_secrets
 ):
     signed_in_secrets(three_places.data)
-    records = []
-
-    class Keep(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    keep = Keep()
-    three_places.child.addHandler(keep)
     mapping = {"count": 7, "name": "synthetic"}
-    try:
+    with kept(three_places.child) as records:
         three_places.child.warning("%(count)d items for %(name)s", mapping)
-    finally:
-        three_places.child.removeHandler(keep)
     expected = "%(count)d items for %(name)s" % mapping  # noqa: UP031 (the way logging formats)
-    assert [record.getMessage() for record in records] == [expected]
-    assert records[0].args is mapping  # the same object
+    assert_finished(records, [expected])
     for where, text in three_places.texts().items():
         assert messages(where, text) == [expected], where
+        assert "withheld" not in text, where
+
+
+def test_a_mapping_key_that_holds_a_secret_is_printed_with_the_secret_replaced(
+    three_places, synthetic_secrets
+):
+    code, token = signed_in_secrets(three_places.data)
+    for secret in (code, token):
+        three_places.child.warning("whole mapping %s", {secret: 1})
+        three_places.child.warning("by name %(name)s", {"name": "synthetic", secret: 2})
+    for where, text in three_places.texts().items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        assert messages(where, text) == ["whole mapping {'[redacted]': 1}", "by name synthetic"] * 2, where
 
 
 def test_a_secret_in_an_extra_field_does_not_reach_the_log_file(three_places, synthetic_secrets):
@@ -1222,27 +1257,17 @@ def test_records_built_outside_the_usual_calls_reach_no_guarded_place(three_plac
         assert texts[where].count("in the arguments [redacted]") == 2, where
 
 
-def test_ordinary_arguments_are_formatted_exactly_as_without_the_redaction(three_places, synthetic_secrets):
+def test_ordinary_arguments_are_written_as_finished_text_at_every_place(three_places, synthetic_secrets):
     signed_in_secrets(three_places.data)
-    records = []
-
-    class Keep(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    keep = Keep()
-    three_places.child.addHandler(keep)
-    try:
-        ratio, name = 2.0 / 3.0, types.SimpleNamespace(label="synthetic")
-        args = (7, ratio, name)
+    ratio, name = 2.0 / 3.0, types.SimpleNamespace(label="synthetic")
+    args = (7, ratio, name)
+    with kept(three_places.child) as records:
         three_places.child.warning("%d items, %.2f ratio, %s name", *args)
-    finally:
-        three_places.child.removeHandler(keep)
     expected = "%d items, %.2f ratio, %s name" % args  # noqa: UP031 (the way logging formats)
-    assert [record.getMessage() for record in records] == [expected]
-    assert all(new is old for new, old in zip(records[0].args, args, strict=True))  # the same objects
+    assert_finished(records, [expected])
     for where, text in three_places.texts().items():
-        assert expected in text, where
+        assert messages(where, text) == [expected], where
+        assert "withheld" not in text, where
 
 
 def test_an_argument_that_cannot_be_turned_into_text_is_withheld_without_raising(
@@ -1264,11 +1289,257 @@ def test_an_argument_that_cannot_be_turned_into_text_is_withheld_without_raising
         def __repr__(self):
             return code
 
-    three_places.child.warning("shortened str %.20s", BadRepr())  # does not raise
+    # The conversion the format asks for raises: the record is withheld.
+    three_places.child.warning("shortened repr %.20r", BadRepr())  # does not raise
+    three_places.child.warning("shortened str %.20s", BadStr())
+    # Only the conversion the format asks for is made, so these print their redacted text.
+    three_places.child.warning("shortened str %.20s", BadRepr())
     three_places.child.warning("shortened repr %.20r", BadStr())
+    withheld = "(a log record withheld: it could not be checked for secrets)"
     for where, text in three_places.texts().items():
         assert leaked_part(code, text) is None, where
-        assert text.count("(a log record withheld: it could not be checked for secrets)") == 2, where
+        assert messages(where, text) == [withheld] * 2 + [
+            "shortened str [redacted]",
+            "shortened repr [redacted]",
+        ]
+
+
+class Changing:
+    """A log argument whose text is the secret on some of its conversions and harmless on the others.
+
+    ``str()`` and ``repr()`` are counted apart, from 1, so a check that converts the argument
+    both ways and then leaves it to be converted again sees it harmless.
+    """
+
+    def __init__(self, secret, secret_on):
+        self.secret, self.secret_on = secret, secret_on
+        self.calls = {"str": 0, "repr": 0}
+
+    def _text(self, kind):
+        self.calls[kind] += 1
+        return self.secret if self.secret_on(self.calls[kind]) else "harmless synthetic text"
+
+    def __str__(self):
+        return self._text("str")
+
+    def __repr__(self):
+        return self._text("repr")
+
+
+CHANGING = {
+    "harmless first, then the secret": lambda n: n > 1,
+    "harmless on odd conversions, the secret on even ones": lambda n: n % 2 == 0,
+    "the secret from the first": lambda n: True,
+}
+
+
+def test_an_argument_whose_text_changes_prints_no_part_of_a_secret(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    expected, arguments = [], []
+    for secret_on in CHANGING.values():
+        first = desktop.REDACTED if secret_on(1) else "harmless synthetic t"
+        for secret in (code, token):
+            lazy, twice, value, shown = (Changing(secret, secret_on) for _ in range(4))
+            three_places.child.warning("lazy %.20s", lazy)
+            three_places.child.warning("twice %.20s %.20s", twice, twice)
+            three_places.child.warning("mapping %(a).20s", {"a": value})
+            three_places.child.warning("repr %.20r", shown)
+            # The second conversion of ``twice`` is its second str().
+            second = desktop.REDACTED if secret_on(2) else "harmless synthetic t"
+            expected += [f"lazy {first}", f"twice {first} {second}", f"mapping {first}", f"repr {first}"]
+            arguments += [(lazy, 1, 0), (twice, 2, 0), (value, 1, 0), (shown, 0, 1)]
+    for where, text in three_places.texts().items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        assert messages(where, text) == expected, where
+    # Each argument was converted as many times as the format names it, and no more.
+    for argument, strs, reprs in arguments:
+        assert argument.calls == {"str": strs, "repr": reprs}
+
+
+class ChangingMessage:
+    """A message object whose text is harmless the first time and holds the secret afterwards."""
+
+    def __init__(self, secret, form):
+        self.secret, self.form, self.calls = secret, form, 0
+
+    def __str__(self):
+        self.calls += 1
+        return self.form % ("harmless" if self.calls == 1 else self.secret)
+
+
+def test_a_message_object_whose_text_changes_prints_no_part_of_a_secret(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    messages_logged = []
+    for secret in (code, token):
+        alone, with_args = ChangingMessage(secret, "alone %s"), ChangingMessage(secret, "with %s and %%s")
+        three_places.child.warning(alone)
+        three_places.child.warning(with_args, "an argument")
+        messages_logged += [alone, with_args]
+    for where, text in three_places.texts().items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        assert messages(where, text) == ["alone harmless", "with harmless and an argument"] * 2, where
+    assert [message.calls for message in messages_logged] == [1] * 4
+
+
+class ChangingError(Exception):
+    """An exception whose text is harmless the first time and holds the secret afterwards."""
+
+    def __init__(self, secret):
+        super().__init__()
+        self.secret, self.calls = secret, 0
+
+    def __str__(self):
+        self.calls += 1
+        return "harmless" if self.calls == 1 else f"failed with {self.secret}"
+
+
+def test_an_exception_whose_text_changes_prints_no_part_of_a_secret(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    errors = []
+    for secret in (code, token):
+        for log in (
+            lambda: three_places.child.exception("failed"),
+            lambda: three_places.child.warning("failed", exc_info=True),
+        ):
+            error = ChangingError(secret)
+            errors.append(error)
+            try:
+                raise error
+            except ChangingError:
+                log()
+    for where, text in three_places.texts().items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        assert text.count("ChangingError: harmless") == 4, where
+    assert [error.calls for error in errors] == [1] * 4
+
+
+def test_an_argument_is_converted_once_and_prints_the_same_text_at_every_place(
+    three_places, synthetic_secrets
+):
+    signed_in_secrets(three_places.data)
+
+    class Counter:
+        calls = 0
+
+        def __str__(self):
+            self.calls += 1
+            return f"counter call {self.calls}"
+
+    counter = Counter()
+    three_places.child.warning("counted %s", counter)
+    assert counter.calls == 1
+    for where, text in three_places.texts().items():
+        assert messages(where, text) == ["counted counter call 1"], where
+
+
+def test_a_start_address_loses_its_whole_query_however_its_code_is_written(three_places, synthetic_secrets):
+    code, _ = signed_in_secrets(three_places.data)
+    start = "http://127.0.0.1:9/desktop/start?"
+    # The first characters percent-encoded: two, because this code starts with "4" and "%34" ends
+    # with "4", so encoding only the first would leave the whole code in the text.
+    encoded = "".join(f"%{ord(character):02X}" for character in code[:2]) + code[2:]
+    plain = [
+        start + "code=" + encoded,
+        start + "code=" + encoded[:30],
+        start + "c%6Fde=" + code[:30],
+        start + "other=1&code=" + encoded[:30],
+        start + "code=" + code[:30],
+        start + "code=" + code[:30] + "#fragment",
+    ]
+    for address in plain:
+        three_places.child.warning("address %s end", address)
+    three_places.child.warning("quoted %r end", start + "code=" + code[:30])
+    three_places.child.info("%s %s %s", "GET", "/desktop/start", 303)  # the app's request line
+    redacted = start + desktop.REDACTED
+    for where, text in three_places.texts().items():
+        lines = messages(where, text)
+        assert lines == [f"address {redacted} end"] * 6 + [
+            f"quoted '{redacted} end",
+            "GET /desktop/start 303",
+        ]
+        for line in lines:
+            for shown in (line, unquote(line)):
+                assert leaked_part(code, shown) is None, where
+
+
+def test_redacting_finished_text_again_changes_nothing(three_places, synthetic_secrets):
+    code, _ = signed_in_secrets(three_places.data)
+    with kept(three_places.child) as records:
+        three_places.child.warning("finished %s", "has %s, %d and 100%")
+        try:
+            raise RuntimeError("synthetic failure, 100%")
+        except RuntimeError:
+            three_places.child.exception("failed at %s", "/desktop/start?code=" + code[:20], stack_info=True)
+    for where, text in three_places.texts().items():
+        lines = text.splitlines()
+        if where == "desktop.log":  # its lines start with the time, level and logger name
+            lines = [line.split(f"{three_places.child.name}: ", 1)[-1] for line in lines]
+        assert "finished has %s, %d and 100%" in lines, where
+        assert (
+            "failed at /desktop/start?[redacted]" in text and "RuntimeError: synthetic failure, 100%" in text
+        )
+    assert_finished(records, ["finished has %s, %d and 100%", "failed at /desktop/start?[redacted]"])
+    assert records[1].exc_text.endswith("RuntimeError: synthetic failure, 100%") and records[1].stack_info
+    for record in records:
+        before = (record.msg, record.args, record.exc_text, record.stack_info)
+        desktop.LOG_REDACTION.scrub(record)
+        assert (record.msg, record.args, record.exc_text, record.stack_info) == before
+    again = desktop.LOG_REDACTION.redact("/desktop/start?" + desktop.REDACTED)
+    assert again == "/desktop/start?" + desktop.REDACTED
+
+
+class Shade(enum.IntEnum):
+    DARK = 42
+
+
+NUMBER_LIKE = [
+    ("%d", (decimal.Decimal("7.9"),)),
+    ("%.2f", (decimal.Decimal("2.345"),)),
+    ("%d %s %x", (Shade.DARK, Shade.DARK, Shade.DARK)),
+    ("%.1f", (fractions.Fraction(7, 3),)),
+    ("%c", (65,)),
+    ("%c", ("z",)),
+    ("%*d", (6, 3)),
+    ("%.*s", (3, "abcdef")),
+    ("%s", (Path("synthetic") / "folder",)),
+]
+
+
+def test_number_like_arguments_print_as_without_the_redaction(three_places, synthetic_secrets):
+    signed_in_secrets(three_places.data)
+    with kept(three_places.child) as records:
+        for form, args in NUMBER_LIKE:
+            three_places.child.warning(form, *args)
+    expected = [form % args for form, args in NUMBER_LIKE]
+    assert_finished(records, expected)
+    for where, text in three_places.texts().items():
+        assert messages(where, text) == expected, where
+
+
+def test_a_record_built_with_make_log_record_and_a_changing_argument_reaches_no_guarded_place(
+    three_places, synthetic_secrets
+):
+    code, token = signed_in_secrets(three_places.data)
+    for secret in (code, token):
+        for secret_on in CHANGING.values():
+            record = logging.makeLogRecord(
+                {
+                    "name": three_places.library.name,
+                    "levelno": logging.WARNING,
+                    "levelname": "WARNING",
+                    "msg": "built %.20s",
+                    "args": (Changing(secret, secret_on),),
+                }
+            )
+            three_places.library.handle(record)
+    texts = three_places.texts()
+    for where in ("desktop.log", "guarded handler"):
+        for secret in (code, token):
+            assert leaked_part(secret, texts[where]) is None, where
+        assert len(messages(where, texts[where])) == 6, where
 
 
 PYWEBVIEW_CHILD = textwrap.dedent("""\
