@@ -35,7 +35,7 @@ The v0.1 screening model does not implement a full quality-of-earnings engagemen
 | Can the team repeat delivery? | Named responsibilities, source rights, an acceptance standard and a second observed delivery |
 | Does work complete honestly? | Provider receipts and human assessments distinct from prepared drafts |
 | Are the economics credible? | Reconciled actual effort, costs, invoice and bank receipt compared with a saved forecast |
-| Do corrections propagate? | A changed assumption or withdrawn source reopens dependent decisions and marks prior documents stale; a jurisdiction change also marks earlier deal analyses and forecasts |
+| Do corrections propagate? | A changed assumption or withdrawn source reopens dependent decisions and marks prior documents stale; a passed due date marks earlier readiness reports; a jurisdiction change also marks earlier deal analyses and forecasts |
 | Can the data be recovered? | A successful restore and integrity check on a separate private database |
 | Can public users reproduce the software? | Fresh installation, synthetic demonstration, automated checks and usable documentation |
 
