@@ -16,6 +16,14 @@
   A response is applied, to the page or to anything kept in `state`, only if the business and the
   load it was requested for are still the ones on screen (and, for something filled into the
   inspector, only while the same item is still shown). Older responses are dropped.
+
+  Everything the page waits for (an answer, a promise chain, a dialog waiting to be shown) belongs
+  to the session that started it, captured before the request is sent. Once that session has
+  ended it changes nothing: no dialog, message, stored state or focus. A form belongs to the
+  business on screen when it opened: it sends to that business, with the ids and versions it was
+  filled from, and it is closed if the page changes to another business before it is sent. The
+  answer to a command speaks for its own business: on another business's page it only says, by
+  name, whether that business's change was saved.
 */
 
 /* ---------------- basics ---------------- */
@@ -85,6 +93,9 @@ const objs = (kind) => (state.snapshot?.objects || []).filter((o) => !kind || o.
 const find = (id) => objs().find((o) => o.id === id);
 const currency = () => state.snapshot?.business.data.currency || 'USD';
 const businessName = () => state.snapshot?.business.data.name || '';
+/* The business on screen, as a form or a command remembers it: where it sends, and the name its
+   result is reported under if the page has moved on by the time the answer arrives. */
+const here = () => ({ bid: state.bid, name: businessName() });
 
 /* Formatter output goes straight into innerHTML, so it must never carry markup. Intl output is
    digits, separators and currency signs; this makes that a guarantee rather than an assumption.
@@ -1815,10 +1826,12 @@ function transitionButtons(t) {
     )
     .join('');
 }
+/* The form carries the business and the version of the step it is drawn from; that is what it
+   sends, whatever the records in memory say by the time it is submitted. */
 function txForm(t) {
   const to = state.open.to;
   const opts = choices(t);
-  return `<form class="confirm" id="tx-form" data-id="${h(t.id)}">
+  return `<form class="confirm" id="tx-form" data-id="${h(t.id)}" data-bid="${h(state.bid)}" data-version="${h(t.version)}">
     <p id="tx-text">${h(moveText(to, t))}</p>
     <div class="form-grid one spaced">${choose(
       'state',
@@ -2879,6 +2892,10 @@ const FOCUS_FALLBACK = {
   'list-right': [SELECTED_ROW, '#list .row'],
   insp: ['#insp-title', SELECTED_ROW],
 };
+/* Where focus goes when the control that had it disappears outside the panes (the out-of-date
+   notice, a dialog closed for it): the selected row, else the first row, else the inspector's
+   heading, whichever is visible. On a phone showing the sources, the current source. */
+const RESTING_FOCUS = [SELECTED_ROW, '#list .row', '#insp-title', SELECTED_SOURCE];
 const SAME_CONTROL = ['data-src', 'data-key', 'data-action', 'data-id', 'data-to', 'data-go'];
 function focusMemo() {
   const el = document.activeElement;
@@ -2989,7 +3006,13 @@ function messageFor(error) {
   console.error(error);
   return 'Something went wrong in this page. Load the current records and try again.';
 }
-async function api(path, options = {}) {
+/* A business command whose answer was lost may have reached the server. Its form keeps the same
+   Idempotency-Key, and the server answers a repeat of the same request under the same key with
+   the result it recorded, so sending the unchanged form again is safe. This is true only while
+   that form is open; a command with other rules passes its own `interrupted` message. */
+const SAME_KEY =
+  'Connection interrupted. Retry the unchanged form to check the same request safely.';
+async function api(path, { interrupted = SAME_KEY, ...options } = {}) {
   const headers = { ...options.headers };
   if (options.body !== undefined) {
     headers['Content-Type'] = 'application/json';
@@ -3002,13 +3025,10 @@ async function api(path, options = {}) {
   try {
     response = await fetch('/api' + path, { ...options, headers, credentials: 'same-origin' });
   } catch {
-    // A command may have reached the server; the same key lets a retry find out safely. A read
-    // changes nothing, so there is nothing to retry carefully.
-    throw new RequestError(
-      command
-        ? 'Connection interrupted. Retry the unchanged form to check the same request safely.'
-        : 'The server could not be reached.',
-    );
+    // A read changes nothing, so there is nothing to retry carefully.
+    const error = new RequestError(command ? interrupted : 'The server could not be reached.');
+    error.interrupted = command;
+    throw error;
   }
   const data = await response.json().catch(() => ({ detail: 'Unexpected server response.' }));
   if (!response.ok) {
@@ -3017,17 +3037,42 @@ async function api(path, options = {}) {
   }
   return data;
 }
-const post = (suffix, body, key) =>
-  api(`/businesses/${state.bid}${suffix}`, {
+/* A command to one business: the business is the one its form was opened for, never the one on
+   screen when it is sent. */
+const post = (bid, suffix, body, key) =>
+  api(`/businesses/${bid}${suffix}`, {
     method: 'POST',
     body,
     headers: { 'Idempotency-Key': key },
   });
+/* Whether a message about a command for `scope` may be read on another business's page: the page
+   shows another one now, or is about to. Such a message names its business. */
+const offScreen = (scope) =>
+  Boolean(scope) &&
+  (scope.bid !== state.bid || Boolean(state.wantBid && state.wantBid !== scope.bid));
+/* The message for a command that failed when its form is no longer open, or when the page shows
+   another business than the one the command was for (`scope`). An interrupted command can no
+   longer be sent again under its key, so the message does not suggest it. */
+function failedText(error, scope) {
+  const elsewhere = offScreen(scope);
+  if (error.interrupted && error.message === SAME_KEY)
+    return elsewhere
+      ? `Connection interrupted. This page cannot tell whether your change was saved to ${scope.name}; check its records before entering it again.`
+      : 'Connection interrupted. This page cannot tell whether your change was saved; load the current records and check before entering it again.';
+  if (!elsewhere) return messageFor(error);
+  return error.recorded
+    ? `The review requested for ${scope.name} did not complete. ${messageFor(error)}`
+    : `Not saved to ${scope.name}. ${messageFor(error)}`;
+}
 /* Sign-out, or a 401: the previous person's records leave memory and the page, not just the view.
-   Any request still in flight belongs to an older load and an older session, so it is dropped. */
+   Any request still in flight belongs to an older load and an older session, so it is dropped,
+   and so is anything waiting to be shown, a new access key included. */
 function forget() {
   loadSeq += 1;
   sessionSeq += 1;
+  waiting.length = 0;
+  dialogAbout = null;
+  clearTimeout(toastTimer);
   Object.assign(state, {
     actor: null,
     businesses: [],
@@ -3096,8 +3141,11 @@ async function refresh() {
     throw error;
   }
   if (stale()) return false;
+  let closed = null;
   if (bid !== state.bid) {
-    // another business: start it from its Today list
+    // another business: nothing about the previous one stays open over it
+    closed = closeForeign(bid, snapshot?.business.data.name || '');
+    // and it starts from its Today list
     Object.assign(state, {
       source: 'today',
       selected: null,
@@ -3142,7 +3190,46 @@ async function refresh() {
   });
   if (!state.snapshot) state.source = 'today';
   renderAll();
+  if (closed !== null) {
+    // the dialog gave focus back to the control that opened it, which the new records replaced
+    if (document.activeElement === document.body || !visible(document.activeElement))
+      focusFirst(RESTING_FOCUS);
+    if (closed) {
+      closedNote = { load, text: closed };
+      toast(closed);
+    }
+  }
   return true;
+}
+/* The note a refresh showed when it closed a form, kept so that a message that follows from the
+   same load (a save reported by name) is shown together with it rather than over it. */
+let closedNote = { load: 0, text: '' };
+/* The business on screen is changing to `bid`. A dialog about the previous one is closed and its
+   content removed, and the decision form of a step is taken away with the step. Returns null
+   when nothing was closed; otherwise what to tell the person: for a form, that it was closed,
+   without saving if nothing was sent from it, and for a view of the records, nothing. */
+function closeForeign(bid, name) {
+  const now = name ? `this page now shows ${name}` : 'this page no longer shows a business';
+  const notes = [];
+  const d = $('#dialog'),
+    about = dialogAbout,
+    dialog = d.open && Boolean(about?.bid) && about.bid !== bid;
+  if (dialog) {
+    d.close();
+    $('#dialog-content').innerHTML = '';
+    $('#dialog-title').textContent = '';
+    if (about.form)
+      notes.push(`“${about.title}” was closed${about.sent ? '' : ' without saving'}; ${now}.`);
+  }
+  const tx = $('#tx-form');
+  if (tx && tx.dataset.bid !== bid) {
+    const sent = tx.querySelector('[type=submit]').disabled || Boolean(state.open?.unsure);
+    const step = find(tx.dataset.id)?.title || 'a step';
+    notes.push(
+      `The decision form for “${step}” was closed${sent ? '' : ' without saving'}; ${now}.`,
+    );
+  }
+  return dialog || notes.length ? notes.join(' ') : null;
 }
 /* A reload that failed. After a command the server accepted, that failure is not the command's:
    the change is saved and only the page is behind. A notice on the page says so, offers to load
@@ -3171,16 +3258,19 @@ function reloadFailed(error, again = false) {
       : `Your change was saved, but this page could not load the current records. ${reason} What you see may not include it yet`) +
     `; there is no need to enter it again.${missed}`;
 }
-/* Reload after a command the server accepted. The view a save asked to move to (`moved`, the view
-   before it) is kept only together with the records that show it. */
-async function reloadAfter(before) {
+/* Reload after a command the server accepted, while the page shows the business it was for
+   (`scope`; null for a command that is not about one business). The view a save asked to move to
+   (`moved`, the view before it) is kept only together with the records that show it. */
+async function reloadAfter(before, scope = null) {
   state.behind = true;
   const session = sessionSeq,
     moved = { source: state.source, selected: state.selected };
   try {
-    await refresh();
+    const shown = await refresh();
     // when a newer reload took over, that one shows the records, or reports why it could not
-    if (session === sessionSeq) toast('Saved to the workspace.');
+    if (session !== sessionSeq) return;
+    const also = shown && closedNote.load === state.loaded ? ' ' + closedNote.text : '';
+    toast(savedText(scope) + also);
   } catch (error) {
     if (session !== sessionSeq) return;
     if (before && state.source === moved.source && state.selected === moved.selected)
@@ -3189,6 +3279,8 @@ async function reloadAfter(before) {
     reloadFailed(error);
   }
 }
+const savedText = (scope) =>
+  offScreen(scope) ? `Saved to ${scope.name}.` : 'Saved to the workspace.';
 
 /* ---------------- forms ---------------- */
 const TEMPLATES = {
@@ -3230,52 +3322,124 @@ const evidenceSelect = (
     multi ? 'Select one or more. On a computer, use Ctrl or Command to select several.' : '',
     multi,
   );
-function showDialog(title, html) {
+/* What the open dialog is about: `bid` is the business whose records it shows or writes to, or
+   null for a dialog that is not about the business on screen (creating a business, access keys);
+   `form` marks a form, `sent` one that has sent its command, `secret` the dialog showing a new
+   access key. Set by showDialog; a dialog about one business is closed when the page changes to
+   another. */
+let dialogAbout = null;
+/* Dialogs that arrived while another was open (a new access key, or the notice that one may not
+   have been created), shown in turn once no dialog is open. Each belongs to the session it was
+   requested in, and the queue is emptied when that session ends. */
+const waiting = [];
+function showDialog(title, html, about = null) {
+  dialogAbout = about;
   $('#dialog-title').textContent = title;
   $('#dialog-content').innerHTML = html;
   if (!$('#dialog').open) $('#dialog').showModal();
 }
-function formDialog(title, fields, submit, button = 'Save', intro = '', after = null) {
+/* Show a dialog that arrived late, without replacing one the person has open. */
+function showWhenFree(session, title, html, about = null) {
+  if (session !== sessionSeq) return;
+  waiting.push({ session, title, html, about });
+  showWaiting();
+}
+function showWaiting() {
+  if ($('#dialog').open) return;
+  while (waiting.length) {
+    const next = waiting.shift();
+    if (next.session !== sessionSeq) continue;
+    showDialog(next.title, next.html, next.about);
+    return;
+  }
+}
+$('#dialog').addEventListener('close', () => {
+  // a dialog opened since (by the page, before this event arrived) is left as it is
+  if ($('#dialog').open) return;
+  // a shown access key leaves the page with its dialog
+  if (dialogAbout?.secret) {
+    $('#dialog-content').innerHTML = '';
+    $('#dialog-title').textContent = '';
+  }
+  dialogAbout = null;
+  showWaiting();
+});
+/* A form in a dialog. It belongs to the business on screen when it opens (`scope`): `submit`
+   receives that scope and sends there. Unless `free` (a form that is not about the business on
+   screen), the form is closed if the page changes to another business before it is sent, and
+   its result is reported under its own business's name if the page has moved on. `lost` takes
+   over when the answer to the command was lost and the command has no safe repeat. */
+function formDialog(
+  title,
+  fields,
+  submit,
+  button = 'Save',
+  intro = '',
+  after = null,
+  { free = false, lost = null } = {},
+) {
+  const scope = here(),
+    about = { bid: free ? null : scope.bid, form: true, sent: false, title };
   showDialog(
     title,
     `<form id="active-form">${intro ? `<p>${h(intro)}</p>` : ''}<div class="form-grid">${fields}</div><p class="error spaced" role="alert"></p><div class="form-actions">${btn('Cancel', 'data-action="close-dialog"')}<button class="btn primary" type="submit">${h(button)}</button></div></form>`,
+    about,
   );
   const form = $('#active-form');
   const command = crypto.randomUUID();
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    // a form for a business that is no longer on screen sends nothing (it is closed when the
+    // business changes; this is the second line of that rule)
+    if (!free && state.bid !== scope.bid) return;
     $('#toast').hidden = true;
     const b = form.querySelector('[type=submit]');
     b.disabled = true;
     form.querySelector('.error').textContent = '';
-    const bid = state.bid,
+    const shown = state.bid,
       session = sessionSeq;
+    about.sent = true;
     let result;
     try {
-      result = await submit(new FormData(form), command);
+      result = await submit(new FormData(form), command, scope);
     } catch (error) {
       if (session !== sessionSeq) return;
+      if (lost && error.interrupted) {
+        lost(form);
+        return;
+      }
       // The command itself failed. Its form stays, with the same key, so sending it again
       // unchanged is safe; if the person closed it meanwhile, the message is shown instead.
       b.disabled = false;
+      // a refused command kept nothing; one whose answer was lost may have been saved, and the
+      // form says so if it is closed later
+      if (error.interrupted) about.unsure = true;
+      about.sent = Boolean(about.unsure);
       if (form.isConnected && $('#dialog').open) {
         form.querySelector('.error').textContent = messageFor(error);
         // a failed save leaves focus on its button, which disabling had cleared
         if (document.activeElement === document.body) b.focus();
-      } else toast(messageFor(error));
+      } else toast(failedText(error, free ? null : scope));
       return;
     }
     if (session !== sessionSeq) return;
     // Saved. The dialog can be closed, and another opened, while a save is in flight; a late
-    // result closes only its own form, and moves the view only if the same business is shown.
-    if (form.isConnected) $('#dialog').close();
+    // result closes only its own form.
+    if (form.isConnected && $('#dialog').open && dialogAbout === about) $('#dialog').close();
+    // On another business's page the result is only reported, by name: that page is not behind,
+    // and its view, state and focus are not this command's to change.
+    if (!free && state.bid !== scope.bid) {
+      toast(savedText(scope));
+      return;
+    }
     const before = {
       source: state.source,
       selected: state.selected,
       remembered: { ...state.remembered },
     };
-    if (after && state.bid === bid && !state.wantBid) after(result);
-    await reloadAfter(before);
+    // the view moves only if the same business is shown and no switch to another is pending
+    if (after && state.bid === shown && !state.wantBid) after(result);
+    await reloadAfter(before, free ? null : scope);
   });
 }
 const selectAfter = (source, prefix) => (result) => {
@@ -3285,7 +3449,9 @@ const selectAfter = (source, prefix) => (result) => {
   state.remembered[source] = state.selected;
 };
 function businessDialog(edit = false) {
-  const b = edit ? state.snapshot.business.data : {};
+  const b = edit ? state.snapshot.business.data : {},
+    // the version the fields are filled from; a newer one is refused by the server, not overwritten
+    version = edit ? state.snapshot.business.version : null;
   const fields =
     input('name', 'Business name', b.name || '', 'text', '', 'required maxlength="240"') +
     choose(
@@ -3330,12 +3496,12 @@ function businessDialog(edit = false) {
   formDialog(
     edit ? 'Edit business' : 'Create a business',
     fields,
-    async (f, key) => {
+    async (f, key, scope) => {
       const body = Object.fromEntries(f);
       body.is_demo = f.has('is_demo');
       if (edit) {
-        body.expected_version = state.snapshot.business.version;
-        return api('/businesses/' + state.bid, {
+        body.expected_version = version;
+        return api('/businesses/' + scope.bid, {
           method: 'PUT',
           body,
           headers: { 'Idempotency-Key': key },
@@ -3351,13 +3517,15 @@ function businessDialog(edit = false) {
       // the new business opens on its Today list once its records arrive
       if (!edit) state.wantBid = result.id;
     },
+    // creating a business is not about the one on screen
+    { free: !edit },
   );
 }
 function recordDialog(id) {
   const o = id ? find(id) : null,
     d = o?.data || {};
   if (!canWrite()) {
-    showDialog(o.title, `<pre>${h(JSON.stringify(o, null, 2))}</pre>`);
+    showDialog(o.title, `<pre>${h(JSON.stringify(o, null, 2))}</pre>`, { bid: state.bid });
     return;
   }
   formDialog(
@@ -3384,7 +3552,7 @@ function recordDialog(id) {
         'Optional links to the shared business records.',
         true,
       ),
-    async (f, key) => {
+    async (f, key, scope) => {
       const body = Object.fromEntries(f);
       body.evidence_ids = f.getAll('evidence_ids');
       body.related_ids = f.getAll('related_ids');
@@ -3392,13 +3560,13 @@ function recordDialog(id) {
       body.properties = d.properties || {};
       if (o) {
         body.expected_version = o.version;
-        return api(`/businesses/${state.bid}/records/${id}`, {
+        return api(`/businesses/${scope.bid}/records/${id}`, {
           method: 'PUT',
           body,
           headers: { 'Idempotency-Key': key },
         });
       }
-      return post('/records', body, key);
+      return post(scope.bid, '/records', body, key);
     },
     'Save record',
     o ? 'Changing a record reopens completed steps that rely on records of this type.' : '',
@@ -3434,10 +3602,10 @@ function newEvidence() {
         'Optional reference. The server does not fetch it.',
       ) +
       input('effective_date', 'Effective date', '', 'date'),
-    async (f, key) => {
+    async (f, key, scope) => {
       const body = Object.fromEntries(f);
       body.effective_date = body.effective_date || null;
-      return post('/evidence', body, key);
+      return post(scope.bid, '/evidence', body, key);
     },
     'Save unverified evidence',
     '',
@@ -3454,8 +3622,9 @@ function reviewEvidence(id, revoke = false) {
       '',
       'Describe what you checked, its relevance and any limitations.',
     ),
-    async (f, key) =>
+    async (f, key, scope) =>
       post(
+        scope.bid,
         `/evidence/${id}/${revoke ? 'revoke' : 'review'}`,
         { note: f.get('note'), expected_version: o.version },
         key,
@@ -3517,7 +3686,7 @@ function forecastDialog() {
               ),
         )
         .join(''),
-    async (f, key) => {
+    async (f, key, scope) => {
       const inputs = {};
       for (const [k] of financeFields) {
         if (k === 'fixed_cost_step_month') {
@@ -3529,6 +3698,7 @@ function forecastDialog() {
             : f.get(k);
       }
       return post(
+        scope.bid,
         '/forecasts',
         { title: f.get('title'), inputs, evidence_ids: f.getAll('evidence_ids') },
         key,
@@ -3581,7 +3751,7 @@ function dealDialog(id) {
         )
         .join('') +
       `<details class="full"><summary>Earnings adjustments (${d.adjustments?.length || 0} retained from prior analysis)</summary><p class="hint">Existing adjustments are retained. Add another here; only adjustments with reviewed evidence enter normalized earnings. Management replacement is deducted separately.</p>${d.adjustments?.length ? `<pre>${h(JSON.stringify(d.adjustments, null, 2))}</pre>` : ''}<div class="form-grid spaced">${input('adjustment_label', 'New adjustment label')}${input('adjustment_amount', 'Adjustment amount', 0, 'number', 'Positive adds to EBITDA; negative deducts.', 'step="any"')}${evidenceSelect('adjustment_evidence', 'Adjustment evidence', '', false, false)}</div></details>`,
-    async (f, key) => {
+    async (f, key, scope) => {
       const body = {
         target: f.get('target'),
         thesis: f.get('thesis'),
@@ -3599,7 +3769,7 @@ function dealDialog(id) {
             evidence_id: f.get('adjustment_evidence') || null,
           },
         ];
-      return post('/deals', body, key);
+      return post(scope.bid, '/deals', body, key);
     },
     'Calculate and create diligence work',
     'Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
@@ -3621,8 +3791,13 @@ function documentDialog(dealId = null) {
         [['', 'Not applicable'], ...objs('deal').map((o) => [o.id, o.title])],
         dealId || '',
       ),
-    async (f, key) =>
-      post('/documents', { template: f.get('template'), deal_id: f.get('deal_id') || null }, key),
+    async (f, key, scope) =>
+      post(
+        scope.bid,
+        '/documents',
+        { template: f.get('template'), deal_id: f.get('deal_id') || null },
+        key,
+      ),
     'Generate draft',
     'Documents keep the source version and explicit unknowns. Contract outputs are preparation briefs, not executable legal agreements.',
     selectAfter('documents', 'doc:'),
@@ -3647,7 +3822,7 @@ function invoiceDialog() {
       input('due_date', 'Due date', '', 'date', '', 'required') +
       evidenceSelect('contract_evidence_id', 'Agreement evidence', '', false, false) +
       evidenceSelect('acceptance_evidence_id', 'Delivery acceptance evidence', '', false, false),
-    async (f, key) => post('/invoices', Object.fromEntries(f), key),
+    async (f, key, scope) => post(scope.bid, '/invoices', Object.fromEntries(f), key),
     'Save draft',
     'A draft remains internal. A human reviewer must attach reviewed external receipts before recording actual issue.',
     selectAfter('sales', 'inv:'),
@@ -3659,8 +3834,13 @@ function issueDialog(id) {
     'Record external invoice issue',
     evidenceSelect('evidence_id', 'Issue receipt', '', true, false) +
       area('note', 'Issue note', '', 'Record where and when the invoice was actually issued.'),
-    async (f, key) =>
-      post(`/invoices/${id}/issue`, { ...Object.fromEntries(f), expected_version: o.version }, key),
+    async (f, key, scope) =>
+      post(
+        scope.bid,
+        `/invoices/${id}/issue`,
+        { ...Object.fromEntries(f), expected_version: o.version },
+        key,
+      ),
     'Record issue',
     'This records an action you already completed with your invoicing provider. It does not send anything. Agreement, acceptance and issue evidence must be reviewed external receipts.',
   );
@@ -3687,12 +3867,15 @@ function paymentDialog(id) {
         'required',
       ) +
       evidenceSelect('evidence_id', 'Reviewed payment receipt', '', true, false),
-    async (f, key) => post(`/invoices/${id}/payments`, Object.fromEntries(f), key),
+    async (f, key, scope) =>
+      post(scope.bid, `/invoices/${id}/payments`, Object.fromEntries(f), key),
     'Record payment',
     'Record only money actually received. Partial payments are supported; duplicate references and overpayments are rejected.',
   );
 }
 function keyDialog() {
+  // the name the key is created under, kept to name it if the answer is lost
+  let name = '';
   formDialog(
     'Create scoped access',
     input('name', 'Person or agent name', '', 'text', '', 'required') +
@@ -3716,23 +3899,47 @@ function keyDialog() {
         true,
       ),
     async (f) => {
+      // captured before the request: a key that arrives after this session ended is dropped
+      const session = sessionSeq;
+      name = f.get('name');
       const key = await api('/principals', {
         method: 'POST',
-        body: { name: f.get('name'), role: f.get('role'), business_ids: f.getAll('business_ids') },
+        body: { name, role: f.get('role'), business_ids: f.getAll('business_ids') },
       });
-      const session = sessionSeq;
-      setTimeout(
-        () =>
-          session === sessionSeq &&
-          showDialog(
-            'Save this access key',
-            `<p>The server stores only a hash. Copy this key into a password manager or your client’s secret settings; it will not be shown again.</p><pre>${h(key.token)}</pre><p class="fine">${h(key.name)} · ${h(label(key.role))}. Never put the key in GitHub, a screenshot or a shared document.</p>`,
-          ),
-        200,
-      );
-      return key;
+      // Shown once, in this session only, and never over a dialog the person has open: it waits
+      // for that dialog (this form included) to close. A change of business does not close it.
+      // A key for a session that has ended is not put anywhere.
+      if (session === sessionSeq)
+        showWhenFree(
+          session,
+          'Save this access key',
+          `<p>The server stores only a hash. Copy this key into a password manager or your client’s secret settings; it will not be shown again.</p><pre>${h(key.token)}</pre><p class="fine">${h(key.name)} · ${h(label(key.role))}. Never put the key in GitHub, a screenshot or a shared document.</p>`,
+          { secret: true },
+        );
+      // the secret is not kept anywhere else
+      return { id: key.id, name: key.name };
     },
     'Create key',
+    '',
+    null,
+    {
+      free: true,
+      // The server cannot answer a repeat of this command from its records: it keeps only a hash
+      // of the key, so a second request makes a second key. A lost answer is said to be lost.
+      lost: (form) => {
+        const session = sessionSeq;
+        const text = `Connection interrupted, so this page cannot tell whether the access key “${name}” was created. A key that was created cannot be shown again. Look at the access keys under Access & assistants: if there is a key named “${name}” that you did not receive, revoke it, then create a new one.`;
+        const html = `<p>${h(text)}</p><div class="form-actions">${btn('Close', 'data-action="close-dialog"', true)}</div>`;
+        if (form.isConnected && $('#dialog').open) {
+          showDialog('Access key not confirmed', html);
+          $('#dialog-content [data-action="close-dialog"]').focus();
+        } else showWhenFree(session, 'Access key not confirmed', html);
+        // the list shows whether the key is there; if it cannot be loaded, the notice stands
+        refresh().catch((e) => {
+          if (session === sessionSeq) reloadFailed(e);
+        });
+      },
+    },
   );
 }
 function aiDialog() {
@@ -3744,8 +3951,9 @@ function aiDialog() {
       'What are the most important unsupported assumptions and the next three useful actions for this business?',
     ) +
       `<label class="check full"><input name="share" type="checkbox" required>I agree to send this business concept, record titles, status, details and summary totals to the configured OpenAI API account. Evidence bodies and full financial tables are omitted.</label>`,
-    async (f, key) => {
+    async (f, key, scope) => {
       const r = await post(
+        scope.bid,
         '/ai',
         {
           question: f.get('question'),
@@ -3754,7 +3962,12 @@ function aiDialog() {
         },
         key,
       );
-      if (r.state !== 'succeeded') throw new RequestError(r.data.error || r.data.note);
+      if (r.state !== 'succeeded') {
+        // the run is recorded, with its outcome; only the advice is missing
+        const error = new RequestError(r.data.error || r.data.note);
+        error.recorded = true;
+        throw error;
+      }
       return r;
     },
     'Share and request review',
@@ -3767,9 +3980,13 @@ function aiDialog() {
 }
 async function submitTransition(form) {
   const open = state.open,
-    t = open?.kind === 'tx' && open.id === form.dataset.id ? find(open.id) : null;
-  // a form left from a decision that is no longer open is taken away rather than sent
-  if (!t) {
+    id = form.dataset.id,
+    // what the form was drawn from: its business, and the step's version it shows
+    scope = { bid: form.dataset.bid, name: businessName() },
+    version = Number(form.dataset.version);
+  // a form left from a decision that is no longer open, or drawn for a business or step no
+  // longer on screen, is taken away rather than sent
+  if (open?.kind !== 'tx' || open.id !== id || scope.bid !== state.bid || !find(id)) {
     rerender(renderInspector);
     return;
   }
@@ -3782,32 +3999,41 @@ async function submitTransition(form) {
   const session = sessionSeq;
   try {
     await post(
-      `/tasks/${t.id}/transition`,
+      scope.bid,
+      `/tasks/${id}/transition`,
       {
         state: f.get('state'),
         note: f.get('note'),
         evidence_ids: f.getAll('evidence_ids'),
-        expected_version: t.version,
+        expected_version: version,
       },
       open.key,
     );
   } catch (error) {
     if (session !== sessionSeq) return;
+    // a lost answer may have been saved; if the form is closed later, it does not say otherwise
+    if (error.interrupted) open.unsure = true;
     // The decision itself failed: the form stays, and sending it again uses the same key.
     if (form.isConnected) {
       form.querySelector('.error').textContent = messageFor(error);
       b.disabled = false;
       if (memo?.el === b && document.activeElement === document.body) b.focus();
-    } else toast(messageFor(error));
+    } else toast(failedText(error, scope));
     return;
   }
   if (session !== sessionSeq) return;
+  // On another business's page the decision is only reported, by name. That page records
+  // nothing for it, is not behind, and keeps its view and focus.
+  if (state.bid !== scope.bid) {
+    toast(savedText(scope));
+    return;
+  }
   // Accepted. Close this decision's form if it is still the one open; until a reload shows the
   // step as it now is, the step says the decision is recorded instead of offering its moves.
-  state.accepted[t.id] = f.get('state');
+  state.accepted[id] = f.get('state');
   if (state.open === open) state.open = null;
-  await reloadAfter();
-  restoreFocus(memo);
+  await reloadAfter(undefined, scope);
+  if (session === sessionSeq && state.bid === scope.bid) restoreFocus(memo);
 }
 
 /* ---------------- events ---------------- */
@@ -3826,7 +4052,7 @@ async function handle(a, el) {
         // focus left with the control: to its region's place, or, from the notice, to the list
         restoreFocus(memo);
         if (document.activeElement === document.body || !visible(document.activeElement))
-          focusFirst([SELECTED_ROW, '#list .row', '#insp-title']);
+          focusFirst(RESTING_FOCUS);
       }
     } catch (e) {
       reloadFailed(e, true);
@@ -3835,10 +4061,21 @@ async function handle(a, el) {
       // a reload that failed again leaves focus on the control, so it can be pressed again
       if (el.isConnected && visible(el) && document.activeElement === document.body) el.focus();
     }
-  } else if (a === 'dismiss-outdated') $('#outdated').hidden = true;
-  else if (a === 'logout') {
-    await api('/logout', { method: 'POST' });
-    showLogin();
+  } else if (a === 'dismiss-outdated') {
+    $('#outdated').hidden = true;
+    // the control that had focus is gone with the notice
+    if (document.activeElement === document.body || !visible(document.activeElement))
+      focusFirst(RESTING_FOCUS);
+  } else if (a === 'logout') {
+    const session = sessionSeq;
+    await api('/logout', {
+      method: 'POST',
+      // signing out twice is safe: the second either ends the session or is refused as signed out
+      interrupted:
+        'Connection interrupted, so this page cannot tell whether you were signed out. Signing out again is safe.',
+    });
+    // an answer for a session that has already ended (a 401 meanwhile) ends nothing newer
+    if (session === sessionSeq) showLogin();
   } else if (a === 'new-business') businessDialog();
   else if (a === 'edit-business') businessDialog(true);
   else if (a === 'new-record') recordDialog();
@@ -3866,10 +4103,11 @@ async function handle(a, el) {
     showDialog(
       o.title,
       `${o.stale ? '<div class="flag"><span></span><div>The records this draft was made from have changed since it was generated.</div></div>' : ''}<pre class="document">${h(o.data.content)}</pre><div class="i-actions"><a class="btn" href="/api/businesses/${h(state.bid)}/documents/${h(id)}/download">Download Markdown</a></div>`,
+      { bid: state.bid },
     );
   } else if (a === 'inspect') {
     const o = find(id);
-    showDialog(o.title, `<pre>${h(JSON.stringify(o.data, null, 2))}</pre>`);
+    showDialog(o.title, `<pre>${h(JSON.stringify(o.data, null, 2))}</pre>`, { bid: state.bid });
   } else if (a === 'new-invoice') invoiceDialog();
   else if (a === 'issue-invoice') issueDialog(id);
   else if (a === 'new-payment') paymentDialog(id);
@@ -3878,15 +4116,28 @@ async function handle(a, el) {
     formDialog(
       'Revoke access key',
       '<p class="full">This immediately prevents the selected key and its sessions from accessing this server.</p>',
-      async () => api('/principals/' + id, { method: 'DELETE' }),
+      async () =>
+        api('/principals/' + id, {
+          method: 'DELETE',
+          // revoking a key that is already revoked reports it revoked again
+          interrupted:
+            'Connection interrupted, so this page cannot tell whether the key was revoked. Revoking it again is safe.',
+        }),
       'Revoke key',
+      '',
+      null,
+      { free: true },
     );
   } else if (a === 'ai-review') aiDialog();
 }
 document.addEventListener('click', (event) => {
   const action = event.target.closest('[data-action]');
   if (action) {
-    handle(action.dataset.action, action).catch((e) => toast(messageFor(e)));
+    // a failure that arrives after its session ended (a 401 ends it) has nothing left to say
+    const session = sessionSeq;
+    handle(action.dataset.action, action).catch((e) => {
+      if (session === sessionSeq) toast(messageFor(e));
+    });
     return;
   }
   const link = event.target.closest('[data-go]');
@@ -3964,7 +4215,12 @@ $('#login-form').addEventListener('submit', async (event) => {
   b.disabled = true;
   $('#login-error').textContent = '';
   try {
-    await api('/login', { method: 'POST', body: { token: new FormData(form).get('token') } });
+    await api('/login', {
+      method: 'POST',
+      body: { token: new FormData(form).get('token') },
+      // a second sign-in only opens another session
+      interrupted: 'Connection interrupted. Signing in again is safe.',
+    });
     form.reset();
     await start();
   } catch (e) {

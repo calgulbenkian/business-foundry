@@ -63,24 +63,30 @@ const focused = (page) =>
       pane: a.closest('.pane')?.classList[1] || null,
     };
   });
-/* Hold back every response matching a path until release(): the request reaches the server at
-   once, so the held response is what the server said then, delivered late. */
-async function hold(page, path) {
+/* Hold back every response matching a path (and, if given, a method) until release(): the
+   request reaches the server at once, so the held response is what the server said then,
+   delivered late. `requested` resolves with that response once the server has answered. With
+   `lose`, release() drops the connection instead, as a lost answer does: the server acted, and
+   the page never hears what it said. */
+async function hold(page, path, { method = null, lose = false } = {}) {
   const match = (url) => url.pathname === path;
+  const mine = (r) => match(new URL(r.url())) && (!method || r.method() === method);
   let open, seen;
   const gate = new Promise((r) => (open = r)),
     requested = new Promise((r) => (seen = r));
   const handler = async (route) => {
+    if (method && route.request().method() !== method) return route.fallback();
     const response = await route.fetch();
-    seen();
+    seen(response);
     await gate;
-    await route.fulfill({ response });
+    if (lose) await route.abort('connectionreset');
+    else await route.fulfill({ response });
   };
   await page.route(match, handler);
   return {
     requested,
     async release() {
-      const finished = page.waitForEvent('requestfinished', (r) => match(new URL(r.url())));
+      const finished = page.waitForEvent(lose ? 'requestfailed' : 'requestfinished', mine);
       open();
       await finished;
       await page.unroute(match, handler);
@@ -866,7 +872,7 @@ async function main() {
     race.on('pageerror', (e) => errors.push(e.message));
     // the connections this page's tests drop on purpose are logged by the browser as failed loads
     race.on('console', (m) => {
-      if (m.type() === 'error' && !/401|net::ERR_CONNECTION_RESET/.test(m.text()))
+      if (m.type() === 'error' && !/401|409|net::ERR_CONNECTION_RESET/.test(m.text()))
         errors.push(m.text());
     });
     const demoName = demo.business.data.name,
@@ -1179,6 +1185,657 @@ async function main() {
       'each decision is recorded once',
     );
 
+    // Late answers belong to the session and the business they were sent from. Each case below
+    // starts from a freshly loaded, signed-in page; every case runs, and the failures are
+    // reported together, so a regression shows each case it breaks. No access key is printed:
+    // a key read from a held answer is only ever compared, never put into a message.
+    const ownerKey = () => readFileSync(join(temp, 'owner.key'), 'utf8').trim();
+    const signInAgain = async () => {
+      await race.getByLabel('Access key', { exact: true }).fill(ownerKey());
+      await race.getByRole('button', { name: 'Open workspace' }).click();
+      await race.locator('#list .today-head').waitFor();
+    };
+    const signOut = async () => {
+      await race.locator('.toolbar [data-action="logout"]').click();
+      await race.getByLabel('Access key', { exact: true }).waitFor();
+    };
+    const settle = async () => {
+      await race.unrouteAll({ behavior: 'ignoreErrors' });
+      await race.setViewportSize({ width: 1440, height: 1050 });
+      await race.goto(origin);
+      await race.waitForFunction(
+        () =>
+          !document.querySelector('#login').hidden ||
+          document.querySelector('#list .today-head, #list .row'),
+      );
+      if (await race.locator('#login').isVisible()) await signInAgain();
+    };
+    const toastText = () => race.locator('#toast').innerText();
+    const rowIn = (text) => race.locator('#list .row').filter({ hasText: text }).first();
+    const dialogOpen = () => race.locator('#dialog').evaluate((d) => d.open);
+    const dialogTitle = () => race.locator('#dialog-title').innerText();
+    const inDialog = (name) =>
+      race.locator('#dialog').getByRole('button', { name, exact: true }).click();
+    const snapshotOf = async (id) =>
+      (await context.request.get(`${origin}/api/businesses/${id}`)).json();
+    const recordsIn = async (id, title) =>
+      (await snapshotOf(id)).objects.filter((o) => o.title === title).length;
+    const principalsNamed = async (name) =>
+      (await (await context.request.get(`${origin}/api/principals`)).json()).filter(
+        (p) => p.name === name,
+      );
+    // whether a secret is anywhere in the page, or waiting in memory to be shown
+    const pageHolds = (secret) =>
+      race.evaluate(
+        (s) =>
+          document.documentElement.innerHTML.includes(s) ||
+          (typeof waiting !== 'undefined' && waiting.some((w) => w.html.includes(s))),
+        secret,
+      );
+    const holdKey = () => hold(race, '/api/principals', { method: 'POST' });
+    const openKeyForm = async (name) => {
+      await raceSource('access');
+      await race.getByRole('button', { name: '+ Create access key', exact: true }).click();
+      await race.getByLabel('Person or agent name', { exact: true }).fill(name);
+    };
+    const keyFrom = async (held) => (await (await held.requested).json()).token;
+    const shownKeyIs = (secret) =>
+      race.locator('#dialog pre').evaluate((p, s) => p.textContent === s, secret);
+    const openRecordForm = async (title) => {
+      await race.getByRole('button', { name: '+ Add record', exact: true }).click();
+      await race.getByLabel('Title', { exact: true }).fill(title);
+      await race
+        .getByLabel('Details', { exact: true })
+        .fill('Synthetic record for the late-answer browser checks.');
+    };
+    // a switch to the demo business whose records are held back until release()
+    const pendingSwitch = async () => {
+      const held = await hold(race, `/api/businesses/${demoBid}`);
+      await race.locator('#business-select').selectOption(demoBid);
+      await held.requested;
+      return held;
+    };
+    // steps that can still start work: a pending step may, whatever its prerequisites
+    const readyTasks = async () =>
+      (await snapshotOf(bid)).objects.filter(
+        (o) => o.kind === 'task' && o.state === 'pending' && !o.data.deal_id && o.id !== ready.id,
+      );
+    const showStep = async (step) => {
+      await race.evaluate((id) => go(`journey|step:${id}`), step.id);
+      await race.locator('#insp-title', { hasText: step.title }).waitFor();
+    };
+    const late = [];
+    const lateCase = (name, run) => late.push([name, run]);
+
+    lateCase('finding 1: a key that arrives after sign-out is discarded', async () => {
+      await onBusiness(bid, testName);
+      const held = await holdKey();
+      await openKeyForm('Browser key answered after sign-out');
+      await inDialog('Create key');
+      const secret = await keyFrom(held);
+      await race.keyboard.press('Escape');
+      await signOut();
+      await held.release();
+      await pause(300);
+      assert(await race.locator('#login').isVisible(), 'the sign-in page is showing');
+      assert.equal(await dialogOpen(), false, 'no dialog opens over the sign-in page');
+      assert(!(await pageHolds(secret)), 'the key is nowhere in the page or waiting in memory');
+    });
+    lateCase('a key that arrives after sign-out and a new sign-in is discarded', async () => {
+      await onBusiness(bid, testName);
+      const held = await holdKey();
+      await openKeyForm('Browser key answered after a new sign-in');
+      await inDialog('Create key');
+      const secret = await keyFrom(held);
+      await race.keyboard.press('Escape');
+      await signOut();
+      await signInAgain();
+      await held.release();
+      await pause(300);
+      assert.equal(await dialogOpen(), false, 'no key dialog in the new session');
+      assert(!(await pageHolds(secret)), 'the key is nowhere in the new session');
+    });
+    lateCase('a key waiting behind a form is discarded when a 401 ends the session', async () => {
+      await onBusiness(bid, testName);
+      const held = await holdKey();
+      await openKeyForm('Browser key waiting when the session ends');
+      await inDialog('Create key');
+      const secret = await keyFrom(held);
+      await race.keyboard.press('Escape');
+      await race.locator('.toolbar [data-action="new-business"]').click();
+      await race.getByLabel('Business name', { exact: true }).fill('Browser business never made');
+      await held.release();
+      await pause(300);
+      assert.equal(await dialogTitle(), 'Create a business', 'the key does not replace the form');
+      await context.clearCookies();
+      await race
+        .getByLabel('Concept', { exact: true })
+        .fill('Synthetic concept refused because the session has ended.');
+      await inDialog('Create workspace');
+      await race.getByLabel('Access key', { exact: true }).waitFor();
+      await pause(300);
+      assert.equal(await dialogOpen(), false, 'nothing opens over the sign-in page');
+      assert(!(await pageHolds(secret)), 'the waiting key left with the session');
+      await signInAgain();
+      await pause(300);
+      assert.equal(await dialogOpen(), false, 'the waiting key is not shown in the next session');
+      assert(!(await pageHolds(secret)), 'nor kept for it');
+    });
+    lateCase(
+      'a key waits for an open form, is shown once, and a change of business leaves it open',
+      async () => {
+        await onBusiness(bid, testName);
+        const switching = await pendingSwitch();
+        const held = await holdKey();
+        await openKeyForm('Browser key shown after another form');
+        await inDialog('Create key');
+        const secret = await keyFrom(held);
+        await race.keyboard.press('Escape');
+        await race.locator('.toolbar [data-action="new-business"]').click();
+        await race.getByLabel('Business name', { exact: true }).fill('Browser business kept open');
+        await held.release();
+        await pause(300);
+        assert.equal(await dialogTitle(), 'Create a business', 'the open form is not replaced');
+        assert.equal(
+          await race.getByLabel('Business name', { exact: true }).inputValue(),
+          'Browser business kept open',
+          'nor what was typed in it',
+        );
+        await inDialog('Cancel');
+        await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+        assert(await shownKeyIs(secret), 'the key shown is the one the server made');
+        await switching.release();
+        await showing(demoName);
+        assert.equal(await dialogTitle(), 'Save this access key', 'the key stays open');
+        assert(await shownKeyIs(secret), 'still the same key');
+        await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+        await pause(300);
+        assert.equal(await dialogOpen(), false, 'the key is shown once');
+        assert(!(await pageHolds(secret)), 'a closed key dialog leaves the key nowhere');
+      },
+    );
+    lateCase(
+      'a key waiting behind a form that a change of business closes is shown on the new page',
+      async () => {
+        await onBusiness(bid, testName);
+        const switching = await pendingSwitch();
+        const held = await holdKey();
+        await openKeyForm('Browser key shown on another business');
+        await inDialog('Create key');
+        const secret = await keyFrom(held);
+        await race.keyboard.press('Escape');
+        await raceSource('records');
+        const typed = 'Browser record typed while a key waited';
+        await openRecordForm(typed);
+        await held.release();
+        await pause(300);
+        assert.equal(await dialogTitle(), 'Add business record', 'the key waits for the form');
+        await switching.release();
+        await showing(demoName);
+        await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+        assert(await shownKeyIs(secret), 'the key is shown over the business now on screen');
+        // the key's own reload is the one that brought the other business in
+        assert.equal(
+          await toastText(),
+          `Saved to the workspace. “Add business record” was closed without saving; this page now shows ${demoName}.`,
+        );
+        assert.equal((await recordsIn(bid, typed)) + (await recordsIn(demoBid, typed)), 0);
+        await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      },
+    );
+    lateCase('finding 2: a form opened for one business is closed when another loads', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      const switching = await pendingSwitch();
+      const typed = 'Browser record typed for one business';
+      await openRecordForm(typed);
+      await switching.release();
+      await showing(demoName);
+      assert.equal(await dialogOpen(), false, 'the form for the previous business is closed');
+      assert.equal(
+        await toastText(),
+        `“Add business record” was closed without saving; this page now shows ${demoName}.`,
+      );
+      assert.equal(await race.locator('#dialog-content').innerHTML(), '', 'and its fields left');
+      assert.equal(await recordsIn(bid, typed), 0, 'nothing was saved to the first business');
+      assert.equal(await recordsIn(demoBid, typed), 0, 'nor to the one now on screen');
+    });
+    lateCase('a decision form open when another business loads is closed and says so', async () => {
+      await onBusiness(bid, testName);
+      const [step] = await readyTasks();
+      await showStep(step);
+      const switching = await pendingSwitch();
+      await race.locator('#insp [data-action="tx"][data-to="in_progress"]').click();
+      await race
+        .getByLabel('Decision note', { exact: false })
+        .fill('Synthetic browser test: typed while another business loaded.');
+      await switching.release();
+      await showing(demoName);
+      assert.equal(await race.locator('#tx-form').count(), 0, 'the decision form is gone');
+      assert.equal(
+        await toastText(),
+        `The decision form for “${step.title}” was closed without saving; this page now shows ${demoName}.`,
+      );
+      assert.equal((await snapshotOf(bid)).objects.find((o) => o.id === step.id).state, 'pending');
+    });
+    lateCase('a form sent while a switch is pending saves to its own business', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      const switching = await pendingSwitch();
+      const title = 'Browser record saved while another business loaded';
+      assert.equal(await addRecord(title), 201, 'sent to the business the form was opened for');
+      await switching.release();
+      await showing(demoName);
+      await race.locator('#toast', { hasText: 'Saved' }).waitFor();
+      assert.equal(await toastText(), `Saved to ${testName}.`, 'the message names its business');
+      assert.equal(await recordsIn(bid, title), 1, 'the record is in its own business');
+      assert.equal(await recordsIn(demoBid, title), 0, 'and not in the one now shown');
+    });
+    lateCase('finding 4: a save that lands on another business only says so', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      const title = 'Browser record saved after the page moved on';
+      const held = await hold(race, `/api/businesses/${bid}/records`, { method: 'POST' });
+      await openRecordForm(title);
+      await inDialog('Save record');
+      await held.requested;
+      await race.keyboard.press('Escape');
+      await switchTo(demoBid, demoName);
+      await raceSource('records');
+      await race.locator('#list .row').nth(1).click();
+      const view = await race.evaluate(() => [state.source, state.selected]);
+      const where = await focused(race);
+      const drop = await dropNext(race, '/api/businesses');
+      await held.release();
+      await pause(300);
+      await drop.off();
+      assert.equal(await outdated.isVisible(), false, 'this page is not marked out of date');
+      assert.equal(await race.evaluate(() => state.behind), false);
+      assert.equal(await toastText(), `Saved to ${testName}.`);
+      assert.deepEqual(await race.evaluate(() => [state.source, state.selected]), view);
+      assert.deepEqual(await focused(race), where, 'focus stays where the person left it');
+      assert.equal(await recordsIn(bid, title), 1);
+      assert.equal(await recordsIn(demoBid, title), 0);
+    });
+    lateCase('a decision that lands on another business only says so', async () => {
+      await onBusiness(bid, testName);
+      const [step] = await readyTasks();
+      await showStep(step);
+      const held = await hold(race, `/api/businesses/${bid}/tasks/${step.id}/transition`, {
+        method: 'POST',
+      });
+      await decide('in_progress', 'Synthetic browser test: started, answered late.');
+      await held.requested;
+      await switchTo(demoBid, demoName);
+      await race.locator('#list .row').nth(1).click();
+      const view = await race.evaluate(() => [state.source, state.selected]);
+      const where = await focused(race);
+      const drop = await dropNext(race, '/api/businesses');
+      await held.release();
+      await pause(300);
+      await drop.off();
+      assert.equal(await outdated.isVisible(), false, 'this page is not marked out of date');
+      assert.deepEqual(
+        await race.evaluate(() => [state.behind, state.accepted, state.open]),
+        [false, {}, null],
+        'nothing is recorded for the page on screen',
+      );
+      assert.equal(await race.locator('#insp [data-accepted]').count(), 0);
+      assert.equal(await toastText(), `Saved to ${testName}.`);
+      assert.deepEqual(await race.evaluate(() => [state.source, state.selected]), view);
+      assert.deepEqual(await focused(race), where, 'focus stays where the person left it');
+      assert.equal(
+        (await snapshotOf(bid)).objects.find((o) => o.id === step.id).state,
+        'in_progress',
+      );
+    });
+    lateCase('a refused save that arrives on another business names its business', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      await rowIn('Browser customer').click();
+      await race.locator('#insp').getByRole('button', { name: 'Edit', exact: true }).click();
+      // the record changes on the server while its form is open, so the form's version is old
+      const cust = (await snapshotOf(bid)).objects.find((o) => o.title === 'Browser customer');
+      await call(`/businesses/${bid}/records/${cust.id}`, 'PUT', {
+        kind: cust.kind,
+        title: cust.title,
+        details: cust.data.details,
+        certainty: cust.data.certainty,
+        owner: cust.data.owner,
+        evidence_ids: cust.data.evidence_ids || [],
+        related_ids: cust.data.related_ids || [],
+        due_date: cust.data.due_date || null,
+        properties: { ...(cust.data.properties || {}), synthetic_change: String(cust.version) },
+        expected_version: cust.version,
+      });
+      const held = await hold(race, `/api/businesses/${bid}/records/${cust.id}`, {
+        method: 'PUT',
+      });
+      await inDialog('Save record');
+      const answer = await held.requested;
+      assert.equal(answer.status(), 409, 'the server refused the old version');
+      const reason = (await answer.json()).detail;
+      await race.keyboard.press('Escape');
+      await switchTo(demoBid, demoName);
+      await held.release();
+      assert.equal(await toastText(), `Not saved to ${testName}. ${reason}`);
+    });
+    lateCase('a refused decision that arrives on another business names its business', async () => {
+      await onBusiness(bid, testName);
+      const [step] = await readyTasks();
+      await showStep(step);
+      await race.locator('#insp [data-action="tx"][data-to="in_progress"]').click();
+      await race
+        .getByLabel('Decision note', { exact: false })
+        .fill('Synthetic browser test: refused as the step changed.');
+      await call(`/businesses/${bid}/tasks/${step.id}/transition`, 'POST', {
+        state: 'in_progress',
+        note: 'Synthetic browser test: changed elsewhere.',
+        evidence_ids: [],
+        expected_version: step.version,
+      });
+      const held = await hold(race, `/api/businesses/${bid}/tasks/${step.id}/transition`, {
+        method: 'POST',
+      });
+      await race.locator('#insp').getByRole('button', { name: 'Record decision' }).click();
+      const answer = await held.requested;
+      assert.equal(answer.status(), 409, 'the server refused the old version');
+      const reason = (await answer.json()).detail;
+      await switchTo(demoBid, demoName);
+      await held.release();
+      assert.equal(await toastText(), `Not saved to ${testName}. ${reason}`);
+    });
+    lateCase('the business form sends the version it was filled from', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      const held = await hold(race, `/api/businesses/${bid}/records`, { method: 'POST' });
+      await openRecordForm('Browser record whose reload refreshes an open form');
+      await inDialog('Save record');
+      await held.requested;
+      await race.keyboard.press('Escape');
+      await raceSource('journey');
+      await race
+        .locator('#insp')
+        .getByRole('button', { name: 'Edit business', exact: true })
+        .click();
+      await race
+        .getByLabel('Intended customer', { exact: true })
+        .fill('Customer typed in the form');
+      // the business changes elsewhere, and the earlier save's reload brings that into memory
+      const b = (await snapshotOf(bid)).business;
+      const kept = 'Fictional customer saved elsewhere';
+      await call(`/businesses/${bid}`, 'PUT', {
+        name: b.data.name,
+        concept: b.data.concept,
+        route: b.data.route,
+        jurisdiction: b.data.jurisdiction,
+        currency: b.data.currency,
+        customer: kept,
+        owner: b.data.owner,
+        is_demo: b.data.is_demo,
+        expected_version: b.version,
+      });
+      await held.release();
+      // the toast sits behind the open form, outside the accessibility tree while it is open
+      await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
+      assert.equal(await race.evaluate(() => state.snapshot.business.version), b.version + 1);
+      const answered = race.waitForResponse(
+        (r) =>
+          r.request().method() === 'PUT' && new URL(r.url()).pathname === `/api/businesses/${bid}`,
+      );
+      await inDialog('Save changes');
+      assert.equal((await answered).status(), 409, 'the older form is refused, not merged');
+      assert.equal((await snapshotOf(bid)).business.data.customer, kept, 'nothing was overwritten');
+      await race.locator('#dialog .error', { hasText: 'The business changed' }).waitFor();
+    });
+    for (const [what, src, row, button] of [
+      ['a document', 'documents', null, 'Read draft'],
+      ['an invoice’s details', 'sales', 'Browser accepted report', 'Details'],
+    ])
+      lateCase(`the view of ${what} closes when another business loads`, async () => {
+        await onBusiness(bid, testName);
+        await raceSource(src);
+        if (row) await rowIn(row).click();
+        const switching = await pendingSwitch();
+        await race.locator('#insp').getByRole('button', { name: button, exact: true }).click();
+        assert.equal(await dialogOpen(), true, `${button} opens`);
+        await switching.release();
+        await showing(demoName);
+        assert.equal(await dialogOpen(), false, 'the view of the other business closed');
+        assert.equal(await race.locator('#dialog-content').innerHTML(), '', 'and left the page');
+        assert(await race.locator('#toast').isHidden(), 'a view closes without a message');
+      });
+    lateCase('a viewer’s read-only record view closes when another business loads', async () => {
+      const viewerKey = (
+        await call('/principals', 'POST', {
+          name: 'Browser viewer for late views',
+          role: 'viewer',
+          business_ids: [bid, demoBid],
+        })
+      ).token;
+      const viewer = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
+      try {
+        const v = await viewer.newPage();
+        v.on('pageerror', (e) => errors.push(e.message));
+        await v.goto(origin);
+        await v.getByLabel('Access key', { exact: true }).fill(viewerKey);
+        await v.getByRole('button', { name: 'Open workspace' }).click();
+        await v.locator('#list .today-head').waitFor();
+        if ((await v.locator('#business-select').inputValue()) !== bid) {
+          await v.locator('#business-select').selectOption(bid);
+          await v.locator('#list .th-sub', { hasText: testName }).waitFor();
+        }
+        await v.locator('#src-nav .src[data-src="records"]').click();
+        await v.locator('#list .row', { hasText: 'Browser customer' }).click();
+        const held = await hold(v, `/api/businesses/${demoBid}`);
+        await v.locator('#business-select').selectOption(demoBid);
+        await held.requested;
+        await v.locator('#insp').getByRole('button', { name: 'View', exact: true }).click();
+        assert.equal(await v.locator('#dialog').evaluate((d) => d.open), true, 'View opens');
+        await held.release();
+        await v.locator('#list .th-sub', { hasText: demoName }).waitFor();
+        assert.equal(
+          await v.locator('#dialog').evaluate((d) => d.open),
+          false,
+          'the read-only record view of the other business closed',
+        );
+      } finally {
+        await viewer.close();
+      }
+    });
+    lateCase('a business that leaves the list closes its open form', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      const savedFirst = 'Browser record saved before its business left the list';
+      const typed = 'Browser record typed as its business left the list';
+      const held = await hold(race, `/api/businesses/${bid}/records`, { method: 'POST' });
+      await openRecordForm(savedFirst);
+      await inDialog('Save record');
+      await held.requested;
+      await race.keyboard.press('Escape');
+      await openRecordForm(typed);
+      // the next list of businesses, built by hand, no longer holds the one on screen
+      const listPath = (url) => url.pathname === '/api/businesses';
+      const without = async (route) => {
+        if (route.request().method() !== 'GET') return route.fallback();
+        const response = await route.fetch();
+        const json = (await response.json()).filter((x) => x.id !== bid);
+        await route.fulfill({ response, json });
+      };
+      await race.route(listPath, without);
+      await held.release();
+      await showing(demoName);
+      await race.unroute(listPath, without);
+      assert.equal(await dialogOpen(), false, 'the form for the business that left is closed');
+      assert.equal(
+        await toastText(),
+        `Saved to ${testName}. “Add business record” was closed without saving; this page now shows ${demoName}.`,
+      );
+      assert.equal(await recordsIn(bid, savedFirst), 1);
+      assert.equal((await recordsIn(bid, typed)) + (await recordsIn(demoBid, typed)), 0);
+    });
+    lateCase('finding 3: a lost answer to key creation promises no safe retry', async () => {
+      await onBusiness(bid, testName);
+      const lostName = 'Browser key whose answer was lost';
+      await openKeyForm(lostName);
+      const held = await hold(race, '/api/principals', { method: 'POST', lose: true });
+      const listAgain = race.waitForRequest(
+        (r) => r.method() === 'GET' && new URL(r.url()).pathname === '/api/principals',
+      );
+      // not awaited until the message is checked; a failure meanwhile must not go unhandled
+      listAgain.catch(() => {});
+      await inDialog('Create key');
+      await held.requested;
+      await held.release();
+      await race.locator('#dialog-title', { hasText: 'Access key not confirmed' }).waitFor();
+      assert.equal(
+        await race.locator('#dialog-content p').innerText(),
+        `Connection interrupted, so this page cannot tell whether the access key “${lostName}” was created. A key that was created cannot be shown again. Look at the access keys under Access & assistants: if there is a key named “${lostName}” that you did not receive, revoke it, then create a new one.`,
+      );
+      assert.doesNotMatch(await race.locator('#dialog').innerText(), /retry|safe/i);
+      assert.equal(
+        await race.locator('#dialog').getByRole('button', { name: 'Create key' }).count(),
+        0,
+        'no control sends the creation again',
+      );
+      assert.equal((await focused(race)).action, 'close-dialog', 'focus is on Close');
+      // the access list was loaded again, and shows the key the server made
+      await listAgain;
+      await race.locator('#list .row', { hasText: lostName }).waitFor();
+      assert.equal((await principalsNamed(lostName)).length, 1, 'the server made one key');
+      await inDialog('Close');
+      // when that reload fails too, the notice still stands
+      const again = 'Browser key lost while the list cannot load';
+      await openKeyForm(again);
+      const held2 = await hold(race, '/api/principals', { method: 'POST', lose: true });
+      const drop = await dropNext(race, '/api/businesses');
+      await inDialog('Create key');
+      await held2.requested;
+      await held2.release();
+      await drop.dropped;
+      await drop.off();
+      assert.equal(await dialogTitle(), 'Access key not confirmed');
+      assert((await race.locator('#dialog-content p').innerText()).includes(`“${again}”`));
+      assert.equal(await toastText(), 'The server could not be reached.');
+    });
+    lateCase('an interrupted command says what is true once its form is closed', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      const held = await hold(race, `/api/businesses/${bid}/records`, {
+        method: 'POST',
+        lose: true,
+      });
+      await openRecordForm('Browser record whose answer was lost');
+      await inDialog('Save record');
+      await held.requested;
+      await race.keyboard.press('Escape');
+      await held.release();
+      assert.equal(
+        await toastText(),
+        'Connection interrupted. This page cannot tell whether your change was saved; load the current records and check before entering it again.',
+      );
+    });
+    lateCase('an interrupted revoke says that revoking again is safe', async () => {
+      await onBusiness(bid, testName);
+      const name = 'Browser key revoked over a lost connection';
+      const made = await call('/principals', 'POST', { name, role: 'viewer', business_ids: [bid] });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      await raceSource('access');
+      await rowIn(name).click();
+      await race.locator('#insp').getByRole('button', { name: 'Revoke', exact: true }).click();
+      const held = await hold(race, `/api/principals/${made.id}`, { method: 'DELETE', lose: true });
+      await inDialog('Revoke key');
+      await held.requested;
+      await held.release();
+      assert.equal(
+        await race.locator('#dialog .error').innerText(),
+        'Connection interrupted, so this page cannot tell whether the key was revoked. Revoking it again is safe.',
+      );
+      await inDialog('Revoke key');
+      await race.locator('#dialog').waitFor({ state: 'hidden' });
+      await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
+      assert.equal((await principalsNamed(name))[0].revoked, true);
+    });
+    lateCase('an interrupted sign-out and sign-in each say that repeating is safe', async () => {
+      let drop = await dropNext(race, '/api/logout', 'POST');
+      await race.locator('.toolbar [data-action="logout"]').click();
+      await drop.dropped;
+      await drop.off();
+      assert.equal(
+        await toastText(),
+        'Connection interrupted, so this page cannot tell whether you were signed out. Signing out again is safe.',
+      );
+      assert(await race.locator('#app').isVisible(), 'still signed in');
+      await signOut();
+      drop = await dropNext(race, '/api/login', 'POST');
+      await race.getByLabel('Access key', { exact: true }).fill(ownerKey());
+      await race.getByRole('button', { name: 'Open workspace' }).click();
+      await drop.dropped;
+      await drop.off();
+      assert.equal(
+        await race.locator('#login-error').innerText(),
+        'Connection interrupted. Signing in again is safe.',
+      );
+      await race.getByRole('button', { name: 'Open workspace' }).click();
+      await race.locator('#list .today-head').waitFor();
+    });
+    lateCase('a sign-out refused because the session ended leaves no message', async () => {
+      await context.clearCookies();
+      await race.locator('.toolbar [data-action="logout"]').click();
+      await race.getByLabel('Access key', { exact: true }).waitFor();
+      await pause(300);
+      assert.equal(
+        await race.locator('#toast').isVisible(),
+        false,
+        'nothing over the sign-in page',
+      );
+    });
+    lateCase('finding 5: after Dismiss, focus is on a visible control', async () => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      let drop = await dropNext(race, '/api/businesses');
+      assert.equal(await addRecord('Browser record before Dismiss on a computer'), 201);
+      await drop.dropped;
+      await drop.off();
+      await outdated.getByRole('button', { name: 'Dismiss' }).focus();
+      await race.keyboard.press('Enter');
+      assert(await outdated.isHidden());
+      let at = await focused(race);
+      assert.deepEqual(
+        [at.pane, at.current, at.visible],
+        ['list', 'true', true],
+        'the selected row',
+      );
+      // on a phone showing the inspector, the list is hidden
+      await race.setViewportSize({ width: 390, height: 844 });
+      if (await race.locator('#back-list').isVisible()) await race.locator('#back-list').click();
+      drop = await dropNext(race, '/api/businesses');
+      assert.equal(await addRecord('Browser record before Dismiss on a phone'), 201);
+      await drop.dropped;
+      await drop.off();
+      await race.locator('#list .row').first().click();
+      assert.equal(await race.locator('#list').isVisible(), false);
+      await outdated.getByRole('button', { name: 'Dismiss' }).focus();
+      await race.keyboard.press('Enter');
+      at = await focused(race);
+      assert.deepEqual([at.id, at.visible], ['insp-title', true], 'phone: the inspector heading');
+    });
+
+    race.setDefaultTimeout(10000);
+    const lateFailures = [];
+    for (const [name, run] of late) {
+      await settle();
+      try {
+        await run();
+      } catch (error) {
+        lateFailures.push(`${name}: ${String(error.message).split('\n')[0]}`);
+      }
+    }
+    await settle();
+    race.setDefaultTimeout(30000);
+    assert.deepEqual(lateFailures, [], 'late answers act only on their own session and business');
+
     // Stored addresses: only http and https become links. The server refuses anything else, so
     // the snapshot is altered on its way to the page. The currency code is one Intl rejects.
     await onBusiness(bid, testName);
@@ -1319,7 +1976,7 @@ async function main() {
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, focus after Dismiss on a computer and a phone, lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
