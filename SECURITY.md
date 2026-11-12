@@ -46,7 +46,7 @@ Exports contain original evidence, internal decisions and AI review requests/res
 
 ## Recovery and operational limits
 
-`foundry backup` uses SQLite's backup API to produce a consistent snapshot while the source is running. It refuses to overwrite an existing file. `foundry restore` requires an absent destination and checks the source schema and SQLite integrity before copying. Keep the original owner key separately. Test restored backups before treating them as usable.
+`foundry backup` uses SQLite's backup API to produce a consistent snapshot while the source is running. It refuses to overwrite an existing file. It refuses a source that does not exist or is not a Foundry database, and creates nothing in that case: no database, no backup file and no folder. `foundry restore` requires an absent destination and checks the source schema and SQLite integrity before copying. Keep the original owner key separately. Test restored backups before treating them as usable.
 
 The JSON export is not a restore format and cannot import authority from another workspace. Invoice and payment records are an operational register. There is no refund/void/correction ledger in this release; an incorrect financial record must be retained, flagged through evidence withdrawal and reconciled in the authoritative accounting system. Add a proper reversal flow before using Foundry as a financial system of record.
 

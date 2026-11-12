@@ -5,12 +5,15 @@ changes to an empty temporary folder. No test runs a command without --db from t
 """
 
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from conftest import fake_uv
 
 from foundry import cli
 from foundry.models import BusinessCreate
@@ -235,3 +238,32 @@ def test_a_backup_of_a_crash_left_database_and_wal_holds_the_committed_business(
     assert "holding 1 business." in capsys.readouterr().out
     assert names_in(destination) == ["Committed before the crash"]
     assert (left / "foundry.db").read_bytes() == before
+
+
+# The README's macOS example ---------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a POSIX shell line")
+def test_the_readme_macos_backup_line_runs_when_pasted(tmp_path):
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    [line] = re.findall(r"`(uv run foundry --db \"\$HOME/Library/[^`]*)`", readme)
+    assert line == (
+        'uv run foundry --db "$HOME/Library/Application Support/Business Foundry/foundry.db" '
+        "backup /private/path/backup.db"
+    )
+    home = tmp_path / "home"  # never the real per-user folder
+    database(home / "Library" / "Application Support" / "Business Foundry" / "foundry.db", 1)
+    destination = tmp_path / "out" / "backup.db"
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "FOUNDRY_DB"}
+    env["HOME"] = str(home)
+    env["PATH"] = str(fake_uv(tmp_path / "tools")) + os.pathsep + env["PATH"]
+    pasted = line.replace("/private/path/backup.db", str(destination))
+    result = subprocess.run(["/bin/sh", "-c", pasted], cwd=work, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        f"Saved {real(destination)}: a copy of {real(home)}/Library/Application Support/Business Foundry/"
+        f"foundry.db holding 1 business.{PRIVATE}\n"
+    )
+    assert names_in(destination) == ["Synthetic business 1"] and os.listdir(work) == []
