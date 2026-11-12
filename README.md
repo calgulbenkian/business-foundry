@@ -27,6 +27,15 @@ The Polymer Geospatial example is **explicitly synthetic**. Its concept, custome
 
 Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `foundry` directly.
 
+### Desktop window (preview)
+
+```sh
+uv sync --locked --extra desktop
+uv run foundry-desktop
+```
+
+This opens the same interface in a native window and signs you in automatically: there is no key to paste. Records are kept in your per-user application data folder (`~/Library/Application Support/Business Foundry` on macOS, `%LOCALAPPDATA%\Business Foundry` on Windows, `~/.local/share/Business Foundry` on Linux unless `XDG_DATA_HOME` names another folder), not in the folder you launched from. The command-line tools can use that database with `--db`. To back it up on macOS, run `uv run foundry --db "$HOME/Library/Application Support/Business Foundry/foundry.db" backup /private/path/backup.db` from the folder you start the app from, with `/private/path/backup.db` changed to a private place for the backup. The window shows the backup command for the database it has open, including one chosen with `--data-dir`, on its **Access & AI** page under **Backup and restore**; on Windows it shows the path but no ready command. Windows needs the Microsoft Edge WebView2 Runtime. Only one copy of the app can be open at a time for each data folder. If you choose **Sign out** inside the window, the sign-in screen appears; quit and reopen the app to sign in again. There is no installer, code signing or automatic update yet, and the app has been run on macOS only, not yet on Windows. See [security](SECURITY.md#desktop-app) for how the window signs in.
+
 ## What works
 
 - A three-pane browser workspace: each group of steps is a coloured line on a Journey map generated from the step data, every state of a live step has its own glyph, and the panes stack on a phone.
@@ -36,7 +45,7 @@ Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `fou
 - Immutable evidence bodies, human review notes, versioned records, optimistic concurrency and idempotent write requests.
 - Linked monthly income statement, cash flow and balance sheet; collection delays, debt, taxes, capex, three scenarios and DCF.
 - Acquisition screening with evidence-supported earnings adjustments, replacement management, valuation ranges, sources and uses, amortizing debt service and downside coverage.
-- Draft business plans, structure decision briefs, contract briefs, operating manuals, readiness reports and investment memos tied to their source versions.
+- Draft business plans, structure decision briefs, contract briefs, operating manuals, readiness reports and investment memos tied to their source versions, written in plain words with machine identifiers kept to a closing reference index. Text typed by a person or an agent is shown literally: it cannot add headings, lists, images or HTML to a document, or a link that hides its address behind other words. A web or email address typed in full stays visible as typed, and some viewers make it clickable. The readiness report audits what needs a person now (saying when a step cannot be approved yet and what it needs first), what is ready, what is blocked, what is still an assumption and which obligations are past their due date, as of a stated date. When a due date passes, an earlier report is marked stale.
 - Invoice drafts, recorded issue, partial/full payment reconciliation and duplicate-payment protection.
 - A reviewable event history, local integrity checks, portable JSON exports and consistent database backups/restores.
 - Optional OpenAI reviews with explicit sharing, recorded prompts/results, limits and validated citations; an MCP adapter for compatible AI clients.
@@ -54,7 +63,7 @@ uv run ruff format --check .
 
 The OpenAPI schema is served at `/api/openapi.json`; load it into any OpenAPI viewer you run yourself. No interactive documentation page is served, because one would need third-party scripts that the content security policy forbids. Authenticated requests use `Authorization: Bearer <access-key>`; such requests need no `Origin` header. Business writes require an `Idempotency-Key`; reuse it only when retrying the identical request. Access-key creation returns a new key once and is intentionally not cached.
 
-Private state lives in `.foundry/` and is ignored by Git. No telemetry, remote databases, third-party fonts or analytics are required. Software is MIT licensed; your business data stays yours.
+The command line keeps private state in `.foundry/` (relative to where you run it), which is ignored by Git. The desktop app uses the per-user application data folder instead. No telemetry, remote databases, third-party fonts or analytics are required. Software is MIT licensed; your business data stays yours.
 
 ## Scope of this release
 

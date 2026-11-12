@@ -23,6 +23,20 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run pytest --cov=foundry --cov-report=term-missing
       - run: uv build
+  # The matrix above runs without pywebview, which shows the rest of the suite does not need it.
+  # This job installs it, so the desktop tests that need the real library run too.
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: pip install uv==0.10.10
+      - run: uv sync --locked --extra dev --extra desktop
+      - run: uv run pytest tests/test_desktop.py
   browser:
     runs-on: ubuntu-latest
     steps:

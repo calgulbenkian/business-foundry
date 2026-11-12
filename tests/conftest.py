@@ -1,3 +1,6 @@
+import shlex
+import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -54,3 +57,19 @@ def reviewed(setup, source_type="external_receipt", title="Reviewed source"):
             mode="json"
         ),
     )
+
+
+FAKE_UV = """#!/bin/sh
+# Stands in for uv in tests: "uv run foundry ARGS" runs this Python's foundry.cli with ARGS.
+[ "$1" = run ] && [ "$2" = foundry ] || exit 97
+shift 2
+exec {python} -m foundry.cli "$@"
+"""
+
+
+def fake_uv(folder: Path) -> Path:
+    """A folder holding a `uv` that runs the command line here, to put first on PATH."""
+    folder.mkdir()
+    (folder / "uv").write_text(FAKE_UV.format(python=shlex.quote(sys.executable)))
+    (folder / "uv").chmod(0o700)
+    return folder

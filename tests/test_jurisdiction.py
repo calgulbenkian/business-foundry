@@ -23,6 +23,7 @@ from foundry import catalog, cli, models
 from foundry import service as service_module
 from foundry.api import create_app
 from foundry.demo import seed
+from foundry.documents import TITLES
 from foundry.service import Service
 from foundry.store import DomainError, Store
 
@@ -963,14 +964,14 @@ def test_a_failure_part_way_through_rolls_everything_back(setup, monkeypatch):
 # Documents.
 
 
-def test_documents_after_a_change_never_list_superseded_steps(setup):
+def test_documents_after_a_change_name_superseded_steps_only_as_replaced(setup):
     _, service, owner, bid, _ = setup
     old = live_core(service, owner, bid)["jurisdiction"]
     for template in ("readiness_report", "business_plan", "operating_manual"):
         content = service.generate_document(
             owner, bid, key(), dump(models.DocumentCreate, template=template)
         )["data"]["content"]
-        assert f"- [pending] Resolve operating and founder jurisdictions — {old['id']}" in content
+        assert "- Resolve operating and founder jurisdictions — not started" in content
     change(service, owner, bid, "other")
     snapshot = service.snapshot(owner, bid)
     assert all(o["stale"] for o in snapshot["objects"] if o["kind"] == "document")
@@ -979,10 +980,85 @@ def test_documents_after_a_change_never_list_superseded_steps(setup):
         content = service.generate_document(
             owner, bid, key(), dump(models.DocumentCreate, template=template)
         )["data"]["content"]
-        assert old["id"] not in content
-        assert "Resolve operating and founder jurisdictions" not in content
-        assert f"- [pending] Obtain a local requirements review — {new['id']}" in content
+        body, index = content.split("## Reference index")
+        # The old step is named once in the body, in the replaced line, and counted nowhere.
+        named = [line for line in body.splitlines() if "Resolve operating and founder jurisdictions" in line]
+        assert len(named) == 1 and body.count("Resolve operating and founder jurisdictions") == 1
+        assert named[0].startswith("Replaced steps (no longer part of this plan): ")
+        assert f"{snapshot['stats']['tasks']} steps are tracked:" in body
+        # Its id is printed only in its own row of the reference index.
+        assert old["id"] not in body and index.count(old["id"]) == 1
+        row = next(line for line in index.splitlines() if old["id"] in line)
+        assert row.startswith("| Resolve operating and founder jurisdictions ")
+        assert "- Obtain a local requirements review — not started" in body and new["id"] in index
         assert "Planning jurisdiction: other." in content
+
+
+WORK_HEADINGS = (
+    "## What needs a person now",
+    "## What can be worked on next",
+    "## What is blocked",
+    "## Every step",
+    "Unfinished steps:",
+)
+STATE_COUNTS = {
+    "verified": "Verified as done",
+    "not_applicable": "Confirmed not applicable",
+    "needs_review": "Sent back for review",
+}
+
+
+def test_replaced_steps_after_real_changes_are_named_once_and_counted_nowhere(setup):
+    _, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    deal = next(o for o in service.snapshot(owner, bid)["objects"] if o["kind"] == "deal")
+    # The first change replaces a verified step and reopens every other completed one.
+    change(service, owner, bid, "GB")
+    gb = live_core(service, owner, bid)["local_review"]
+    move(service, owner, bid, gb, "in_progress")
+    move(service, owner, bid, all_tasks(service, owner, bid)[gb["id"]], "prepared")
+    # The second replaces a prepared step that cites a source no live step cites.
+    for to, replaced_titles in (
+        ("GB", ["Resolve operating and founder jurisdictions"]),
+        ("SE", ["Resolve operating and founder jurisdictions", gb["title"]]),
+    ):
+        if to == "SE":
+            change(service, owner, bid, "SE")
+        snapshot = service.snapshot(owner, bid)
+        stats, objects = snapshot["stats"], snapshot["objects"]
+        replaced = [o for o in objects if o["kind"] == "task" and o["state"] == "superseded"]
+        assert [o["title"] for o in replaced] == replaced_titles and stats["superseded"] == len(replaced)
+        reopened = [o for o in objects if o["kind"] == "task" and o["state"] == "needs_review"]
+        assert len(reopened) == stats["needs_review"] == 16
+        for template in TITLES:
+            content = document(service, owner, bid, template, deal if template == "investment_memo" else None)
+            body, index = content.split("## Reference index")
+            lines = body.splitlines()
+            work = template in {"readiness_report", "business_plan", "operating_manual"}
+            expected = "Replaced steps (no longer part of this plan): " + "; ".join(replaced_titles) + "."
+            assert [line for line in lines if line.startswith("Replaced steps")] == (
+                [expected] if work else []
+            )
+            for step in replaced:
+                assert body.count(step["title"]) == (1 if work else 0), (template, step["title"])
+                assert step["id"] not in body
+                assert index.count(step["id"]) == (1 if work else 0)
+            assert gb["data"]["source_uri"] not in content or to == "GB"
+            if not work:
+                continue
+            # Every count the document prints agrees with the snapshot's stats.
+            assert f"\n{stats['tasks']} steps are tracked: " in body
+            for k, label in STATE_COUNTS.items():
+                assert (f"\n- {label}: {stats[k]}\n" in body) == bool(stats[k]), (template, k)
+            for heading in WORK_HEADINGS:
+                for section in body.split(heading)[1:]:
+                    section = section.split("\n## ")[0]
+                    assert not any(step["title"] in section for step in replaced), (template, heading)
+            if template == "readiness_report":
+                sent_back = body.split("### Steps sent back for review\n\n")[1].split("\n\n")[0]
+                assert sent_back.splitlines() == [
+                    f"- {o['title']} — reason: Jurisdiction changed from undecided to GB." for o in reopened
+                ]
 
 
 # Stored data from earlier releases.
@@ -1464,7 +1540,11 @@ def test_records_saved_after_the_change_have_no_mark_and_documents_no_warning(se
     assert sum(stale for stale, _ in found.values()) == 2
     assert "WARNING:" not in document(service, owner, bid, "investment_memo", deal)
     business_plan = document(service, owner, bid, "business_plan")
-    assert f"Model: Fresh ({plan['id']})" in business_plan and "WARNING:" not in business_plan
+    assert "Model: Fresh. Currency: " in business_plan and "WARNING:" not in business_plan
+    objects = service.snapshot(owner, bid)["objects"]
+    earlier = next(o for o in objects if o["kind"] == "financial_plan" and o["id"] != plan["id"])
+    index = business_plan.split("## Reference index")[1]
+    assert plan["id"] in index and earlier["id"] not in index
 
 
 def test_a_change_leaves_every_stored_deal_forecast_revision_and_earlier_event_byte_for_byte(setup):
@@ -1562,7 +1642,8 @@ def test_the_snapshot_fingerprint_is_the_same_hash_of_stored_rows_so_no_document
     assert snapshot["source_fingerprint"] == expected
     documents = [o for o in snapshot["objects"] if o["kind"] == "document"]
     assert [d["stale"] for d in documents] == [True, False]
-    assert all(set(d) == set(documents[0]) for d in documents) and "stale_reasons" not in documents[0]
+    assert all(set(d) == set(documents[0]) for d in documents)
+    assert [[r["code"] for r in d["stale_reasons"]] for d in documents] == [["source_changed"], []]
 
 
 def test_every_reader_sees_the_same_mark_http_agent_adapter_and_document(setup, client):

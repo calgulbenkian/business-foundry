@@ -2,6 +2,8 @@
 
 The core application is deterministic and works without AI. There are two optional paths, with different account and data-sharing boundaries.
 
+The MCP path needs `foundry serve`: the desktop app picks a new port at every launch, so an MCP adapter has no fixed address to reach. The direct provider review also works in the desktop window, which builds the same adviser, but only when the app inherits the provider settings below, for example when `foundry-desktop` is started from a terminal in which they are exported. An app opened from Finder or the Start menu does not inherit the settings exported in your shell, so for that use `foundry serve`.
+
 ## 1. Compatible AI client through MCP
 
 Run the Foundry server. In **Access & assistants**, create a key with the **agent** role and explicitly select its businesses. Alternatively:
@@ -47,9 +49,9 @@ The adapter registers three MCP prompts, each taking a `business_id`:
 
 - `founder_intake` — interview for starting from a concept: intended buyer, concrete problem, offer/pricing/acceptance, delivery assets and third-party rights, unit economics and cash timing (`build_forecast`), source evidence (`add_evidence`), and the operating footprint a human needs to select the planning jurisdiction.
 - `acquisition_intake` — target and thesis, reported revenue/EBITDA and replacement management, evidence-backed earnings adjustments, then valuation multiples, uses and debt or seller financing (`analyze_acquisition`).
-- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals, forecasts or documents (each stale deal or forecast lists its reasons in `stale_reasons`); summarizes gaps and asks before changing anything.
+- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals, forecasts or documents (each stale deal, forecast or document lists its reasons in `stale_reasons`). It starts from the latest readiness report when one is current, offers to generate one otherwise, summarizes gaps and asks before changing anything.
 
-Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, use `prepare_task` only to prepare work, and leave the planning jurisdiction to a human. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
+Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Text an agent writes into records, evidence or step notes is printed literally in generated documents, so it cannot add images, HTML or structure to a document a reviewer reads, or a link that hides its address behind other words. A viewer that strikes through text between single tildes (GitHub does) will strike it through, with the words still present. A web or email address it types in full stays visible as typed, and some viewers make it clickable. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, use `prepare_task` only to prepare work, and leave the planning jurisdiction to a human. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
 
 If your client does not surface MCP prompts, follow the same sequence manually: ask the assistant to call `get_business` for the business ID, then interview you one topic at a time in the order above, saving each answer with `add_record` (new) or `update_record` (existing) and attaching sources with `add_evidence`, before running `build_forecast` or `analyze_acquisition` and reviewing the results yourself.
 

@@ -12,10 +12,17 @@ license = "MIT"
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "pydantic>=2.10,<3", "httpx>=0.28,<1", "mcp>=1.12,<2"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1"]
+dev = ["pytest>=8,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1", "markdown-it-py>=3,<5", "platformdirs>=4.3,<5"]
+# The native desktop window. Not needed for the CLI, the web server or the main test suite;
+# CI installs it in one separate job that runs tests/test_desktop.py.
+desktop = ["pywebview>=6.2,<7", "platformdirs>=4.3,<5"]
 
 [project.scripts]
 foundry = "foundry.cli:main"
+
+[project.gui-scripts]
+# A windowed launcher: on Windows it opens without a console.
+foundry-desktop = "foundry.desktop:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/foundry"]
