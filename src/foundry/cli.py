@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from typing import get_args
 from uuid import uuid4
 
 from . import models
@@ -75,6 +76,23 @@ def main(argv=None):
         ],
     )
     document.add_argument("--deal-id")
+    jurisdiction = commands.add_parser(
+        "jurisdiction",
+        help="Change the planning jurisdiction as the local owner: supersede the old guide's steps, "
+        "add the new guide's steps and reopen completed work (not legal advice; no entity is moved)",
+    )
+    jurisdiction.add_argument("business_id")
+    jurisdiction.add_argument("jurisdiction", choices=get_args(models.Jurisdiction))
+    jurisdiction.add_argument("--reason", help="Why the human decision was made (required to change)")
+    jurisdiction.add_argument(
+        "--evidence", action="extend", nargs="+", default=[], metavar="ID", help="Reviewed evidence IDs"
+    )
+    jurisdiction.add_argument(
+        "--expected-version", type=int, help="Business version the decision was based on (default: current)"
+    )
+    jurisdiction.add_argument(
+        "--preview", action="store_true", help="Show the effect without changing anything"
+    )
     for name in ("export", "verify"):
         command = commands.add_parser(
             name,
@@ -158,6 +176,23 @@ def main(argv=None):
                 payload = model.model_validate_json(args.configuration.read_text()).model_dump(mode="json")
                 fn = service.save_forecast if args.command == "forecast" else service.save_deal
                 print(json.dumps(fn(actor, args.business_id, str(uuid4()), payload), indent=2))
+            elif args.command == "jurisdiction":
+                if args.preview:
+                    result = service.preview_jurisdiction(actor, args.business_id, args.jurisdiction)
+                else:
+                    if args.reason is None:
+                        raise ValueError("Give --reason for the jurisdiction decision, or use --preview.")
+                    version = args.expected_version
+                    if version is None:
+                        version = service.snapshot(actor, args.business_id)["business"]["version"]
+                    payload = models.JurisdictionChange(
+                        expected_version=version,
+                        jurisdiction=args.jurisdiction,
+                        reason=args.reason,
+                        evidence_ids=args.evidence,
+                    ).model_dump(mode="json")
+                    result = service.change_jurisdiction(actor, args.business_id, str(uuid4()), payload)
+                print(json.dumps(result, indent=2))
             elif args.command == "document":
                 payload = models.DocumentCreate(template=args.template, deal_id=args.deal_id).model_dump(
                     mode="json"

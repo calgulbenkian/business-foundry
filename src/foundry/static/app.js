@@ -10,6 +10,8 @@ const label = (s) =>
     .replaceAll('_', ' ')
     .replace(/^./, (c) => c.toUpperCase());
 const badge = (s) => `<span class="badge ${h(s)}">${h(label(s))}</span>`;
+const staleNotices = (o) =>
+  (o?.stale_reasons || []).map((r) => `<div class="notice">${h(r.message)}</div>`).join('');
 const state = {
   actor: null,
   businesses: [],
@@ -240,7 +242,7 @@ function overview() {
   const s = state.snapshot.stats,
     b = state.snapshot.business.data;
   const tasks = objs('task')
-    .filter((t) => !['verified', 'not_applicable'].includes(t.state))
+    .filter((t) => !['verified', 'not_applicable', 'superseded'].includes(t.state))
     .sort((a, b) => a.blockers.length - b.blockers.length)
     .slice(0, 4);
   const plan = objs('financial_plan').at(-1);
@@ -254,7 +256,7 @@ function overview() {
     `<div class="grid two"><div class="card hero-card"><div><p class="eyebrow">${b.route === 'acquire' ? 'BUILD ON WHAT EXISTS' : 'BUILD FROM THE GROUND UP'}</p><h2>${h(b.name)}</h2><p>${h(b.concept)}</p></div><div class="actions"><span class="inline-tag">${h(b.jurisdiction === 'undecided' ? 'Jurisdiction to review' : b.jurisdiction)}</span><span class="inline-tag">${h(currency())}</span>${canWrite() ? action('edit-business', 'Edit business') : ''}</div></div><div class="card"><div class="card-heading"><h3>Your next useful steps</h3><span class="small">${tasks.length} to explore</span></div>${tasks.map((t, i) => `<div class="row"><span class="number">0${i + 1}</span><div class="row-main"><h3>${h(t.title)}</h3><p>${h(t.blockers[0] || 'Ready to prepare and review')}</p></div>${action('task', 'Open', t.id)}</div>`).join('') || '<p class="muted">All recorded steps are resolved. Keep recurring obligations and changed assumptions under review.</p>'}</div></div>` +
     `<div class="section-title"><h2>Understand the economics</h2>${action('navigate', 'Open financial model', 'finances')}</div>` +
     (plan
-      ? `<div class="card">${chart(plan.data.scenarios)}<div class="legend"><span><i class="line-base"></i>Base</span><span><i class="line-downside"></i>Downside</span><span><i class="line-upside"></i>Upside</span></div><p class="small">Projected cash over ${plan.data.inputs.months} months. Forecast assumptions are separate from recorded payments.</p></div>`
+      ? `<div class="card">${staleNotices(plan)}${chart(plan.data.scenarios)}<div class="legend"><span><i class="line-base"></i>Base</span><span><i class="line-downside"></i>Downside</span><span><i class="line-upside"></i>Upside</span></div><p class="small">Projected cash over ${plan.data.inputs.months} months. Forecast assumptions are separate from recorded payments.</p></div>`
       : empty(
           'Make the assumptions visible',
           'Model customers, pricing, delivery costs and collection timing before committing capital.',
@@ -295,7 +297,7 @@ function chart(scenarios) {
   return svg;
 }
 function work() {
-  const tasks = objs('task'),
+  const tasks = objs('task').filter((t) => t.state !== 'superseded'),
     groups = [...new Set(tasks.map((t) => t.data.category))];
   return (
     heading(
@@ -406,7 +408,7 @@ function finances() {
     );
   const s = p.data.scenarios[state.scenario],
     sum = s.summary;
-  html += `<div class="notice ${sum.statements_balance ? 'good' : 'error'}">${sum.statements_balance ? 'All three statements balance.' : 'Statement balance check failed.'} ${h(p.title)} · ${h(currency())} · ${p.data.inputs.months} months · ${plans.length} saved version${plans.length > 1 ? 's' : ''}</div><div class="finance-summary"><div><span>Ending cash · ${h(state.scenario)}</span><strong>${money(sum.ending_cash)}</strong></div><div><span>Additional cash needed</span><strong>${money(sum.additional_cash_needed)}</strong></div><div><span>First cash shortfall</span><strong>${sum.first_shortfall_month ? 'Month ' + sum.first_shortfall_month : 'None modeled'}</strong></div></div><div class="card"><div class="card-heading"><h3>Cash balance over time</h3><div class="actions">${['base', 'downside', 'upside'].map((c) => action('scenario', label(c), c, c === state.scenario ? 'primary compact' : 'secondary compact')).join('')}</div></div>${chart(p.data.scenarios)}<p class="small">${h(p.data.scenario_definitions[state.scenario])}. Negative cash is an unfunded shortfall; the model does not silently borrow to cover it.</p></div>`;
+  html += `${staleNotices(p)}<div class="notice ${sum.statements_balance ? 'good' : 'error'}">${sum.statements_balance ? 'All three statements balance.' : 'Statement balance check failed.'} ${h(p.title)} · ${h(currency())} · ${p.data.inputs.months} months · ${plans.length} saved version${plans.length > 1 ? 's' : ''}</div><div class="finance-summary"><div><span>Ending cash · ${h(state.scenario)}</span><strong>${money(sum.ending_cash)}</strong></div><div><span>Additional cash needed</span><strong>${money(sum.additional_cash_needed)}</strong></div><div><span>First cash shortfall</span><strong>${sum.first_shortfall_month ? 'Month ' + sum.first_shortfall_month : 'None modeled'}</strong></div></div><div class="card"><div class="card-heading"><h3>Cash balance over time</h3><div class="actions">${['base', 'downside', 'upside'].map((c) => action('scenario', label(c), c, c === state.scenario ? 'primary compact' : 'secondary compact')).join('')}</div></div>${chart(p.data.scenarios)}<p class="small">${h(p.data.scenario_definitions[state.scenario])}. Negative cash is an unfunded shortfall; the model does not silently borrow to cover it.</p></div>`;
   for (const [statement, fields] of Object.entries(statementFields))
     html += `<div class="section-title"><h2>${statement === 'income' ? 'Income statement' : statement === 'cash' ? 'Cash flow' : 'Balance sheet'} · ${h(label(state.scenario))}</h2></div><div class="card table-wrap"><table><thead><tr><th>Month</th>${fields.map((f) => `<th>${f[1]}</th>`).join('')}</tr></thead><tbody>${s.months.map((m) => `<tr><td>${m.month}</td>${fields.map((f) => `<td>${money(m[f[0]])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
   html += `<div class="grid two spaced"><div class="card"><h3>Discounted cash flow</h3>${sum.dcf ? `<div class="row"><span>Enterprise value</span><strong>${money(sum.dcf.enterprise_value)}</strong></div><div class="row"><span>Equity value</span><strong>${money(sum.dcf.equity_value)}</strong></div><div class="row"><span>Value from terminal assumption</span><strong>${sum.dcf.terminal_share === null ? 'Not meaningful' : (Number(sum.dcf.terminal_share) * 100).toFixed(1) + '%'}</strong></div><p class="small spaced">${h(sum.dcf.basis)}. This is a scenario value, not a market price.</p>` : '<p class="muted">Requires at least 12 months and positive terminal cash flow.</p>'}</div><div class="card"><h3>What the model assumes</h3>${p.data.assumptions.map((a) => `<p class="small">${h(a)}</p>`).join('')}<details><summary>Input assumptions and prior versions</summary><pre>${h(JSON.stringify(p.data.inputs, null, 2))}</pre>${plans.map((x) => `<p class="small">${h(x.title)} · ${h(dateTime(x.created_at))} ${action('inspect', 'View', x.id)}</p>`).join('')}</details></div></div>`;
@@ -423,7 +425,7 @@ function deals() {
       ? objs('deal')
           .map((o) => {
             const a = o.data.analysis;
-            return `<article class="card spaced"><div class="card-heading"><div><p class="eyebrow">ACQUISITION SCREENING</p><h2>${h(o.title)}</h2></div>${badge(o.stale ? 'needs_review' : o.state)}</div><p class="muted">${h(o.data.inputs.thesis)}</p>${o.stale ? '<div class="notice">Supporting evidence changed. Create a new analysis before relying on these adjustments.</div>' : ''}<div class="finance-summary"><div><span>Normalized EBITDA</span><strong>${money(a.normalized_ebitda)}</strong></div><div><span>Assumed enterprise value range</span><strong>${a.enterprise_value_range ? a.enterprise_value_range.map(money).join(' – ') : 'Not meaningful'}</strong></div><div><span>Buyer equity required</span><strong>${money(a.sources_and_uses.buyer_equity_required)}</strong></div></div><div class="table-wrap"><table><thead><tr><th>Case</th><th>EBITDA</th><th>Cash after debt service</th><th>Coverage ratio</th></tr></thead><tbody>${Object.entries(
+            return `<article class="card spaced"><div class="card-heading"><div><p class="eyebrow">ACQUISITION SCREENING</p><h2>${h(o.title)}</h2></div>${badge(o.stale ? 'needs_review' : o.state)}</div><p class="muted">${h(o.data.inputs.thesis)}</p>${staleNotices(o)}<div class="finance-summary"><div><span>Normalized EBITDA</span><strong>${money(a.normalized_ebitda)}</strong></div><div><span>Assumed enterprise value range</span><strong>${a.enterprise_value_range ? a.enterprise_value_range.map(money).join(' – ') : 'Not meaningful'}</strong></div><div><span>Buyer equity required</span><strong>${money(a.sources_and_uses.buyer_equity_required)}</strong></div></div><div class="table-wrap"><table><thead><tr><th>Case</th><th>EBITDA</th><th>Cash after debt service</th><th>Coverage ratio</th></tr></thead><tbody>${Object.entries(
               a.scenarios,
             )
               .map(
@@ -593,7 +595,7 @@ function businessDialog(edit = false) {
     },
     edit ? 'Save changes' : 'Create workspace',
     edit
-      ? 'Changes reopen completed work for review. Jurisdiction is fixed in this release; use a new workspace for a reviewed jurisdiction change.'
+      ? 'Changes reopen completed work for review. This form cannot change the jurisdiction: an owner or reviewer changes it as a separate, recorded decision with a reason, using the API or the foundry jurisdiction command.'
       : 'A concept creates the operating workspace and dependency-aware work plan. Unknowns can stay unknown until you have evidence.',
   );
 }

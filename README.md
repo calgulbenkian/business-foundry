@@ -40,6 +40,7 @@ This opens the same interface in a native window and signs you in automatically:
 
 - Separate business workspaces, scoped access keys, human review roles and an agent role that cannot approve evidence or attest external execution.
 - Dependency-aware startup and acquisition work, with distinct preparation, approval, submission and verification states.
+- A human-only, recorded change of planning jurisdiction, with a preview: earlier guide steps stay as superseded history, the new guide's steps are added and completed work is reopened in the same workspace. Earlier documents, deal analyses and forecasts are marked stale; saved figures are never rewritten.
 - Immutable evidence bodies, human review notes, versioned records, optimistic concurrency and idempotent write requests.
 - Linked monthly income statement, cash flow and balance sheet; collection delays, debt, taxes, capex, three scenarios and DCF.
 - Acquisition screening with evidence-supported earnings adjustments, replacement management, valuation ranges, sources and uses, amortizing debt service and downside coverage.
@@ -65,7 +66,7 @@ The command line keeps private state in `.foundry/` (relative to where you run i
 
 ## Scope of this release
 
-This is designed for a founder or small team on a trusted machine. It is not yet a multi-region enterprise platform, full double-entry bookkeeping system, contract-signing service, licensed valuation database or universal compliance engine. Jurisdiction guides are planning prompts requiring a current local review. A global “business complete” claim would be misleading; individual steps have explicit evidence and review states.
+This is designed for a founder or small team on a trusted machine. It is not yet a multi-region enterprise platform, full double-entry bookkeeping system, contract-signing service, licensed valuation database or universal compliance engine. Jurisdiction guides are planning prompts requiring a current local review. Changing the planning jurisdiction changes which guide applies and reopens work; it is not legal advice and does not form, move or register an entity. A global “business complete” claim would be misleading; individual steps have explicit evidence and review states.
 
 The next proving ground is a real private Polymer pilot: replace synthetic assumptions with the founders' actual operating facts, review rights and responsibilities, deliver an agreed customer result, reconcile payment, then publish only reusable improvements. See [the pilot acceptance plan](docs/PILOT.md).
 

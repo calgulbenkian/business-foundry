@@ -343,6 +343,16 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
     def update_business(bid: str, body: models.BusinessUpdate, who=Depends(actor), command=Depends(key)):
         return service.update_business(who, bid, command, body.model_dump(mode="json"))
 
+    @app.get("/api/businesses/{bid}/jurisdiction/preview")
+    def preview_jurisdiction(bid: str, to: models.Jurisdiction, who=Depends(actor)):
+        return service.preview_jurisdiction(who, bid, to)
+
+    @app.post("/api/businesses/{bid}/jurisdiction")
+    def change_jurisdiction(
+        bid: str, body: models.JurisdictionChange, who=Depends(actor), command=Depends(key)
+    ):
+        return service.change_jurisdiction(who, bid, command, body.model_dump(mode="json"))
+
     @app.post("/api/businesses/{bid}/records", status_code=201)
     def create_record(bid: str, body: models.RecordCreate, who=Depends(actor), command=Depends(key)):
         return service.add_record(who, bid, command, body.model_dump(mode="json"))

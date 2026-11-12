@@ -24,10 +24,10 @@ The first initialization creates one owner token and writes it to `owner.key` be
 
 | Role | Scope | Authority |
 |---|---|---|
-| Owner | All businesses | Create businesses and keys, prepare work, review, approve and reconcile |
-| Reviewer | Assigned businesses | Prepare and make human review decisions |
+| Owner | All businesses | Create businesses and keys, prepare work, review, approve, reconcile and change the planning jurisdiction |
+| Reviewer | Assigned businesses | Prepare and make human review decisions, including a planning-jurisdiction change |
 | Operator | Assigned businesses | Create ordinary records and prepare work; record an approved external submission with reviewed evidence |
-| Agent | Assigned businesses | Prepare records, evidence, models and drafts; no human approvals or execution attestations |
+| Agent | Assigned businesses | Prepare records, evidence, models and drafts; no human approvals, execution attestations or jurisdiction changes |
 | Viewer | Assigned businesses | Read only |
 
 Owners are global even if scope IDs are supplied; the UI does not offer owner-key creation. Only an owner can create/revoke access keys. An owner cannot revoke the key currently authenticating that request. Revocation removes sessions and blocks bearer authentication. Ordinary keys have no automatic expiry in v0.1; revoke them when access ends. The original owner key is powerful and should remain outside AI clients.

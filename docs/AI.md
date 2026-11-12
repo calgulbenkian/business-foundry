@@ -37,7 +37,7 @@ A typical stdio client configuration has this shape; adapt it to the client's do
 }
 ```
 
-The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote URLs. Tools list businesses, read the workspace, create or update assumption and reported records, attach unverified evidence, prepare work, run financial/deal analyses and generate working documents. Human approvals, evidence verification, external-submission attestations and payment reconciliation are not agent tools; the service also rejects those actions for the agent role even if a caller bypasses MCP.
+The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote URLs. Tools list businesses, read the workspace, create or update assumption and reported records, attach unverified evidence, prepare work, run financial/deal analyses and generate working documents. Human approvals, evidence verification, external-submission attestations, payment reconciliation and planning-jurisdiction changes are not agent tools; the service also rejects those actions for the agent role even if a caller bypasses MCP.
 
 ### Updating records
 
@@ -47,11 +47,11 @@ The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote U
 
 The adapter registers three MCP prompts, each taking a `business_id`:
 
-- `founder_intake` — interview for starting from a concept: intended buyer, concrete problem, offer/pricing/acceptance, delivery assets and third-party rights, unit economics and cash timing (`build_forecast`), and source evidence (`add_evidence`).
+- `founder_intake` — interview for starting from a concept: intended buyer, concrete problem, offer/pricing/acceptance, delivery assets and third-party rights, unit economics and cash timing (`build_forecast`), source evidence (`add_evidence`), and the operating footprint a human needs to select the planning jurisdiction.
 - `acquisition_intake` — target and thesis, reported revenue/EBITDA and replacement management, evidence-backed earnings adjustments, then valuation multiples, uses and debt or seller financing (`analyze_acquisition`).
-- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals or documents; summarizes gaps and asks before changing anything.
+- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals, forecasts or documents (each stale deal or forecast lists its reasons in `stale_reasons`); summarizes gaps and asks before changing anything.
 
-Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, and use `prepare_task` only to prepare work. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
+Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, use `prepare_task` only to prepare work, and leave the planning jurisdiction to a human. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
 
 If your client does not surface MCP prompts, follow the same sequence manually: ask the assistant to call `get_business` for the business ID, then interview you one topic at a time in the order above, saving each answer with `add_record` (new) or `update_record` (existing) and attaching sources with `add_evidence`, before running `build_forecast` or `analyze_acquisition` and reviewing the results yourself.
 
