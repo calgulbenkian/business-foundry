@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import sys
 from uuid import uuid4
 
 import pytest
@@ -2013,7 +2014,6 @@ def test_export_leaves_out_ai_review_columns_it_does_not_carry(setup, column):
         pytest.param('{"note":1E400}', {}, ValueError, id="overflow"),
         pytest.param('{"note":"\\ud800"}', {}, UnicodeEncodeError, id="surrogate"),
         pytest.param('{"note":1}', {"actor_id": SQL("X'FF'")}, UnicodeDecodeError, id="blob-not-utf8"),
-        pytest.param('{"n":' + "[" * 2000 + "]" * 2000 + "}", {}, RecursionError, id="nested-2000-levels"),
     ],
 )
 def test_known_limit_audit_endpoint_raises_on_events_it_cannot_send(
@@ -2026,6 +2026,31 @@ def test_known_limit_audit_endpoint_raises_on_events_it_cannot_send(
     with pytest.raises(Exception) as caught:
         client.get(f"/api/businesses/{bid}/audit")
     assert caught.type is expected
+
+
+# Python 3.11 counts JSON parsing against the recursion limit of 1,000, so there the service cannot read 2,000 levels;
+# 3.12 and later give the parser its own limit of about 10,000, so the service reports and only sending fails.
+READS_2000_LEVELS = sys.version_info >= (3, 12)
+
+
+@pytest.mark.parametrize(
+    "service_reads",
+    [
+        pytest.param(
+            READS_2000_LEVELS, id="py3.12+-service-reports" if READS_2000_LEVELS else "py3.11-service-raises"
+        )
+    ],
+)
+def test_known_limit_audit_endpoint_raises_on_an_event_nested_2000_levels(setup, client, service_reads):
+    store, service, actor, bid, _ = setup
+    append_raw(store, bid, bid, '{"n":' + "[" * 2000 + "]" * 2000 + "}", hashed=False)
+    if service_reads:
+        assert service.audit(actor, bid)["integrity"]["valid"] is False
+    else:
+        assert_audit_raises(setup, RecursionError)
+    with pytest.raises(Exception) as caught:
+        client.get(f"/api/businesses/{bid}/audit")
+    assert caught.type is RecursionError
 
 
 def test_audit_endpoint_sends_an_event_column_stored_as_a_utf8_blob(setup, client):
