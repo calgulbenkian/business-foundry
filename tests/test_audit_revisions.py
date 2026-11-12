@@ -6,6 +6,7 @@ import sys
 from uuid import uuid4
 
 import pytest
+from conftest import reviewed
 
 from foundry import models
 from foundry.demo import seed
@@ -2061,3 +2062,174 @@ def test_audit_endpoint_sends_an_event_column_stored_as_a_utf8_blob(setup, clien
     body = response.json()
     assert body["integrity"]["failed_sequence"] == seq
     assert body["events"][-1]["actor_id"] == "A"
+
+
+# Jurisdiction changes. One change writes a business.updated event, a task.superseded update for each
+# step of the earlier package, the new package's steps, a reopening of each remaining completed step, and
+# then a business.jurisdiction_changed event. That last event names the business as its object but has no
+# id, version or data, so it records no version. Steps are moved through the service, as a founder would.
+
+JURISDICTION_REASON = "Founders confirmed where they will operate."
+
+
+def change_jurisdiction(setup, to):
+    _, service, actor, bid, _ = setup
+    version = service.snapshot(actor, bid)["business"]["version"]
+    payload = models.JurisdictionChange(
+        expected_version=version, jurisdiction=to, reason=JURISDICTION_REASON
+    ).model_dump(mode="json")
+    return service.change_jurisdiction(actor, bid, key(), payload)
+
+
+def move_step(setup, step_key, states, evidence):
+    _, service, actor, bid, _ = setup
+    [task] = [
+        o
+        for o in service.snapshot(actor, bid)["objects"]
+        if o["kind"] == "task" and o["state"] != "superseded" and o["data"]["key"] == step_key
+    ]
+    for state in states:
+        payload = models.TaskTransition(
+            state=state,
+            expected_version=task["version"],
+            note=f"Synthetic move to {state}.",
+            evidence_ids=[evidence["id"]],
+        ).model_dump(mode="json")
+        task = service.transition(actor, bid, task["id"], key(), payload)
+    return task
+
+
+def jurisdiction_history(setup):
+    """undecided to GB to SE to undecided. Returns each change's result, in order."""
+    evidence = reviewed(setup, source_type="document")
+    move_step(setup, "jurisdiction", ["not_applicable"], evidence)
+    move_step(setup, "structure", ["not_applicable"], evidence)
+    changes = [change_jurisdiction(setup, "GB")]
+    move_step(setup, "local_review", ["in_progress"], evidence)
+    move_step(setup, "structure", ["not_applicable"], evidence)
+    changes.append(change_jurisdiction(setup, "SE"))
+    move_step(setup, "structure", ["not_applicable"], evidence)
+    move_step(setup, "local_review", ["prepared", "approved", "verified"], evidence)
+    changes.append(change_jurisdiction(setup, "undecided"))
+    return changes
+
+
+def test_several_jurisdiction_changes_verify_in_audit_and_export(setup):
+    _, service, actor, bid, _ = setup
+    changes = jurisdiction_history(setup)
+    # Superseded from three different states; each change adds one step and reopens the structure step.
+    assert [[s["state"] for s in c["superseded"]] for c in changes] == [
+        ["not_applicable"],
+        ["in_progress"],
+        ["verified"],
+    ]
+    assert [(len(c["added"]), [s["key"] for s in c["reopened"]]) for c in changes] == [(1, ["structure"])] * 3
+    assert service.snapshot(actor, bid)["business"]["version"] == 4
+    assert_clean(service, actor, bid)
+    assert service.audit(actor, bid, True)["integrity"] == integrity(setup)
+
+
+def superseded_from_verified(setup):
+    _, service, actor, bid, _ = setup
+    step = jurisdiction_history(setup)[-1]["superseded"][0]
+    [task] = [o for o in service.snapshot(actor, bid)["objects"] if o["id"] == step["id"]]
+    assert task["state"] == "superseded" and task["version"] == 5
+    return task
+
+
+def live_step(setup):
+    _, service, actor, bid, _ = setup
+    [task] = [
+        o
+        for o in service.snapshot(actor, bid)["objects"]
+        if o["kind"] == "task" and o["state"] != "superseded" and o["data"]["key"] == "structure"
+    ]
+    return task
+
+
+SUPERSEDED_DAMAGE = [
+    pytest.param(
+        "UPDATE revisions SET snapshot=json_set(snapshot,'$.title','Rewritten') WHERE object_id=? AND version=?",
+        ["Revision mismatch: {id}", "Historical revision differs from history: {id} version {version}"],
+        id="current-revision-changed",
+    ),
+    pytest.param(
+        "UPDATE objects SET title='Rewritten' WHERE id=? AND version=?",
+        ["Current record differs from history: {id}", "Revision mismatch: {id}"],
+        id="current-row-changed",
+    ),
+    pytest.param(
+        "DELETE FROM revisions WHERE object_id=? AND version=?",
+        ["Revision mismatch: {id}", "Historical revision missing: {id} version {version}"],
+        id="revision-removed",
+    ),
+]
+
+
+@pytest.mark.parametrize("step", [superseded_from_verified, live_step], ids=["superseded", "live"])
+@pytest.mark.parametrize(("sql", "expected"), SUPERSEDED_DAMAGE)
+def test_superseded_step_is_checked_like_any_other_step(setup, step, sql, expected):
+    # For the superseded step the damaged version is the one its task.superseded event recorded.
+    store = setup[0]
+    if step is live_step:
+        jurisdiction_history(setup)
+    task = step(setup)
+    with store.write() as con:
+        assert con.execute(sql, (task["id"], task["version"])).rowcount == 1
+    result = integrity(setup)
+    assert not result["valid"]
+    assert result["record_errors"] == [e.format(**task) for e in expected]
+
+
+def test_jurisdiction_change_event_records_no_version(setup):
+    store, service, actor, bid, _ = setup
+    change_jurisdiction(setup, "GB")
+    events = service.audit(actor, bid)["events"]
+    [decision] = [e for e in events if e["action"] == "business.jurisdiction_changed"]
+    assert decision["object_id"] == bid and decision["payload"]["business_version"] == 2
+    assert not {"id", "version", "data"} & set(decision["payload"])
+    recorded, errors = Service._recorded_versions(events)
+    business = service.snapshot(actor, bid)["business"]
+    assert {v: p for (o, v), p in recorded.items() if o == bid} == {1: events[0]["payload"], 2: business}
+    assert errors == []
+    # A correctly chained copy of the decision repeats nothing and is not an unusable version.
+    with store.read() as con:
+        text = con.execute("SELECT payload FROM events WHERE seq=?", (decision["seq"],)).fetchone()[0]
+    append_event(store, bid, bid, text, action="business.jurisdiction_changed")
+    assert_clean(service, actor, bid)
+
+
+def damage_first_jurisdiction_event(setup, payload):
+    store, service, actor, bid, _ = setup
+    jurisdiction_history(setup)
+    with store.write() as con:
+        seq = con.execute(
+            "SELECT min(seq) FROM events WHERE business_id=? AND action='business.jurisdiction_changed'",
+            (bid,),
+        ).fetchone()[0]
+        con.execute("UPDATE events SET payload=? WHERE seq=?", (payload, seq))
+    return seq
+
+
+@pytest.mark.parametrize("payload", ['{"to":"GB"}', '{"from":"undecided"}'])
+def test_changed_jurisdiction_event_payload_breaks_the_chain_in_audit_export_and_endpoint(
+    setup, client, payload
+):
+    # Verification never reads the jurisdiction a payload names. Reading the snapshot does, and raises.
+    _, service, actor, bid, _ = setup
+    seq = damage_first_jurisdiction_event(setup, payload)
+    broken_at(setup, seq)
+    assert service.audit(actor, bid, True)["integrity"] == integrity(setup)
+    response = client.get(f"/api/businesses/{bid}/audit")
+    assert response.status_code == 200
+    assert response.json()["integrity"] == integrity(setup)
+
+
+def test_known_limit_jurisdiction_event_payload_that_is_not_json_raises(setup, client):
+    _, _, _, bid, _ = setup
+    damage_first_jurisdiction_event(setup, "not json")
+    assert_audit_raises(setup, json.JSONDecodeError)
+    assert_audit_raises(setup, json.JSONDecodeError, export=True)
+    with pytest.raises(Exception) as caught:
+        client.get(f"/api/businesses/{bid}/audit")
+    assert caught.type is json.JSONDecodeError
