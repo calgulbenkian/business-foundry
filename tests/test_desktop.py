@@ -1542,6 +1542,190 @@ def test_a_record_built_with_make_log_record_and_a_changing_argument_reaches_no_
         assert len(messages(where, texts[where])) == 6, where
 
 
+def log_with_a_stack(logger, filename):
+    """Log through ``logger`` with ``stack_info=True`` from a function compiled under ``filename``,
+    so that a ``File "…"`` line of the stack holds that name."""
+    namespace = {}
+    source = "def log(logger):\n    logger.warning('with a stack', stack_info=True)\n"
+    exec(compile(source, filename, "exec"), namespace)
+    namespace["log"](logger)
+
+
+def test_a_secret_or_a_start_address_in_the_stack_is_replaced_at_every_place(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    for secret in (code, token):
+        log_with_a_stack(three_places.child, f"/synthetic/{secret}/mod.py")
+    log_with_a_stack(three_places.child, "/synthetic/desktop/start?code=" + code[:30])
+    # A record built another way, with stack text that holds the secret.
+    for secret in (code, token):
+        record = logging.makeLogRecord(
+            {
+                "name": three_places.library.name,
+                "levelno": logging.WARNING,
+                "levelname": "WARNING",
+                "msg": "built with a stack",
+                "stack_info": f'Stack (most recent call last):\n  File "/synthetic/built/{secret}/mod.py"',
+            }
+        )
+        three_places.library.handle(record)
+    texts = three_places.texts()
+    for where, text in texts.items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        assert text.count('File "/synthetic/[redacted]/mod.py", line 2, in log') == 2, where
+        assert text.count('File "/synthetic/desktop/start?[redacted] line 2, in log') == 1, where
+    for where in ("desktop.log", "guarded handler"):
+        assert texts[where].count('File "/synthetic/built/[redacted]/mod.py"') == 2, where
+
+
+class Text(str):
+    """A ``str`` subclass: the format is given a stand-in for it, not the text itself."""
+
+
+def test_a_number_format_given_a_str_subclass_is_refused_and_written_as_not_fitting(
+    three_places, synthetic_secrets
+):
+    signed_in_secrets(three_places.data)
+    forms = [("n=%d", Text("123")), ("f=%.1f", Text("1.5")), ("x=%x", Text("1"))]
+    for form, value in forms:
+        with pytest.raises(TypeError):
+            form % value  # Python alone refuses each
+    with kept(three_places.child) as records:
+        for form, value in forms:
+            three_places.child.warning(form, value)
+    expected = ["n=%d ('123',)", "f=%.1f ('1.5',)", "x=%x ('1',)"]
+    assert_finished(records, expected)
+    for where, text in three_places.texts().items():
+        assert messages(where, text) == expected, where
+
+
+class Counted:
+    """Prints ``strN`` or ``reprN``, with N counting its conversions of either kind."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def _text(self, kind):
+        self.calls += 1
+        return f"{kind}{self.calls}"
+
+    def __str__(self):
+        return self._text("str")
+
+    def __repr__(self):
+        return self._text("repr")
+
+
+def test_arguments_that_do_not_fit_are_written_after_the_message_at_every_place(
+    three_places, synthetic_secrets, capfd
+):
+    code, token = signed_in_secrets(three_places.data)
+    counter = Counted()
+    for form, args in (("two %s %s", ("one",)), ("count %s %d", (Counted(), "not a number"))):
+        with pytest.raises(TypeError):
+            form % args  # Python alone refuses each
+    with kept(three_places.child) as records:
+        three_places.child.warning("two %s %s", "one")  # does not raise
+        for secret in (code, token):
+            three_places.child.warning("misfit %s %s", secret)
+        three_places.child.warning("count %s %d", counter, "not a number")
+    expected = [
+        "two %s %s ('one',)",
+        "misfit %s %s ('[redacted]',)",
+        "misfit %s %s ('[redacted]',)",
+        "count %s %d (repr2, 'not a number')",
+    ]
+    assert_finished(records, expected)
+    # Converted once by %s before %d failed, and once more by the arguments' repr.
+    assert counter.calls == 2
+    for where, text in three_places.texts().items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        assert messages(where, text) == expected, where
+    _, err = capfd.readouterr()
+    assert "Logging error" not in err and "Traceback" not in err
+
+
+class Width(enum.IntEnum):
+    EIGHT = 8
+
+
+class Count(int):
+    pass
+
+
+class Ratio(float):
+    pass
+
+
+# Each prints the same without the redaction and with it.
+NEIGHBOURS_OF_THE_DIFFERENCE = [
+    ("c=%c", (Count(66),)),
+    ("f=%5.2f", (Ratio(1.25),)),
+]
+
+
+def test_known_difference_three_forms_that_fit_python_alone_are_written_as_not_fitting(
+    three_places, synthetic_secrets, capfd
+):
+    signed_in_secrets(three_places.data)
+    differing = [
+        ("c=%c", (Text("x"),), "c=x", "c=%c ('x',)"),
+        ("w=%*d", (Width.EIGHT, 5), "w=       5", "w=%*d (<Width.EIGHT: 8>, 5)"),
+        ("p=%.*s", (Count(3), "abcdef"), "p=abc", "p=%.*s (3, 'abcdef')"),
+    ]
+    with kept(three_places.child) as records:
+        for form, args, _, _ in differing:
+            three_places.child.warning(form, *args)  # does not raise
+        for form, args in NEIGHBOURS_OF_THE_DIFFERENCE:
+            three_places.child.warning(form, *args)
+    assert [form % args for form, args, _, _ in differing] == [alone for _, _, alone, _ in differing]
+    expected = [written for _, _, _, written in differing]
+    expected += [form % args for form, args in NEIGHBOURS_OF_THE_DIFFERENCE]
+    assert expected[3:] == ["c=B", "f= 1.25"]
+    assert_finished(records, expected)
+    for where, text in three_places.texts().items():
+        assert messages(where, text) == expected, where
+    _, err = capfd.readouterr()
+    assert "Logging error" not in err and "Traceback" not in err
+
+
+class OwnExceptionText(logging.Formatter):
+    """A formatter with its own exception text, counting the times it is asked for it."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def formatException(self, ei):
+        self.calls += 1
+        return "synthetic marker"
+
+
+def test_a_formatter_with_its_own_exception_text_is_not_asked_for_it(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    stream, formatter = io.StringIO(), OwnExceptionText()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(formatter)
+    three_places.child.addHandler(handler)
+    try:
+        with kept(three_places.child) as records:
+            for secret in (code, token):
+                try:
+                    raise RuntimeError(f"failed with {secret}")
+                except RuntimeError:
+                    three_places.child.exception("failed")
+    finally:
+        three_places.child.removeHandler(handler)
+    text = stream.getvalue()
+    for secret in (code, token):
+        assert leaked_part(secret, text) is None
+    assert text.count("Traceback (most recent call last)") == 2
+    assert text.count("RuntimeError: failed with [redacted]") == 2
+    assert "synthetic marker" not in text and formatter.calls == 0
+    assert_finished(records, ["failed", "failed"])  # exc_info is None on each
+
+
 PYWEBVIEW_CHILD = textwrap.dedent("""\
     import sys
     from pathlib import Path
