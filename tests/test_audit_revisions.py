@@ -2239,6 +2239,278 @@ def test_changed_ai_reviews_of_three_businesses_are_reported_each_only_in_its_ow
     assert_audit_and_export(service, actor, third, ["AI review differs from history: review_third_business"])
 
 
+# AI reviews that differ from each other in data and state. The reviews above are alike in
+# everything but their ids, which catches an export that drops duplicates but not one that gives a
+# review another review's data or state. Each review below is chained with the event a review
+# ending in its state leaves, so its row matches its own event and no other.
+
+
+# Rule: each AI review is compared with its own event and exported with its own data and state.
+def test_two_ai_reviews_that_differ_are_each_checked_and_exported_with_their_own_fields(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_zulu",
+        state="succeeded",
+        data={"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_alpha",
+        state="failed",
+        data={"error": "Provider output failed schema or citation validation.", "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_zulu", "review_alpha"]
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    # The two rows have the same created_at and the export orders by created_at only, so SQL does
+    # not fix which of them comes first. They are compared sorted by id.
+    assert sorted(runs, key=lambda run: run["id"]) == [
+        {
+            "id": "review_alpha",
+            "state": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"error": "Provider output failed schema or citation validation.", "http_status": 200},
+        },
+        {
+            "id": "review_zulu",
+            "state": "succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+        },
+    ]
+
+
+# Rule: in the created_at order the export fixes, each entry's data and state travel with its own
+# row. The review created later is stored first, so a version that paired a row's place in
+# created_at order with the row at that place in storage would swap the two reviews' fields.
+def test_export_by_created_at_keeps_each_ai_review_with_its_own_data_and_state(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_created_later",
+        created_at="2026-03-01T00:00:00+00:00",
+        state="failed",
+        data={"error": "Provider rejected the request.", "http_status": 403},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_created_sooner",
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_created_later", "review_created_sooner"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_created_sooner",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+        },
+        {
+            "id": "review_created_later",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 403},
+        },
+    ]
+
+
+# Rule: a business's export carries its own AI review's advice and outcome, never another
+# business's, whichever business's row was stored first.
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+def test_export_of_each_business_carries_its_own_ai_review_data_and_state(setup, first_inserted_first):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    reviews = [
+        lambda: add_ai_review(
+            store,
+            actor,
+            bid,
+            state="succeeded",
+            data={"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        ),
+        lambda: add_ai_review(
+            store,
+            actor,
+            other,
+            run_id=SECOND_RUN,
+            state="failed",
+            data={"error": "Provider did not complete a usable answer.", "http_status": 200},
+        ),
+    ]
+    for add in reviews if first_inserted_first else reversed(reviews):
+        add()
+    assert ai_call_ids_in_insertion_order(store) == (
+        ["review_synthetic", "review_second_business"]
+        if first_inserted_first
+        else ["review_second_business", "review_synthetic"]
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    assert_audit_and_export(service, actor, other, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        }
+    ]
+    assert exported_archive(service, actor, other)["ai_runs"] == [
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        }
+    ]
+
+
+# Rule: the export carries a changed AI review as its row stores it, and the same archive reports
+# it. It neither shows the state its history recorded nor leaves the review out.
+def test_export_carries_a_changed_ai_review_as_stored_and_reports_it(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    alter_ai_review(store, "review_synthetic")
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Advice that was never returned."},
+        }
+    ]
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+
+
+# Rule: the export carries an AI review that has no history, and the same archive reports it.
+def test_export_carries_an_ai_review_without_history_and_reports_it(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        chained=False,
+        state="failed",
+        data={"error": "Provider rejected the request.", "http_status": 429},
+    )
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        }
+    ]
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+
+
+# Rule: each exported review keeps its own data when another review shares its state, and its own
+# state when another review shares its data. The first two reviews share a state and differ in
+# data; the first and third share data and differ in state.
+def test_export_keeps_each_ai_review_fields_when_reviews_share_a_state_or_data(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_first",
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_second",
+        created_at="2026-03-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Delay the second location."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_third",
+        created_at="2026-04-01T00:00:00+00:00",
+        state="failed",
+        data={"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_first", "review_second", "review_third"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "succeeded",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Delay the second location."}, "http_status": 200},
+        },
+        {
+            "id": "review_third",
+            "state": "failed",
+            "created_at": "2026-04-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+    ]
+
+
+# Rule: a review is compared with its own event, and another review's event does not answer for
+# it. A row changed by SQL to the state and data of another review of the same business matches
+# that review's event, not its own, and is reported.
+def test_ai_review_changed_to_another_review_outcome_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_zulu",
+        state="succeeded",
+        data={"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_alpha",
+        state="failed",
+        data={"error": "Provider output failed schema or citation validation.", "http_status": 200},
+    )
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET data=?,state='failed' WHERE id='review_zulu'",
+                (
+                    canonical(
+                        {"error": "Provider output failed schema or citation validation.", "http_status": 200}
+                    ),
+                ),
+            ).rowcount
+            == 1
+        )
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_zulu"])
+
+
 def test_export_digest_covers_the_archive_with_its_ai_review(setup):
     store, service, actor, bid, _ = setup
     add_ai_review(store, actor, bid)
@@ -2594,21 +2866,32 @@ def test_null_id_of_a_current_record_is_reported(setup):
     assert export_integrity(setup)["record_errors"] == expected
 
 
-def add_ai_review(store, actor, bid, chained=True, run_id="review_synthetic", created_at=APPENDED_AT):
-    data = {"note": "Synthetic run written for this test."}
+def add_ai_review(
+    store,
+    actor,
+    bid,
+    chained=True,
+    run_id="review_synthetic",
+    created_at=APPENDED_AT,
+    data=None,
+    state="unknown",
+):
+    """Store an AI review row and, when chained, the event a review ending in that state leaves."""
+    if data is None:
+        data = {"note": "Synthetic run written for this test."}
     with store.write() as con:
         con.execute(
             "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
-            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), "unknown", created_at),
+            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), state, created_at),
         )
         if chained:
             store.event(
                 con,
                 bid,
                 actor,
-                "ai.unknown",
+                "ai." + state,
                 run_id,
-                {"run_id": run_id, "state": "unknown", "data_sha256": digest(canonical(data))},
+                {"run_id": run_id, "state": state, "data_sha256": digest(canonical(data))},
             )
     return run_id
 
