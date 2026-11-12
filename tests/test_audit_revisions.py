@@ -1536,6 +1536,62 @@ def test_list_or_object_run_id_without_a_digest_is_reported(setup, payload):
     broken_at(setup, seq)
 
 
+@pytest.mark.parametrize("hashed", POSITIONS)
+def test_known_limit_null_object_id_with_a_version_and_no_id_raises(setup, hashed):
+    # Without an id, payload.get("id") == object_id is None == None, and the id is then read.
+    store, _, _, bid, _ = setup
+    without_constraint(store, "events", "object_id TEXT NOT NULL", "object_id")
+    append_raw(store, bid, SQL("NULL"), '{"version":1,"data":{}}', hashed=hashed)
+    assert_audit_raises(setup, KeyError)
+
+
+@pytest.mark.parametrize("hashed", POSITIONS)
+def test_null_object_id_with_a_null_id_is_reported(setup, hashed):
+    store, _, _, bid, _ = setup
+    without_constraint(store, "events", "object_id TEXT NOT NULL", "object_id")
+    seq = append_raw(store, bid, SQL("NULL"), '{"id":null,"version":1,"data":{}}', hashed=hashed)
+    broken_at(setup, seq, ["Historical record missing: None", "Historical revision missing: None version 1"])
+
+
+def export_integrity(setup):
+    _, service, actor, bid, _ = setup
+    return service.audit(actor, bid, True)["integrity"]
+
+
+@pytest.mark.parametrize("hashed", POSITIONS)
+@pytest.mark.parametrize(
+    ("column", "payload"),
+    [
+        pytest.param("actor_id", '{"note":1}', id="actor-id"),
+        pytest.param("action", '{"note":1}', id="action"),
+        pytest.param("created_at", '{"note":1}', id="created-at"),
+        pytest.param("prev_hash", '{"note":1}', id="prev-hash"),
+        pytest.param("hash", '{"note":1}', id="hash"),
+        pytest.param("object_id", '{"data":{}}', id="object-id-payload-without-version"),
+    ],
+)
+def test_null_event_column_is_reported(setup, column, payload, hashed):
+    store, _, _, bid, _ = setup
+    without_constraint(store, "events", f"{column} TEXT NOT NULL", column)
+    seq = append_raw(store, bid, bid, payload, hashed=hashed, columns={column: SQL("NULL")})
+    broken_at(setup, seq)
+    assert export_integrity(setup)["failed_sequence"] == seq
+
+
+def test_null_id_of_a_current_record_is_reported(setup):
+    # SQLite allows NULL in a TEXT PRIMARY KEY without any change to the table.
+    store = setup[0]
+    row = record_row(setup, "objects")
+    set_column(store, "objects", "id", row, SQL("NULL"))
+    expected = [
+        "Current record differs from history: None",
+        "Revision mismatch: None",
+        f"Historical record missing: {row}",
+    ]
+    assert integrity(setup)["record_errors"] == expected
+    assert export_integrity(setup)["record_errors"] == expected
+
+
 def add_ai_review(store, actor, bid, chained=True):
     run_id = "review_synthetic"
     data = {"note": "Synthetic run written for this test."}
@@ -1807,6 +1863,19 @@ def test_ai_review_data_that_parses_is_reported(setup, data):
     run_id = add_ai_review(store, actor, bid)
     set_column(store, "ai_calls", "data", run_id, data)
     assert integrity(setup)["record_errors"] == [f"AI review differs from history: {run_id}"]
+
+
+@pytest.mark.parametrize("chained", [pytest.param(True, id="chained"), pytest.param(False, id="no-history")])
+def test_null_id_of_an_ai_review_row_is_reported(setup, chained):
+    # SQLite allows NULL in a TEXT PRIMARY KEY without any change to the table.
+    store, _, actor, bid, _ = setup
+    run_id = add_ai_review(store, actor, bid, chained)
+    set_column(store, "ai_calls", "id", run_id, SQL("NULL"))
+    expected = ["AI review differs from history: None"]
+    if chained:
+        expected.append(f"Historical AI review missing: {run_id}")
+    assert integrity(setup)["record_errors"] == expected
+    assert export_integrity(setup)["record_errors"] == expected
 
 
 UNENCODABLE_EVENTS = [
