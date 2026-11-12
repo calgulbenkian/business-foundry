@@ -26,14 +26,56 @@ const slowdown = (() => {
     throw new Error(`FOUNDRY_BROWSER_SLOWDOWN must be a number of 1 or more, not "${v}"`);
   return n;
 })();
-/* Run in each page before its own script: the page's requests whose answers it has not yet
-   finished with. A request leaves the list once its answer has been read, or its failure
-   reported, and the page's own code that follows has run: that code runs in promise jobs, and
-   every one queued by then runs before a timer can fire. A request that code sends in turn is
-   on the list before the one that caused it leaves. The page itself is not changed. */
-function trackRequests() {
+/* A timer the page sets for this long or less is waited for by quiet(); a longer one is not. The
+   page's message hides after 5,500 ms, and nothing should wait for that. A fault that acts on a
+   timer longer than this is out of quiet()'s reach. */
+const SHORT_TIMER_MS = 2000;
+/* Run in each page before its own script. It follows two things, and changes nothing the page
+   does with either:
+   - The page's requests whose answers it has not yet finished with. A request leaves the list
+     once its answer has been read, or its failure reported, and the page's own code that follows
+     has run: that code runs in promise jobs, and every one queued by then runs before a timer
+     can fire. A request that code sends in turn is on the list before the one that caused it
+     leaves.
+   - The page's short timers: each setTimeout of `short` ms or less, given a function, from the
+     moment it is set until its function has run or clearTimeout cancels it. A timer or request
+     set by that function is followed before the first one leaves.
+   Not followed: setInterval, setTimeout given a string, timers longer than `short`, and work the
+   browser starts on its own, such as a dialog's close event. quiet() covers what is already
+   queued of the last of these by waiting a frame and a task, and checking again. */
+function trackPending(short) {
   const open = [];
   window.__browserTestRequests = open;
+  const timers = new Set();
+  window.__browserTestTimers = timers;
+  const later = window.setTimeout,
+    cancel = window.clearTimeout;
+  window.setTimeout = function (fn, ms, ...args) {
+    // no delay, or one that is not a number, is a delay of 0, as the browser counts it
+    if (typeof fn !== 'function' || (Number(ms) || 0) > short) return later(fn, ms, ...args);
+    const id = later(function () {
+      try {
+        return fn.apply(this, args);
+      } finally {
+        timers.delete(id);
+      }
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  window.clearTimeout = function (id) {
+    timers.delete(id);
+    return cancel(id);
+  };
+  // whether anything is pending, leaving out requests matching a hold() ({ path, method })
+  window.__browserTestPending = (held) =>
+    timers.size > 0 ||
+    open.some((r) => !held.some((h) => h.path === r.path && (!h.method || h.method === r.method)));
+  // after one frame and one task, whether anything is pending again; its own task is not followed
+  window.__browserTestSettled = (held) =>
+    new Promise((r) =>
+      requestAnimationFrame(() => later(() => r(window.__browserTestPending(held)), 0)),
+    );
   const send = window.fetch;
   window.fetch = (input, init) => {
     const entry = {
@@ -42,7 +84,7 @@ function trackRequests() {
     };
     open.push(entry);
     const finish = () =>
-      setTimeout(() => {
+      later(() => {
         const at = open.indexOf(entry);
         if (at >= 0) open.splice(at, 1);
       }, 0);
@@ -69,25 +111,24 @@ const heldOn = (page) => {
   if (!holding.has(page)) holding.set(page, new Set());
   return holding.get(page);
 };
-/* Resolve once the page has finished with every request it has sent, except those a hold() is
-   still holding back, and has drawn the result: the moment after which anything the page was
-   going to do with an answer has been done. A check that something did not happen waits for
-   this, never for a fixed time. */
+/* Resolve once nothing trackPending() follows is pending in the page: every request it has sent
+   has been finished with, except those a hold() is still holding back, and every timer of
+   SHORT_TIMER_MS or less it has set has run or been cancelled. Then one frame is drawn and one
+   task runs, and if that started a request or a short timer, it waits again. What it follows:
+   requests by fetch, short timers, and work already queued for the next frame or task, such as
+   a dialog's close event. What it does not: a timer longer than SHORT_TIMER_MS, setInterval, a
+   timer given a string, and work the browser starts later on its own. A check that something
+   did not happen waits for this, so that a page that does the thing a short time later, by a
+   request or by a timer, is caught. It never waits for a fixed time. */
 async function quiet(page) {
   const held = [...heldOn(page)];
-  await page.waitForFunction(
-    (held) =>
-      window.__browserTestRequests.every((r) =>
-        held.some((h) => h.path === r.path && (!h.method || h.method === r.method)),
-      ),
-    held,
-  );
-  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0))));
+  do await page.waitForFunction((held) => !window.__browserTestPending(held), held);
+  while (await page.evaluate((held) => window.__browserTestSettled(held), held));
 }
 /* Every page the test opens comes from here, so every one is slowed alike. */
 async function newPage(owner, options) {
   const p = await owner.newPage(options);
-  await p.addInitScript(trackRequests);
+  await p.addInitScript(trackPending, SHORT_TIMER_MS);
   if (slowdown > 1) {
     const cdp = await p.context().newCDPSession(p);
     await cdp.send('Emulation.setCPUThrottlingRate', { rate: slowdown });
@@ -214,9 +255,13 @@ async function dropNext(page, path, method = 'GET') {
     done();
   };
   await page.route(match, handler);
+  // resolves once the page has finished with the failure and anything it sent because of it
+  const finished = dropped.then(() => quiet(page));
+  // a case that fails before it waits for this, and a page loaded again meanwhile, would
+  // otherwise leave its failure unhandled; a case that waits for it still sees the failure
+  finished.catch(() => {});
   return {
-    // resolves once the page has finished with the failure and anything it sent because of it
-    dropped: dropped.then(() => quiet(page)),
+    dropped: finished,
     off: () => {
       used = true;
     },
@@ -273,6 +318,7 @@ async function walkLists(page, what) {
           await page.locator('#list .grp', { hasText: 'Events' }).waitFor({ state: 'attached' });
       }
       const at = `${what}, ${id || 'no business'}, ${width}px`;
+      await quiet(page);
       assert.deepEqual(await listFaults(page), [], `${at}: lists hold only list items`);
       assert.equal(
         await page
@@ -360,6 +406,8 @@ async function main() {
     let f; // what has focus, read after each step that re-renders the focused control
     await signIn(page, origin, join(temp, 'owner.key'));
     await page.locator('#list .today-head').waitFor();
+    // the checks of what Today does not hold wait until the page has finished loading it
+    await quiet(page);
     assert.equal(await page.locator('#list-title').innerText(), 'Today');
     // Today mixes steps from several lines under shared headings, so each step row names its
     // line in text, matching the source list; the spine's colour is never the only cue.
@@ -549,6 +597,7 @@ async function main() {
     const demoKeys = [...new Set(Object.keys(lineNames))];
     for (const scheme of ['light', 'dark']) {
       await page.emulateMedia({ colorScheme: scheme });
+      await quiet(page);
       const painted = await lineColours(page);
       for (const what of [
         'map line',
@@ -571,6 +620,7 @@ async function main() {
     await page.emulateMedia({ colorScheme: 'light' });
     await page.setViewportSize({ width: 1920, height: 1100 });
     await page.locator('#insp .mapbox[data-fit="wide"]').waitFor();
+    await quiet(page);
     const wide = page.locator('#insp .mp-wide');
     assert(await wide.isVisible());
     assert.equal(await page.locator('#insp .mp-tall').isVisible(), false);
@@ -652,6 +702,7 @@ async function main() {
     await page.setViewportSize({ width: 728, height: 1000 });
     await page.locator('#insp .mapbox[data-fit="tall"]').waitFor();
     assert(await page.locator('#insp .mp-tall').isVisible());
+    await quiet(page);
     assert.equal(await overflow(page), false, '728: horizontal overflow');
     await page.screenshot({ path: 'test-results/journey-medium.png' });
     await page.setViewportSize({ width: 1440, height: 1050 });
@@ -688,6 +739,7 @@ async function main() {
     await submit('Save unverified evidence');
     await rowFor('Browser synthetic receipt').click();
     await page.locator('#insp pre.original').waitFor();
+    await quiet(page);
     assert.equal(await page.locator('#insp img').count(), 0);
     assert((await page.locator('#insp pre.original').innerText()).includes('<img src=x'));
     await page.getByRole('button', { name: 'Record human review' }).click();
@@ -901,6 +953,7 @@ async function main() {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.reload();
     await page.locator('#list .row').first().waitFor();
+    await quiet(page);
     assert.equal(await page.locator('#app').getAttribute('data-level'), 'list');
     assert.equal(await page.locator('#insp').isVisible(), false);
     await page.screenshot({ path: 'test-results/overview-mobile.png', fullPage: true });
@@ -910,6 +963,7 @@ async function main() {
       return at;
     };
     await page.locator('#list .row').first().click();
+    await quiet(page);
     assert.equal(await page.locator('#app').getAttribute('data-level'), 'detail');
     assert(await page.locator('#back-list').isVisible());
     assert.equal(await page.locator('#list').isVisible(), false);
@@ -933,6 +987,7 @@ async function main() {
       assert(await page.locator('#src-nav').isVisible());
       assert.equal((await inPane('sources', `${id}: back to sources`)).current, 'true');
       await page.locator(`#src-nav .src[data-src="${id}"]`).press('Enter');
+      await quiet(page);
       assert.equal(await overflow(page), false, `${id}: mobile horizontal overflow (list)`);
       await inPane(id === 'journey' ? 'inspector' : 'list', `${id}: source chosen`);
       if (id !== 'journey') {
@@ -940,6 +995,7 @@ async function main() {
         await inPane('inspector', `${id}: row chosen`);
       }
       await page.locator('#insp #insp-title').waitFor();
+      await quiet(page);
       assert.equal(await overflow(page), false, `${id}: mobile horizontal overflow (detail)`);
     }
     await page.screenshot({ path: 'test-results/detail-mobile.png', fullPage: true });
@@ -959,6 +1015,7 @@ async function main() {
     const reopenedRow = rowFor('Establish customer demand');
     assert.equal(await reopenedRow.locator('.r-g svg').getAttribute('data-glyph'), 'review');
     await reopenedRow.click();
+    await quiet(page);
     const inspector = await page.locator('#insp').innerText();
     assert(inspector.includes('This step was reopened.'));
     assert(inspector.includes('Evidence withdrawn: Browser synthetic receipt'));
@@ -1058,6 +1115,7 @@ async function main() {
     assert(afterSave.events.length > beforeSave.events.length, 'the save added history');
     await raceSource('history');
     await race.locator('#list .grp', { hasText: 'Events' }).waitFor();
+    await quiet(race);
     assert.equal(
       await race.locator('#list .grp', { hasText: 'Events' }).locator('.grp-n').innerText(),
       String(afterSave.events.length),
@@ -1156,6 +1214,7 @@ async function main() {
     await race.locator('#list .row', { hasText: savedTitle }).waitFor();
     f = await focused(race);
     assert.deepEqual([f.pane, f.visible], ['list', true], 'focus after loading the records');
+    await quiet(race);
     assert.equal(await recordsTitled(savedTitle), 1, 'the record was saved once');
 
     // (e) A switch to another business is pending while a save in this one is followed by a
@@ -1191,6 +1250,7 @@ async function main() {
     await outdated.getByRole('button', { name: 'Load current records' }).click();
     await outdated.waitFor({ state: 'hidden' });
     await race.locator('#list .row', { hasText: switchTitle }).waitFor();
+    await quiet(race);
     assert.equal(
       await race.locator('#business-select').inputValue(),
       bid,
@@ -1248,6 +1308,7 @@ async function main() {
     await race.locator('#insp').getByRole('button', { name: 'Record decision' }).click();
     assert.equal((await answered).status(), 200);
     await race.locator('#insp #tx-form').waitFor({ state: 'detached' });
+    await quiet(race);
     assert.equal(txKeys.length, 2);
     assert.equal(txKeys[1], txKeys[0], 'sending a failed decision again uses the same key');
     txKeys.length = 0;
@@ -1283,6 +1344,7 @@ async function main() {
       .click();
     await outdated.waitFor({ state: 'hidden' });
     await race.locator('#insp .i-state .st', { hasText: 'Prepared' }).waitFor();
+    await quiet(race);
     assert.equal(txKeys.length, 1, 'the accepted decision was sent once');
     f = await focused(race);
     assert.deepEqual([f.id, f.visible], ['insp-title', true], 'focus after loading the records');
@@ -1691,6 +1753,7 @@ async function main() {
       );
       await inDialog('Save changes');
       assert.equal((await answered).status(), 409, 'the older form is refused, not merged');
+      await quiet(race);
       assert.equal((await snapshotOf(bid)).business.data.customer, kept, 'nothing was overwritten');
       await race.locator('#dialog .error', { hasText: 'The business changed' }).waitFor();
     });
@@ -1923,6 +1986,7 @@ async function main() {
       await drop.dropped;
       await drop.off();
       await race.locator('#list .row').first().click();
+      await quiet(race);
       assert.equal(await race.locator('#list').isVisible(), false);
       await outdated.getByRole('button', { name: 'Dismiss' }).focus();
       await race.keyboard.press('Enter');
@@ -1951,7 +2015,12 @@ async function main() {
         ['new-record', true, 'list'],
         `${what}: focus is on the visible control that opens the record form`,
       );
-    // create a key and wait until the reload after it has drawn the access list again
+    // Create a key, show it, and only then let the reload after it draw the access list again,
+    // so the control that opened the form is replaced while the key's dialog is open. The page
+    // does not set that order: the browser fires the form's close event, which shows the key, a
+    // few milliseconds after the form closes, and the reload's answers can arrive first. Then
+    // the key's dialog opens over a list already drawn again, and the case would pass without
+    // the situation it names. So the reload's first request is held until the key is showing.
     const keyShownOverRedrawnList = async (name, phone = false) => {
       if (phone) {
         // on a phone the source list gives way to the list pane once a source is chosen
@@ -1959,10 +2028,23 @@ async function main() {
         await race.getByRole('button', { name: '+ Create access key', exact: true }).click();
         await race.getByLabel('Person or agent name', { exact: true }).fill(name);
       } else await openKeyForm(name);
+      const opener = await race.locator('#list-right [data-action="new-key"]').elementHandle();
+      const reload = await hold(race, '/api/businesses', { method: 'GET' });
       await inDialog('Create key');
       await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+      await reload.requested;
+      assert.equal(await rowIn(name).count(), 0, 'the key is shown before the list is drawn again');
+      assert(
+        await opener.evaluate((el) => el.isConnected),
+        'the form’s opener is still on the page',
+      );
+      await reload.release();
       await rowIn(name).waitFor();
-      await quiet(race);
+      assert(
+        !(await opener.evaluate((el) => el.isConnected)),
+        'the list behind the key was drawn again, and the form’s opener with it',
+      );
+      await opener.dispose();
     };
     lateCase('round 4 finding 1: Escape on a new key, after the list was redrawn', async () => {
       await onBusiness(bid, testName);
@@ -2077,6 +2159,7 @@ async function main() {
         assert((await session()) === signedIn, 'the new session keeps its cookie');
         await raceSource('history');
         await race.locator('#list .grp', { hasText: 'Events' }).waitFor();
+        await quiet(race);
         assert(await race.locator('#app').isVisible(), 'the workspace stays on screen');
         assert(await race.locator('#login').isHidden(), 'sign-in is not asked for');
         assert.equal(await race.locator('#toast').isVisible(), false, 'no message appears');
@@ -2125,6 +2208,7 @@ async function main() {
     const openStep = async (t) => {
       await race.evaluate((id) => go(`journey|step:${id}`), t.id);
       await race.locator('#insp-title', { hasText: t.title }).waitFor();
+      await quiet(race);
     };
     await openStep(t0);
     assert.equal(await race.locator('#insp a[href^="javascript"]').count(), 0);
@@ -2142,10 +2226,12 @@ async function main() {
     await raceSource('evidence');
     await race.locator('#list .row').filter({ hasText: 'Browser synthetic receipt' }).click();
     await race.locator('#insp pre.original').waitFor();
+    await quiet(race);
     assert.equal(await race.locator('#insp a[href^="data:"]').count(), 0);
     assert((await race.locator('#insp .props .uri').innerText()).startsWith('data:text/html,'));
     // money() under a rejected currency code: the amount, as text, and no markup.
     await raceSource('sales');
+    await quiet(race);
     assert.equal(await race.locator('.inj').count(), 0, 'no markup from a currency code');
     assert.match(await race.locator('#list').innerText(), /100\.00 imgclassinjsrcx/);
     altering = false;
@@ -2209,6 +2295,7 @@ async function main() {
     await race.locator('#list .grp', { hasText: 'Events' }).waitFor();
     await race.locator('.toolbar [data-action="logout"]').click();
     await race.getByLabel('Access key', { exact: true }).waitFor();
+    await quiet(race);
     assert.deepEqual(await forgotten(), blank, 'signed out');
     await race
       .getByLabel('Access key', { exact: true })
@@ -2218,6 +2305,7 @@ async function main() {
     await context.clearCookies();
     await race.locator('#src-nav .src[data-src="history"]').click();
     await race.getByLabel('Access key', { exact: true }).waitFor();
+    await quiet(race);
     assert.deepEqual(await forgotten(), blank, 'after a 401');
     await race.close();
 
@@ -2236,9 +2324,11 @@ async function main() {
     await fresh.screenshot({ path: 'test-results/empty-desktop.png' });
     await walkLists(fresh, 'no business yet');
     await fresh.setViewportSize({ width: 390, height: 844 });
+    await quiet(fresh);
     assert.equal(await overflow(fresh), false, 'empty workspace: mobile overflow');
     await fresh.close();
 
+    await quiet(page);
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
