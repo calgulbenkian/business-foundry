@@ -96,6 +96,10 @@ const state = {
 const canReview = () => ['owner', 'reviewer'].includes(state.actor?.role);
 const canWrite = () => Boolean(state.actor) && state.actor.role !== 'viewer';
 const isOwner = () => state.actor?.role === 'owner';
+/* The toolbar's + New business, which only an owner may use. It is the one control offered by role
+   that the page writes outside the panes it renders again; forget() hides it, and only a load for
+   an owner shows it again. */
+const newBusinessButton = () => $('.toolbar [data-action="new-business"]');
 const objs = (kind) => (state.snapshot?.objects || []).filter((o) => !kind || o.kind === kind);
 const find = (id) => objs().find((o) => o.id === id);
 const currency = () => state.snapshot?.business.data.currency || 'USD';
@@ -3321,6 +3325,8 @@ function forget() {
   $('#back-list-lbl').textContent = 'Today';
   $('#business-select').innerHTML = '';
   $('#demo-tag').hidden = true;
+  // nobody is known to be an owner until the next load names one
+  newBusinessButton().hidden = true;
   $('#toast').hidden = true;
   $('#outdated').hidden = true;
   $('#outdated-text').textContent = '';
@@ -3444,7 +3450,7 @@ async function refresh() {
   M = buildModel(snapshot);
   $('#demo-tag').hidden = !snapshot?.business.data.is_demo;
   $('#actor-name').textContent = state.actor.name + ' · ' + label(state.actor.role);
-  $('[data-action="new-business"]').hidden = !isOwner();
+  newBusinessButton().hidden = !isOwner();
   $('#tb-date').textContent = new Date().toLocaleDateString(undefined, {
     weekday: 'long',
     day: 'numeric',
@@ -4502,8 +4508,10 @@ async function handle(a, el) {
     // an answer for a session that has already ended (a 401 meanwhile) ends nothing newer;
     // the other tabs are told before the sign-in page, and so before any new sign-in, is shown
     if (session === sessionSeq) sessionEnded();
-  } else if (a === 'new-business') businessDialog();
-  else if (a === 'edit-business') businessDialog(true);
+  } else if (a === 'new-business') {
+    // an owner's form opens only for an owner, however its control was reached
+    if (isOwner()) businessDialog();
+  } else if (a === 'edit-business') businessDialog(true);
   else if (a === 'new-record') recordDialog();
   else if (a === 'record') recordDialog(id);
   else if (a === 'new-evidence') newEvidence();
@@ -4529,8 +4537,10 @@ async function handle(a, el) {
   else if (a === 'new-invoice') invoiceDialog();
   else if (a === 'issue-invoice') issueDialog(id);
   else if (a === 'new-payment') paymentDialog(id);
-  else if (a === 'new-key') keyDialog();
-  else if (a === 'revoke-key') {
+  else if (a === 'new-key') {
+    if (isOwner()) keyDialog();
+  } else if (a === 'revoke-key') {
+    if (!isOwner()) return;
     formDialog(
       'Revoke access key',
       '<p class="full">This immediately prevents the selected key and its sessions from accessing this server.</p>',

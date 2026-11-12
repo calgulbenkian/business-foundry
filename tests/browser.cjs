@@ -3976,6 +3976,117 @@ print(json.dumps({
         });
       },
     );
+    // Round 10, F1. The toolbar's + New business is for an owner only. While a tab does not know who
+    // is signed in, or knows it is someone else, it is not shown, and its form does not open even
+    // when its control is clicked from the page's own script.
+    const dialogIn = (p) =>
+      p.evaluate(() => ({
+        open: document.querySelector('#dialog').open,
+        title: document.querySelector('#dialog-title').textContent,
+      }));
+    const noDialog = { open: false, title: '' };
+    // a click on a control, sent from the page itself rather than by a person
+    const clickFromPage = (p, selector) =>
+      p.evaluate((s) => document.querySelector(s).click(), selector);
+    // a control for an action, made by the test and clicked from the page, as a page's own script
+    // could reach it; the control is taken away again
+    const actionFromPage = (p, action, id = '') =>
+      p.evaluate(
+        ([a, i]) => {
+          const control = document.createElement('button');
+          control.dataset.action = a;
+          if (i) control.dataset.id = i;
+          document.body.append(control);
+          control.click();
+          control.remove();
+        },
+        [action, id],
+      );
+    const NEW_BUSINESS = '.toolbar [data-action="new-business"]';
+    lateCase(
+      'round 10 F1: another tab signs out; while this tab asks who is signed in, no + New business',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          assert.equal(await b.locator(NEW_BUSINESS).isVisible(), true, 'the owner has it');
+          const question = await holdNext(b, '/api/me');
+          await signOutIn(a);
+          assert.equal((await sent(question, 'tab B’s question')).status(), 401);
+          await quiet(b);
+          assert.deepEqual(
+            await tabShows(b),
+            {
+              signInPage: false,
+              workspace: true,
+              name: '',
+              actor: null,
+              newBusiness: false,
+              note: '',
+              error: '',
+              toast: null,
+            },
+            'an empty workspace, with nothing only an owner may use',
+          );
+          await clickFromPage(b, NEW_BUSINESS);
+          await quiet(b);
+          assert.deepEqual(await dialogIn(b), noDialog, 'its form does not open');
+          await question.release();
+          assert.deepEqual(await tabShows(b), { ...signedOutPage, note: CHANGED });
+          assert.deepEqual(await dialogIn(b), noDialog);
+        });
+      },
+    );
+    lateCase(
+      'round 10 F1: a viewer signs in in another tab; while the viewer’s records load, no + New business, then the owner has it',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await signOutIn(a);
+          await told(b.getByLabel('Access key', { exact: true }), 'tab B was not told');
+          await quiet(b);
+          const records = await holdNext(b, '/api/businesses');
+          await signInAs(a, viewer.token);
+          await sent(records, 'tab B’s first load as the viewer');
+          await quiet(b);
+          assert.equal(await b.evaluate(() => state.actor?.role), 'viewer', 'the viewer is named');
+          assert.equal(await b.locator(NEW_BUSINESS).isVisible(), false, 'no + New business');
+          await clickFromPage(b, NEW_BUSINESS);
+          await quiet(b);
+          assert.deepEqual(await dialogIn(b), noDialog, 'a click opens no form');
+          await records.release();
+          assert.deepEqual(await dialogIn(b), noDialog, 'and none is open after the load');
+          assert.deepEqual(await tabShows(b), {
+            signInPage: false,
+            workspace: true,
+            name: `${viewer.name} · Viewer`,
+            actor: viewer.id,
+            newBusiness: false,
+            note: '',
+            error: '',
+            toast: CHANGED,
+          });
+          // an owner's other forms do not open for the viewer either, however they are reached
+          for (const [action, id] of [
+            ['new-business', ''],
+            ['new-key', ''],
+            ['revoke-key', viewer.id],
+          ]) {
+            await actionFromPage(b, action, id);
+            await quiet(b);
+            assert.deepEqual(await dialogIn(b), noDialog, `${action}: no form for the viewer`);
+          }
+          // the owner, signing in after the viewer, has + New business again, and it opens its form
+          await signOutIn(a);
+          await signInAs(a, ownerKey());
+          await told(b.locator(NEW_BUSINESS), 'tab B did not show + New business for the owner');
+          await quiet(b);
+          assert.deepEqual(await tabShows(b), { ...(await ownerWorkspace(b)), toast: CHANGED });
+          await b.locator(NEW_BUSINESS).click();
+          await b.locator('#dialog-title', { hasText: 'Create a business' }).waitFor();
+          assert.deepEqual(await dialogIn(b), { open: true, title: 'Create a business' });
+          await b.getByRole('button', { name: 'Close dialog', exact: true }).click();
+          assert.equal((await dialogIn(b)).open, false, 'and closes');
+        });
+      },
+    );
     // Round 9, H. A step's history served with entries that are not objects among real ones: its
     // view opens and lists the real entries only.
     lateCase('round 9 H: a history holding entries that are not objects', async () => {
