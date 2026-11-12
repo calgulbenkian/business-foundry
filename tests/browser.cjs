@@ -2555,6 +2555,187 @@ print(json.dumps({
         related: 'Document · Needs review — made from records that changed since',
       });
     });
+    // Round 8, N2. A view of one item open across a reload of its own business.
+    // that a request a hold() is holding reached the server; a page that never sends it fails here,
+    // after the page's usual time limit, rather than leaving the test waiting
+    const sent = async (held, what) => {
+      let timer;
+      try {
+        return await Promise.race([
+          held.requested,
+          new Promise((_, fail) => {
+            timer = setTimeout(() => fail(new Error(`${what} was never sent`)), 10000 * slowdown);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    // a record saved, its answer held, and its form put away: releasing it reloads the records
+    // while whatever was opened meanwhile stays open
+    const saveHeld = async (title) => {
+      await raceSource('records');
+      const held = await hold(race, `/api/businesses/${bid}/records`, { method: 'POST' });
+      await openRecordForm(title);
+      await inDialog('Save record');
+      await sent(held, 'the held request');
+      await race.keyboard.press('Escape');
+      return held;
+    };
+    lateCase('round 8 N2: an open draft learns that a reload made it stale', async () => {
+      const doc = await newDraft();
+      assert.equal(doc.stale ?? false, false);
+      await raceSource('records');
+      await openRecordForm('Browser record that makes an open draft stale');
+      const reload = await hold(race, `/api/businesses/${bid}`, { method: 'GET' });
+      await inDialog('Save record');
+      await sent(reload, 'the reload');
+      await readDraft(doc);
+      assert.deepEqual(await viewFlags(), [], 'the records on the page still match the draft');
+      const view = await race.locator('#dialog pre.document').elementHandle();
+      const scroll = await race.evaluate(() => {
+        const pre = $('#dialog pre.document');
+        pre.scrollTop = 120;
+        return [pre.scrollTop, $('#dialog').scrollTop, pre.scrollHeight > pre.clientHeight];
+      });
+      assert(scroll[2] && scroll[0] === 120, 'the draft’s text scrolls');
+      await reload.release();
+      assert.deepEqual(await viewFlags(), [DRAFT_CHANGED], 'the open view says the draft is stale');
+      assert(await view.evaluate((el) => el.isConnected && $('#dialog').open), 'never closed');
+      assert.deepEqual(
+        await race.evaluate(() => [$('#dialog pre.document').scrollTop, $('#dialog').scrollTop]),
+        scroll.slice(0, 2),
+        'the reading position is where it was',
+      );
+      assert.equal(
+        await race.locator('#dialog a', { hasText: 'Download Markdown' }).getAttribute('href'),
+        `/api/businesses/${bid}/documents/${doc.id}/download`,
+      );
+      assert.equal(
+        await docRow(doc.id).locator('.r-sub').innerText(),
+        'Source records changed since this draft',
+      );
+      await view.dispose();
+      // opened again, it says the same
+      await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      await race.locator('#insp').getByRole('button', { name: 'Read draft', exact: true }).click();
+      await race.locator('#dialog pre.document').waitFor();
+      assert.deepEqual(await viewFlags(), [DRAFT_CHANGED]);
+    });
+    lateCase(
+      'round 8 N2: an open draft loses its warning when a reload says it matches',
+      async () => {
+        const doc = await newDraft();
+        let stale = true;
+        await serveChanged((body) => {
+          body.objects.find((o) => o.id === doc.id).stale = stale;
+        });
+        await race.reload();
+        await race.locator('#list .today-head').waitFor();
+        const held = await saveHeld('Browser record saved while a stale draft is open');
+        await readDraft(doc);
+        assert.deepEqual(await viewFlags(), [DRAFT_CHANGED]);
+        const link = race.locator('#dialog a', { hasText: 'Download Markdown' });
+        await link.focus();
+        const focusedLink = await link.elementHandle();
+        stale = false;
+        await held.release();
+        assert.deepEqual(await viewFlags(), [], 'the warning is gone');
+        assert(await race.evaluate(() => $('#dialog').open));
+        assert(
+          await focusedLink.evaluate((el) => el.isConnected && document.activeElement === el),
+          'focus is on the same download link',
+        );
+        await focusedLink.dispose();
+      },
+    );
+    lateCase(
+      'round 8 N2: a view of a draft no longer in the records closes and says so',
+      async () => {
+        const doc = await newDraft();
+        let gone = false;
+        await serveChanged((body) => {
+          if (gone) body.objects = body.objects.filter((o) => o.id !== doc.id);
+        });
+        const held = await saveHeld('Browser record saved while a draft leaves the records');
+        await readDraft(doc);
+        gone = true;
+        await held.release();
+        assert.equal(await dialogOpen(), false, 'the view closed');
+        assert.equal(await race.locator('#dialog-content').innerHTML(), '');
+        assert.equal(
+          await toastText(),
+          `Saved to the workspace. “${doc.title}” is no longer in the records, so its view was closed.`,
+        );
+      },
+    );
+    lateCase('round 8 N2: an invoice’s details follow a change made through the API', async () => {
+      await onBusiness(bid, testName);
+      const unreviewed = await call(`/businesses/${bid}/evidence`, 'POST', {
+        title: 'Browser receipt for an invoice viewed while it is issued',
+        content: 'Synthetic external receipt; nothing was sent.',
+        source_type: 'external_receipt',
+      });
+      const receipt = await call(`/businesses/${bid}/evidence/${unreviewed.id}/review`, 'POST', {
+        note: 'Synthetic review of a synthetic receipt.',
+        expected_version: unreviewed.version,
+      });
+      const inv = await call(`/businesses/${bid}/invoices`, 'POST', {
+        customer_id: customer,
+        description: 'Browser invoice viewed while it is issued',
+        amount: '40',
+        due_date: '2027-03-01',
+        contract_evidence_id: receipt.id,
+        acceptance_evidence_id: receipt.id,
+      });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      const held = await saveHeld('Browser record saved while invoice details are open');
+      await raceSource('sales');
+      await race.locator(`#list .row[data-key="inv:${inv.id}"]`).click();
+      await race.locator('#insp').getByRole('button', { name: 'Details', exact: true }).click();
+      const pre = race.locator('#dialog-content pre');
+      assert.equal(JSON.parse(await pre.textContent()).issue_evidence_id, undefined);
+      await call(`/businesses/${bid}/invoices/${inv.id}/issue`, 'POST', {
+        evidence_id: receipt.id,
+        note: 'Synthetic issue recorded while the details were open.',
+        expected_version: inv.version,
+      });
+      await held.release();
+      assert(await race.evaluate(() => $('#dialog').open), 'the view stayed open');
+      assert.deepEqual(
+        JSON.parse(await pre.textContent()),
+        (await snapshotOf(bid)).objects.find((o) => o.id === inv.id).data,
+        'it shows the invoice as the new records hold it',
+      );
+    });
+    lateCase('round 8 N2: an open draft gains the server’s reasons in a reload', async () => {
+      const doc = await newDraft();
+      let reasons = null;
+      await serveChanged((body) => {
+        const d = body.objects.find((o) => o.id === doc.id);
+        delete d.stale_reasons;
+        d.stale = Boolean(reasons);
+        if (reasons) d.stale_reasons = reasons;
+      });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      const held = await saveHeld('Browser record saved while a draft gains reasons');
+      await readDraft(doc);
+      assert.deepEqual(await viewFlags(), []);
+      reasons = [
+        { code: 'synthetic_markup', message: 'Synthetic <i>reason</i> & a "quote".' },
+        { code: 'obligations_overdue', message: 'The number of overdue obligations changed.' },
+      ];
+      await held.release();
+      const messages = reasons.map((r) => r.message);
+      assert.deepEqual(await viewFlags(), messages, 'the open view prints every reason, in order');
+      assert.equal(await race.locator('#dialog-content .flag i').count(), 0, 'as text');
+      // the words of a view opened now; the save moved the list to its record meanwhile
+      await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      await readDraft(doc);
+      assert.deepEqual(await viewFlags(), messages);
+    });
 
     race.setDefaultTimeout(10000);
     const lateFailures = [];

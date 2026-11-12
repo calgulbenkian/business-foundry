@@ -3344,6 +3344,12 @@ async function refresh() {
   });
   if (!state.snapshot) state.source = 'today';
   renderAll();
+  // the same business: a view left open says what these records hold about its item
+  const gone = closed === null ? updateView() : '';
+  if (gone) {
+    closedNote = { load, text: gone };
+    toast(gone);
+  }
   if (closed !== null) {
     // the dialog gave focus back to the control that opened it, which the new records replaced
     if (document.activeElement === document.body || !visible(document.activeElement))
@@ -3479,7 +3485,8 @@ const evidenceSelect = (
 /* What the open dialog is about: `bid` is the business whose records it shows or writes to, or
    null for a dialog that is not about the business on screen (creating a business, access keys);
    `form` marks a form, `sent` one that has sent its command, `secret` the dialog showing a new
-   access key. Set by showDialog; a dialog about one business is closed when the page changes to
+   access key, and `view` a view of one item (see showView), updated by each reload of its
+   business. Set by showDialog; a dialog about one business is closed when the page changes to
    another. */
 let dialogAbout = null;
 /* Dialogs that arrived while another was open (a new access key, or the notice that one may not
@@ -3553,6 +3560,54 @@ $('#dialog').addEventListener('close', () => {
   opener = null;
   returnFocus(memo);
 });
+/* A view of one item in the dialog: a document's text, an invoice's or payment's stored data, or
+   a whole record for a person who can only read it. Each is drawn from the item as the records
+   on screen hold it, in two parts: what flags it (a stale document's warning) and its text. */
+const VIEWS = {
+  document: (o) => ({ flags: documentFlags(o), text: String(o.data.content ?? '') }),
+  data: (o) => ({ flags: '', text: JSON.stringify(o.data, null, 2) }),
+  record: (o) => ({ flags: '', text: JSON.stringify(o, null, 2) }),
+};
+function showView(kind, o) {
+  const v = VIEWS[kind](o);
+  const download =
+    kind === 'document'
+      ? `<div class="i-actions"><a class="btn" href="/api/businesses/${h(state.bid)}/documents/${h(o.id)}/download">Download Markdown</a></div>`
+      : '';
+  showDialog(
+    o.title,
+    `<div data-view-flags>${v.flags}</div><pre${kind === 'document' ? ' class="document"' : ''} data-view-text>${h(v.text)}</pre>${download}`,
+    { bid: state.bid, view: { kind, id: o.id, flags: v.flags } },
+  );
+}
+/* After a reload of the business on screen, an open view says what the new records hold about
+   its item, in the same words as a view opened now. Only a part that changed is replaced, so the
+   dialog stays open, and its scroll position, focus and any selection stay where they were. A
+   view of an item no longer in the records is closed; this returns the sentence that says so. */
+function updateView() {
+  const d = $('#dialog'),
+    about = dialogAbout,
+    view = about?.view;
+  if (!d.open || !view || about.bid !== state.bid) return '';
+  const o = find(view.id);
+  if (!o) {
+    const text = `“${$('#dialog-title').textContent}” is no longer in the records, so its view was closed.`;
+    d.close();
+    $('#dialog-content').innerHTML = '';
+    $('#dialog-title').textContent = '';
+    return text;
+  }
+  const v = VIEWS[view.kind](o),
+    flags = $('#dialog-content [data-view-flags]'),
+    text = $('#dialog-content [data-view-text]');
+  if (flags && view.flags !== v.flags) {
+    flags.innerHTML = v.flags;
+    view.flags = v.flags;
+  }
+  if (text && text.textContent !== v.text) text.textContent = v.text;
+  if ($('#dialog-title').textContent !== o.title) $('#dialog-title').textContent = o.title;
+  return '';
+}
 /* A form in a dialog. It belongs to the business on screen when it opens (`scope`): `submit`
    receives that scope and sends there. Unless `free` (a form that is not about the business on
    screen), the form is closed if the page changes to another business before it is sent, and
@@ -3714,7 +3769,7 @@ function recordDialog(id) {
   const o = id ? find(id) : null,
     d = o?.data || {};
   if (!canWrite()) {
-    showDialog(o.title, `<pre>${h(JSON.stringify(o, null, 2))}</pre>`, { bid: state.bid });
+    showView('record', o);
     return;
   }
   formDialog(
@@ -4298,17 +4353,9 @@ async function handle(a, el) {
   else if (a === 'new-deal') dealDialog(id);
   else if (a === 'new-document') documentDialog();
   else if (a === 'investment-memo') documentDialog(id);
-  else if (a === 'document') {
-    const o = find(id);
-    showDialog(
-      o.title,
-      `${documentFlags(o)}<pre class="document">${h(o.data.content)}</pre><div class="i-actions"><a class="btn" href="/api/businesses/${h(state.bid)}/documents/${h(id)}/download">Download Markdown</a></div>`,
-      { bid: state.bid },
-    );
-  } else if (a === 'inspect') {
-    const o = find(id);
-    showDialog(o.title, `<pre>${h(JSON.stringify(o.data, null, 2))}</pre>`, { bid: state.bid });
-  } else if (a === 'new-invoice') invoiceDialog();
+  else if (a === 'document') showView('document', find(id));
+  else if (a === 'inspect') showView('data', find(id));
+  else if (a === 'new-invoice') invoiceDialog();
   else if (a === 'issue-invoice') issueDialog(id);
   else if (a === 'new-payment') paymentDialog(id);
   else if (a === 'new-key') keyDialog();
