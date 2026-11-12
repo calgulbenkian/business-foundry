@@ -75,6 +75,18 @@ def same_json(stored, recorded):
         return False
 
 
+# Terminal state of a step that belonged to a planning guide the business no longer uses. The step and
+# its history are kept; it is not open work, never blocks another step and never transitions again.
+SUPERSEDED = "superseded"
+# Steps that come from a jurisdiction package rather than the shared base guide, identified by catalog key
+# so that steps stored before this state existed need no migration.
+PACKAGE_KEYS = {spec["key"] for specs in catalog.JURISDICTIONS.values() for spec in specs}
+
+
+def live(task):
+    return task["state"] != SUPERSEDED
+
+
 def moves_to(entry, state):
     return isinstance(entry, dict) and entry.get("to") == state
 
@@ -104,6 +116,33 @@ def evidence_basis(history):
     prepared = [i for i, entry in enumerate(cycle) if moves_to(entry, "prepared")]
     basis = cycle[prepared[-1] :] if prepared else cycle[-1:]
     return set().union(*(cited(entry) for entry in basis))
+
+
+# A saved deal analysis or forecast keeps the figures it was calculated with. When something it relied on
+# has changed since, the snapshot marks it stale and lists why. Each reason's message is the one sentence
+# that the snapshot, the interface and generated documents all show.
+ANALYSIS_NAMES = {"deal": "deal analysis", "financial_plan": "forecast"}
+ANALYSIS_REDO = {"deal": "run a revised analysis", "financial_plan": "save a revised forecast"}
+ANALYSIS_EVENTS = ("deal.created", "financial_plan.created")
+
+
+def evidence_changed_reason():
+    return {
+        "code": "evidence_changed",
+        "message": "Supporting evidence has changed since this deal analysis was saved. "
+        "Run a revised analysis before relying on these figures.",
+    }
+
+
+def jurisdiction_changed_reason(kind, saved, current):
+    return {
+        "code": "jurisdiction_changed",
+        "saved_jurisdiction": saved,
+        "current_jurisdiction": current,
+        "message": f"This {ANALYSIS_NAMES[kind]} was saved while the planning jurisdiction was {saved}. "
+        f"It is now {current}. Check its assumptions, the tax rate among them, and {ANALYSIS_REDO[kind]} "
+        "before relying on these figures.",
+    }
 
 
 def evaluate(model, *args):
@@ -190,10 +229,13 @@ class Service:
                 raise DomainError(
                     "Currency cannot change after financial records exist. Create a separate business."
                 )
-            # Jurisdiction changes alter legal applicability and are deliberately a separate, reviewed migration.
+            # Jurisdiction changes alter which planning guide applies; they are a separate human decision
+            # (change_jurisdiction) that records a reason and supersedes the old guide's steps.
             if data["jurisdiction"] != old["data"]["jurisdiction"]:
                 raise DomainError(
-                    "Jurisdiction is fixed for this release. Create a new business with the reviewed jurisdiction; retain this history."
+                    "A general edit cannot change the planning jurisdiction. An owner or reviewer changes it "
+                    "with the jurisdiction action (POST /api/businesses/{id}/jurisdiction or "
+                    "'foundry jurisdiction'), which records a reason and reopens affected work."
                 )
             item = {**old, "data": data, "version": old["version"] + 1, "updated_at": now()}
             con.execute(
@@ -205,6 +247,137 @@ class Service:
             return item
 
         return self.command(actor, bid, key, "business.update", payload, run)
+
+    def jurisdiction_plan(self, con, bid, to):
+        """Everything a jurisdiction change does, worked out once. The preview and the change both use it.
+
+        The current package's live steps are superseded. The new package's steps are added as pending
+        steps whose prerequisites resolve by key against the live steps that remain (for example a new
+        local review depends on the existing structure decision). Every remaining completed step, deal
+        steps included, is reopened. Base and deal steps keep their identity and are never superseded.
+        """
+        business = self.store.business(con, bid)
+        current = business["data"]["jurisdiction"]
+        if to not in catalog.JURISDICTIONS:
+            raise DomainError(
+                "Choose a known planning jurisdiction: " + ", ".join(catalog.JURISDICTIONS) + "."
+            )
+        if to == current:
+            raise DomainError(f"The planning jurisdiction is already {current}.")
+        tasks = [t for t in self.store.objects(con, bid, "task") if live(t)]
+        superseded = [
+            t for t in tasks if not t["data"].get("deal_id") and t["data"].get("key") in PACKAGE_KEYS
+        ]
+        gone = {t["id"] for t in superseded}
+        remaining = [t for t in tasks if t["id"] not in gone]
+        keys = {t["data"]["key"]: t["id"] for t in remaining if not t["data"].get("deal_id")}
+        added = [
+            {
+                **spec,
+                "depends_on": [keys[k] for k in spec["depends_on_keys"] if k in keys],
+                "deal_id": None,
+            }
+            for spec in catalog.JURISDICTIONS[to]
+        ]
+        return {
+            "business": business,
+            "from": current,
+            "to": to,
+            "superseded": superseded,
+            "added": added,
+            "reopened": [t for t in remaining if t["state"] in COMPLETED],
+        }
+
+    @staticmethod
+    def jurisdiction_summary(plan):
+        def step(t):
+            return {"id": t["id"], "key": t["data"].get("key"), "title": t["title"], "state": t["state"]}
+
+        return {
+            "from": plan["from"],
+            "to": plan["to"],
+            "superseded": [step(t) for t in plan["superseded"]],
+            "added": [
+                {"key": s["key"], "title": s["title"], "depends_on": s["depends_on"]} for s in plan["added"]
+            ],
+            "reopened": [step(t) for t in plan["reopened"]],
+        }
+
+    def preview_jurisdiction(self, actor, bid, to):
+        """What change_jurisdiction would do now, without changing anything. Any reader may ask."""
+        self.access(actor, bid)
+        with self.store.read() as con:
+            plan = self.jurisdiction_plan(con, bid, to)
+        return {"business_version": plan["business"]["version"], **self.jurisdiction_summary(plan)}
+
+    def change_jurisdiction(self, actor, bid, key, payload):
+        """A human decision to plan under another jurisdiction. It changes which planning guide applies and
+        reopens completed work; it is not legal advice and does not form, move or register an entity."""
+
+        def run(con):
+            old = self.store.business(con, bid)
+            if old["version"] != payload["expected_version"]:
+                raise DomainError("The business changed. Refresh before saving.", 409)
+            reason = payload["reason"].strip() if isinstance(payload.get("reason"), str) else ""
+            if not reason:
+                raise DomainError("Record the reason for this jurisdiction decision.")
+            plan = self.jurisdiction_plan(con, bid, payload["jurisdiction"])
+            self.references(con, bid, payload["evidence_ids"], "evidence", verified=True)
+            summary = self.jurisdiction_summary(plan)
+            change = f"Jurisdiction changed from {plan['from']} to {plan['to']}"
+            data = {**old["data"], "jurisdiction": plan["to"]}
+            item = {**old, "data": data, "version": old["version"] + 1, "updated_at": now()}
+            con.execute(
+                "UPDATE businesses SET data=?,version=?,updated_at=? WHERE id=?",
+                (canonical(data), item["version"], item["updated_at"], bid),
+            )
+            self.store.event(con, bid, actor, "business.updated", bid, item)
+            for t in plan["superseded"]:
+                entry = {
+                    "from": t["state"],
+                    "to": SUPERSEDED,
+                    "note": change
+                    + ". This step belongs to the earlier planning guide and is kept as history.",
+                    "jurisdiction_from": plan["from"],
+                    "jurisdiction_to": plan["to"],
+                    "actor_id": actor["id"],
+                    "at": now(),
+                }
+                self.store.update(
+                    con,
+                    t,
+                    {**t["data"], "history": t["data"]["history"] + [entry]},
+                    SUPERSEDED,
+                    actor,
+                    t["version"],
+                    action="task.superseded",
+                )
+            added = [
+                {"id": self.store.add(con, bid, "task", spec["title"], spec, actor, "pending")["id"], **shown}
+                for spec, shown in zip(plan["added"], summary["added"], strict=True)
+            ]
+            for t in plan["reopened"]:
+                self._reopen(con, actor, t, change)
+            result = {**summary, "added": added}
+            self.store.event(
+                con,
+                bid,
+                actor,
+                "business.jurisdiction_changed",
+                bid,
+                {
+                    "title": change,
+                    "reason": reason,
+                    "evidence_ids": payload["evidence_ids"],
+                    "actor_id": actor["id"],
+                    "actor_name": actor["name"],
+                    "business_version": item["version"],
+                    **result,
+                },
+            )
+            return {"business": item, "business_version": item["version"], **result}
+
+        return self.command(actor, bid, key, "business.jurisdiction", payload, run, review=True)
 
     def references(self, con, bid, ids, kind=None, verified=False, external=False):
         result = []
@@ -307,12 +480,15 @@ class Service:
         reason="Inputs changed",
         task_ids=None,
     ):
-        tasks = self.store.objects(con, bid, "task")
+        # A superseded step is history: it is never reopened and does not pass a reopening on.
+        tasks = [t for t in self.store.objects(con, bid, "task") if live(t)]
         affected = set(task_ids or ())
         related_kinds = set(kinds or ())
         if evidence_id:
             for obj in self.store.objects(con, bid):
                 data = obj["data"]
+                if obj["kind"] == "task" and not live(obj):
+                    continue
                 if obj["kind"] == "task" and obj["state"] in COMPLETED:
                     # A completed task relies on its currently attached evidence and on everything
                     # cited since its latest preparation. The current ids always count, so a task
@@ -346,20 +522,25 @@ class Service:
                     changed = True
         for t in tasks:
             if t["id"] in affected and t["state"] in COMPLETED:
-                history = t["data"]["history"] + [
-                    {
-                        "from": t["state"],
-                        "to": "needs_review",
-                        "note": reason,
-                        "actor_id": actor["id"],
-                        "at": now(),
-                    }
-                ]
-                self.store.update(
-                    con, t, {**t["data"], "history": history}, "needs_review", actor, t["version"]
-                )
+                self._reopen(con, actor, t, reason)
+
+    def _reopen(self, con, actor, task, reason):
+        history = task["data"]["history"] + [
+            {
+                "from": task["state"],
+                "to": "needs_review",
+                "note": reason,
+                "actor_id": actor["id"],
+                "at": now(),
+            }
+        ]
+        return self.store.update(
+            con, task, {**task["data"], "history": history}, "needs_review", actor, task["version"]
+        )
 
     def blockers(self, con, bid, item):
+        if not live(item):
+            return []
         messages = []
         if item["data"].get("deal_id"):
             deal = self.store.get(con, bid, item["data"]["deal_id"], "deal")
@@ -370,7 +551,9 @@ class Service:
                 messages.append("Supporting deal evidence changed; create and review a fresh analysis")
         for dep_id in item["data"]["depends_on"]:
             dep = self.store.get(con, bid, dep_id, "task")
-            if dep["state"] not in FINISHED:
+            # A superseded prerequisite belongs to a planning guide that no longer applies. It can never
+            # finish, so it never blocks.
+            if live(dep) and dep["state"] not in FINISHED:
                 messages.append(f"Complete: {dep['title']}")
         for kind in item["data"]["required_record_kinds"]:
             records = self.store.objects(con, bid, kind)
@@ -392,6 +575,11 @@ class Service:
 
         def run(con):
             old = self.store.get(con, bid, tid, "task")
+            if not live(old):
+                raise DomainError(
+                    "This step belongs to a planning guide the business no longer uses. "
+                    "It is kept as history and cannot change."
+                )
             if old["version"] != payload["expected_version"]:
                 raise DomainError("Task changed. Refresh before saving.", 409)
             allowed = {
@@ -595,6 +783,34 @@ class Service:
         with self.store.read() as con:
             return self._snapshot(con, bid)
 
+    def saved_jurisdictions(self, con, bid):
+        """The planning jurisdiction in force when each deal analysis and forecast was calculated, by id.
+
+        Read from the event sequence, never from clock time. A deal or forecast is calculated once, when it
+        is created, and nothing changes it afterwards. A record created before the first jurisdiction
+        change was saved under that change's "from"; a later one under the "to" of the latest change
+        before it. With no jurisdiction change in the history the result is empty: nothing to compare.
+        Nothing is stored, so records written before this existed are covered without a migration.
+        """
+        rows = con.execute(
+            "SELECT action, object_id, payload FROM events WHERE business_id=? AND action IN (?,?,?) "
+            "ORDER BY seq",
+            (bid, "business.jurisdiction_changed", *ANALYSIS_EVENTS),
+        )
+        in_force, before_first, saved = None, [], {}
+        for row in rows:
+            if row["action"] != "business.jurisdiction_changed":
+                if in_force is None:
+                    before_first.append(row["object_id"])
+                else:
+                    saved[row["object_id"]] = in_force
+                continue
+            change = json.loads(row["payload"])
+            if in_force is None:
+                saved.update(dict.fromkeys(before_first, change["from"]))
+            in_force = change["to"]
+        return saved
+
     def _snapshot(self, con, bid):
         business = self.store.business(con, bid)
         objects = self.store.objects(con, bid)
@@ -602,15 +818,23 @@ class Service:
         fingerprint = digest(
             canonical({"business": business, "objects": [o for o in objects if o["kind"] != "document"]})
         )
+        # Marks below are worked out on every read and added after the fingerprint; nothing is stored.
+        saved_under = self.saved_jurisdictions(con, bid)
+        jurisdiction = business["data"]["jurisdiction"]
         for obj in objects:
             if obj["kind"] == "task":
                 obj["blockers"] = self.blockers(con, bid, obj)
             if obj["kind"] == "document":
                 obj["stale"] = obj["data"]["source_fingerprint"] != fingerprint
-            if obj["kind"] == "deal":
-                obj["stale"] = any(
-                    by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()
-                )
+            if obj["kind"] in ANALYSIS_NAMES:
+                reasons = []
+                if any(by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()):
+                    reasons.append(evidence_changed_reason())
+                saved = saved_under.get(obj["id"])
+                if saved is not None and saved != jurisdiction:
+                    reasons.append(jurisdiction_changed_reason(obj["kind"], saved, jurisdiction))
+                obj["stale"] = bool(reasons)
+                obj["stale_reasons"] = reasons
             if obj["kind"] in {"invoice", "payment"}:
                 refs = [
                     obj["data"].get(k)
@@ -622,12 +846,14 @@ class Service:
                     )
                 ]
                 obj["evidence_warning"] = any(by_id[e]["state"] != "verified" for e in refs if e)
-        tasks = [o for o in objects if o["kind"] == "task"]
+        # Readiness counts cover live steps only; superseded steps stay in objects as history.
+        tasks = [o for o in objects if o["kind"] == "task" and live(o)]
         stats = {
             "verified": sum(t["state"] == "verified" for t in tasks),
             "not_applicable": sum(t["state"] == "not_applicable" for t in tasks),
             "tasks": len(tasks),
             "needs_review": sum(t["state"] == "needs_review" for t in tasks),
+            "superseded": sum(o["kind"] == "task" and not live(o) for o in objects),
             "overdue_obligations": sum(
                 o["kind"] == "obligation"
                 and bool(o["data"].get("due_date"))
