@@ -671,7 +671,7 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     memo = generate("investment_memo", deal["id"])
     for content in (plan, memo):
         assert "```json" not in content and '"months":' not in content
-    assert "Model: Six \\| month plan (financial_plan_" in plan
+    assert "Model: Six \\| month plan. Currency: USD." in plan
     assert "Currency: USD. Horizon: 6 months." in plan
     assert table_rows(plan, "| Total revenue ") == ["Total revenue", "6,000.00", "4,500.00", "7,500.00"]
     assert table_rows(plan, "| First shortfall month ")[1:] == ["None modeled"] * 3
@@ -686,12 +686,12 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     assert "| ---------------------- | " in plan and "-------: |" in plan
     assert table_rows(plan, "| Base     |")[1].startswith("Not available — needs at least 12 months")
     assert "DCF basis:" not in plan
-    assert "Full monthly statements are stored in financial plan financial_plan_" in plan
+    assert "Full monthly statements are stored in the financial plan Six \\| month plan " in plan
 
     assert "## Target: Loss-making \\| shop" in memo
     assert "WARNING: Supporting evidence" not in memo
     assert table_rows(memo, "| Reported EBITDA ") == ["Reported EBITDA", "-5,000.00", ""]
-    assert table_rows(memo, "| Add: Owner") == ["Add: Owner \\| car lease", "3,000.00", evidence["id"]]
+    assert table_rows(memo, "| Add: Owner") == ["Add: Owner \\| car lease", "3,000.00", "Lease statement"]
     assert table_rows(memo, "| Normalized EBITDA ") == ["Normalized EBITDA", "-12,000.00", ""]
     assert table_rows(memo, "| Unsupported") == [
         "Unsupported \\| item",
