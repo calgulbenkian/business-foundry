@@ -53,9 +53,11 @@ WINDOW_READY_SECONDS = 120
 SESSION_DAYS = 30
 SERVER_START_SECONDS = 15
 SHUTDOWN_SECONDS = 10
-# After a termination signal the process ends within SIGNAL_EXIT_SECONDS, whatever the window,
-# the server or the database are doing. The window first has SIGNAL_CLOSE_SECONDS to close the
-# normal way; if it has not, the app runs the same cleanup itself in the time that remains.
+# After a termination signal the app ends its own process SIGNAL_EXIT_SECONDS after it read the
+# signal at the latest, whatever the window, the server or the database are doing (if the process
+# is not being run at that moment, as soon as it runs again). The window first has
+# SIGNAL_CLOSE_SECONDS to close the normal way; if it has not, the app runs the same cleanup
+# itself in the time that remains.
 SIGNAL_EXIT_SECONDS = 30
 SIGNAL_CLOSE_SECONDS = 10
 
@@ -1023,7 +1025,9 @@ class SignalShutdown:
     - The reader takes the time the moment it reads the signal and, from then on, only sleeps:
       SIGNAL_EXIT_SECONDS later it ends the process with ``os._exit``. It takes no lock and
       writes no log, so nothing the window, the server, the database or the log does can hold
-      it, and the process is gone by then even if ``main`` never returns.
+      it, and it ends the process then even if ``main`` never returns. It can do so only while
+      the process is being run: if it is paused, or the computer is asleep or busy, at that
+      moment, the process ends as soon as it runs again.
     - The shutdown thread closes the window, from a thread of its own (pywebview's ``destroy``
       can wait for the GUI for a long time). That runs the same shutdown as the close button.
       If the app has not finished stopping SIGNAL_CLOSE_SECONDS after the signal, it starts

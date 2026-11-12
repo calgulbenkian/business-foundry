@@ -1940,6 +1940,62 @@ SIGNAL_CHILD = textwrap.dedent("""\
         desktop.open_window = lambda app, signals: print("WINDOW OPENED", flush=True)
     else:
         desktop.open_window = fake_window
+
+    if mode in ("stop-hangs", "gui-hangs"):
+        # These cases end at the reader's limit, and what they check must have happened before
+        # it: the second stage's warning written (stop-hangs), or the cleanup finished
+        # (gui-hangs). Left to the scheduler, a child that is not run for a moment can wake past
+        # its deadline and end before the other thread has acted. So once the reader has taken
+        # the signal's time, each later look at its clock waits until that has happened. In
+        # stop-hangs the reader is also let go when the shutdown thread ends, which the app's
+        # code does only after the warning, so a version that skips the warning fails at once.
+        # (In gui-hangs the shutdown thread can end before the cleanup has finished, when it
+        # wakes past the deadline, so only the finished cleanup lets the reader go.) The deadline
+        # and the os._exit are still the reader's own: it never ends the process before its
+        # limit, and once let go it ends it as soon as the limit is reached.
+        made, happened = [], threading.Event()
+        real_init, real_shut_down = desktop.SignalShutdown.__init__, desktop.SignalShutdown._shut_down
+
+        def init(self, *args, **kwargs):
+            made.append(self)
+            real_init(self, *args, **kwargs)
+
+        def shut_down(self):
+            try:
+                real_shut_down(self)
+            finally:
+                if mode == "stop-hangs":
+                    happened.set()
+
+        class Log:
+            def __getattr__(self, name):
+                return getattr(real_log, name)
+
+            def warning(self, msg, *args, **kwargs):
+                real_log.warning(msg, *args, **kwargs)  # written to desktop.log when this returns
+                if mode == "stop-hangs" and "stopping now" in msg:
+                    happened.set()
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def monotonic(self):
+                reader = threading.current_thread().name == "foundry-signals"
+                if reader and made and made[0].received.is_set():
+                    happened.wait()
+                return time.monotonic()
+
+        real_stop = desktop.DesktopApp.stop
+
+        def stop(self):
+            real_stop(self)
+            if mode == "gui-hangs" and self.stopped:
+                happened.set()
+
+        real_log = desktop.log
+        desktop.SignalShutdown.__init__, desktop.SignalShutdown._shut_down = init, shut_down
+        desktop.log, desktop.time, desktop.DesktopApp.stop = Log(), Clock(), stop
     desktop.main(["--data-dir", str(data)])
     print("MAIN RETURNED", flush=True)
 """)
@@ -2000,9 +2056,13 @@ def test_sigterm_delivered_to_a_foreign_thread_still_shuts_down_cleanly(tmp_path
 @pytest.mark.parametrize("mode", ["ignored", "destroy-hangs", "destroy-raises"])
 def test_sigterm_still_cleans_up_and_exits_when_the_window_will_not_close(tmp_path, mode):
     # The window returns without closing, never returns, or fails. The app runs the cleanup
-    # itself once the window's time is up, and exits as soon as it is done.
-    code, out, data, _ = run_until_signalled(tmp_path, mode, close_seconds=0.5)
+    # itself once the window's time is up, and exits as soon as it is done: in about a second,
+    # long before the reader's limit of 120 seconds would end it. (A shutdown thread that only
+    # waited would be ended by the reader at 120 seconds; a pause of a few seconds is far from
+    # either.)
+    code, out, data, elapsed = run_until_signalled(tmp_path, mode, close_seconds=0.5)
     assert code == 128 + signal.SIGTERM and "MAIN RETURNED" not in out
+    assert elapsed < 60
     assert assert_cleaned_up(data) == 1
     assert "did not stop within 0.5 seconds of the signal; stopping now" in read_log(data)
 
@@ -2012,8 +2072,9 @@ def test_sigterm_still_cleans_up_and_exits_when_the_window_will_not_close(tmp_pa
 def test_sigterm_ends_the_process_within_the_limit_whatever_shutdown_is_doing(tmp_path, mode):
     # stop-hangs: a stop already in progress is stuck inside the cleanup, holding the stop lock.
     # gui-hangs: the cleanup finished, but the GUI loop never returns, so main() never does.
-    # Either way the process is gone once SIGNAL_EXIT_SECONDS have passed since the signal.
-    # (In gui-hangs the window may take all the time: whatever it does, the exit is at the limit.)
+    # Either way the process ends, and not before SIGNAL_EXIT_SECONDS have passed since the
+    # signal. The child holds the reader until what the case checks has happened (see
+    # SIGNAL_CHILD), so no result depends on which thread the computer runs first.
     close_seconds = 0.5 if mode == "stop-hangs" else 2
     code, out, data, elapsed = run_until_signalled(tmp_path, mode, close_seconds, exit_seconds=2)
     assert code == 128 + signal.SIGTERM and "MAIN RETURNED" not in out
@@ -2079,6 +2140,86 @@ def test_the_signal_watcher_ends_the_process_exactly_at_the_limit(monkeypatch):
         writer.close()
     assert exits == [(1000.0 + desktop.SIGNAL_EXIT_SECONDS, 128 + signal.SIGTERM)]
     assert watcher.received.is_set() and watcher._exit_at == 1000.0 + desktop.SIGNAL_EXIT_SECONDS
+
+
+class _StoppingApp:
+    """DesktopApp as the shutdown thread sees it, on a clock the test moves.
+
+    A wait that times out moves the clock through its whole timeout and returns False. Once
+    ``stops_after`` is set, a wait first lets the stop the shutdown thread started be called,
+    then moves the clock by that many seconds (the cleanup's duration) and returns True.
+    """
+
+    def __init__(self, clock, *, stopping, stops_after=None):
+        self.clock, self.stopping, self.stops_after = clock, stopping, stops_after
+        self.waits, self.stops, self.stop_called = [], [], threading.Event()
+
+    def wait_stopped(self, timeout):
+        self.waits.append((self.clock["now"], timeout))
+        if self.stops_after is not None and len(self.waits) == 2:
+            # The test's limit only stops a broken version from hanging; no result depends on it.
+            assert self.stop_called.wait(20), "the shutdown thread never started the stop"
+            self.clock["now"] += self.stops_after
+            return True
+        self.clock["now"] += timeout
+        return False
+
+    def stop(self):
+        self.stops.append(threading.current_thread().name)
+        self.stop_called.set()
+
+
+def shutdown_thread(monkeypatch, app, clock, exits):
+    """A SignalShutdown whose signal (SIGTERM) arrived at 1000.0 on the test's clock, with limits
+    of 4 seconds to close and 25 to exit; its ``os._exit`` is noted in ``exits`` and raises."""
+
+    def exit_now(status):
+        exits.append((clock["now"], status))
+        raise _Exited
+
+    monkeypatch.setattr(desktop, "SIGNAL_CLOSE_SECONDS", 4)
+    monkeypatch.setattr(desktop, "SIGNAL_EXIT_SECONDS", 25)
+    monkeypatch.setattr(desktop, "time", _Patched(time, monotonic=lambda: clock["now"]))
+    monkeypatch.setattr(desktop, "os", _Patched(os, _exit=exit_now))
+    shutdown = object.__new__(desktop.SignalShutdown)
+    shutdown.app, shutdown.close_window = app, None
+    shutdown._signum, shutdown._exit_at = signal.SIGTERM, 1025.0
+    shutdown._go = threading.Event()
+    shutdown._go.set()
+    return shutdown
+
+
+def test_the_shutdown_thread_stops_the_app_itself_and_exits_as_soon_as_that_is_done(monkeypatch, caplog):
+    # The window has not closed when its 4 seconds are up: the shutdown thread runs the stop
+    # itself and ends the process the moment the stop has finished (here 1.5 seconds later),
+    # not at the reader's limit.
+    clock = {"now": 1000.0}
+    exits = []
+    app = _StoppingApp(clock, stopping=False, stops_after=1.5)
+    shutdown = shutdown_thread(monkeypatch, app, clock, exits)
+    with caplog.at_level("INFO", logger="foundry.desktop"), pytest.raises(_Exited):
+        shutdown._shut_down()
+    assert app.waits == [(1000.0, 4.0), (1004.0, 21.0)]
+    assert app.stops == ["foundry-stop"]
+    assert exits == [(1005.5, 143)]
+    assert "The app did not stop within 4 seconds of the signal; stopping now." in caplog.text
+
+
+def test_the_second_stage_starts_although_a_stop_is_already_in_progress(monkeypatch, caplog):
+    # A stop is in progress and never finishes. When the window's 4 seconds are up the warning
+    # is still written and a stop is still started (it waits for the one in progress); the
+    # shutdown thread then waits out the rest of the 25 seconds and leaves the exit to the reader.
+    clock = {"now": 1000.0}
+    exits = []
+    app = _StoppingApp(clock, stopping=True)
+    shutdown = shutdown_thread(monkeypatch, app, clock, exits)
+    with caplog.at_level("INFO", logger="foundry.desktop"):
+        shutdown._shut_down()
+    assert "The app did not stop within 4 seconds of the signal; stopping now." in caplog.text
+    assert app.stop_called.wait(20)  # the stop runs on a thread of its own
+    assert app.waits == [(1000.0, 4.0), (1004.0, 21.0)]
+    assert app.stops == ["foundry-stop"]
+    assert exits == [] and clock["now"] == 1025.0
 
 
 # A signal raised at the moment SignalShutdown installs the handler for it, before the
