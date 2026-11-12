@@ -2883,6 +2883,32 @@ print(json.dumps({
         'no reason ran a script',
       );
     });
+    lateCase(
+      'round 9 D: an open draft follows a reload that lists a reason and does not mark it stale',
+      async () => {
+        const doc = await newDraft();
+        const reason = {
+          code: 'source_changed',
+          message: 'Synthetic reason, served with the draft not marked stale.',
+        };
+        let reasons = [];
+        await serveChanged((body) => {
+          Object.assign(
+            body.objects.find((o) => o.id === doc.id),
+            { stale: false, stale_reasons: reasons },
+          );
+        });
+        await race.reload();
+        await race.locator('#list .today-head').waitFor();
+        await readDraft(doc);
+        assert.deepEqual(await viewFlags(), [], 'no reason yet');
+        reasons = [reason];
+        await race.evaluate(() => refresh());
+        await quiet(race);
+        assert.deepEqual(await viewFlags(), [reason.message], 'the open view gives the reason');
+        assert.equal(await docRow(doc.id).locator('.r-sub').innerText(), 'Needs review');
+      },
+    );
     // Round 9, B. The backup command a desktop owner is shown. Only the desktop window's server adds
     // `desktop` to an owner's /api/me, and this test's server is `foundry serve`, so the field is
     // added on its way to the page. Without it, both places say what `foundry serve` always shows.
