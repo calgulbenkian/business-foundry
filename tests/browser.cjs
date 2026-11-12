@@ -3930,6 +3930,72 @@ print(json.dumps({
         });
       },
     );
+    // Round 9, H. A step's history served with entries that are not objects among real ones: its
+    // view opens and lists the real entries only.
+    lateCase('round 9 H: a history holding entries that are not objects', async () => {
+      const hStep = (await snapshotOf(bid)).objects.find(
+        (o) => o.kind === 'task' && o.state !== 'superseded' && !o.data.deal_id,
+      );
+      const at = new Date().toISOString();
+      const served = {
+        [hStep.id]: [
+          'approved',
+          [
+            {
+              from: 'pending',
+              to: 'prepared',
+              evidence_ids: [],
+              at,
+              note: 'Synthetic preparation for the history check.',
+            },
+            null,
+            'an entry that is a string',
+            9,
+            {
+              from: 'prepared',
+              to: 'approved',
+              evidence_ids: [],
+              at,
+              note: 'Synthetic approval for the history check.',
+            },
+          ],
+        ],
+      };
+      await serveChanged((body) => {
+        for (const t of body.objects)
+          if (served[t.id]) {
+            t.state = served[t.id][0];
+            t.data.history = served[t.id][1];
+            t.data.evidence_ids = [];
+          }
+      });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      await onBusiness(bid, testName);
+      // the step's view opens and shows its two real entries, newest first
+      await showStep(hStep);
+      await quiet(race);
+      const historyRows = await race
+        .locator('#insp .i-sec')
+        .filter({ has: race.locator('h3', { hasText: /^History/ }) })
+        .locator('.att-row .an')
+        .evaluateAll((rows) =>
+          rows.map((r) => [r.firstChild.textContent, r.querySelector('.sub').textContent]),
+        );
+      assert.deepEqual(
+        historyRows.map(([move, sub]) => [move, sub.split(' · ').at(-1)]),
+        [
+          ['Prepared → Approved', 'Synthetic approval for the history check.'],
+          ['Not started → Prepared', 'Synthetic preparation for the history check.'],
+        ],
+        'the real entries, and nothing for the others',
+      );
+      assert.doesNotMatch(
+        await race.locator('#insp').innerText(),
+        /could not be shown|TypeError|Cannot read/,
+        'its view is drawn',
+      );
+    });
     race.setDefaultTimeout(10000);
     const lateFailures = [];
     // A failure while the page is loaded again for a case names that case, and lists what the
@@ -4608,7 +4674,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, and a closed form is still named after a second change), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, and a closed form is still named after a second change), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

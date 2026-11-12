@@ -2162,8 +2162,11 @@ function inspStep(s) {
   );
 }
 /* Every decision recorded on a step, newest first. */
+/* A step's decisions, newest first. An entry that is not an object, which only a damaged or
+   foreign snapshot can hold, is left out, as the rule for the evidence a step relies on leaves it
+   out. */
 function historySec(t) {
-  const hist = taskHistory(t).slice().reverse();
+  const hist = taskHistory(t).filter(isEntry).reverse();
   return sec(
     'History',
     hist.length
