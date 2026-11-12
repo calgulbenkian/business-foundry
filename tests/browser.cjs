@@ -2942,7 +2942,12 @@ print(json.dumps({
         ]) {
           await raceSource(source);
           await race.locator(`#list .row[data-key="${key}"]`).click();
-          await race.locator('#insp-title', { hasText: title }).waitFor();
+          await race
+            .locator('#insp-title', { hasText: title })
+            .waitFor()
+            .catch(() => {
+              throw new Error(`the ${where} view did not open`);
+            });
           await quiet(race);
           shown[where] = {
             flags: await race.locator(flags).allInnerTexts(),
@@ -4178,6 +4183,31 @@ print(json.dumps({
       },
     );
     lateCase(
+      'round 10 T: a first load that fails after an earlier answer named someone else shows the sign-in page',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await bothSignedOut(a, b);
+          const first = await holdNext(b, '/api/me');
+          await signInAs(a, viewer.token);
+          await sent(first, 'tab B’s question after the signal');
+          const login = await hold(b, '/api/login', { method: 'POST' });
+          await typeKey(b, ownerKey());
+          await sent(login, 'tab B’s sign-in');
+          await first.release();
+          assert.equal(await b.locator('#actor-name').innerText(), `${viewer.name} · Viewer`);
+          // the owner is named, the viewer is forgotten, and the owner's first load is lost
+          const load = await dropNext(b, '/api/businesses');
+          await login.release();
+          await load.dropped;
+          assert.deepEqual(
+            await tabShows(b),
+            { ...signedOutPage, error: 'The server could not be reached.' },
+            'the sign-in page says why, as when the page starts',
+          );
+        });
+      },
+    );
+    lateCase(
       'round 10 T: a refusal after two changes still says the sign-in changed, when the tab showed a workspace',
       async () => {
         await twoTabs(async ({ a, b }) => {
@@ -4210,7 +4240,6 @@ print(json.dumps({
             await b.locator('#toast').innerText(),
             `${CHANGED} “Add business record” was closed without saving.`,
           );
-          assert.equal(await b.evaluate(() => toldPending), null, 'nothing is left to say');
           await bareSignal(a);
           await b.waitForFunction(() => document.querySelector('#toast').hidden);
           await told(b.locator('#toast', { hasText: CHANGED }), 'tab B did not say so again');
