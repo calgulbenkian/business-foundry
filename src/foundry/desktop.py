@@ -314,6 +314,8 @@ class LogRedaction(logging.Filter):
     layers also check a record built another way, which the factory does not check:
     ``logging.makeLogRecord`` fills a record in after the factory has made it, and ``LogRecord``
     called directly does not use the factory. A handler added later does not check it.
+    A field passed with ``extra=`` is set on the record after the factory has made it, and
+    neither the factory nor a handler filter checks it; the log file's format prints no such field.
     """
 
     def __init__(self):

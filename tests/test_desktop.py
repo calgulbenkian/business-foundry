@@ -1150,6 +1150,52 @@ def test_a_format_that_shortens_an_argument_prints_no_part_of_a_secret(three_pla
         assert text.count("precision [redacted]") == 2, where
         assert text.count("('x', '[redacted]')") == 2, where
         assert text.count("[redacted]          |") == 2, where
+        # The mapping record too: written, not withheld, with the redacted text as its message.
+        assert messages(where, text).count(desktop.REDACTED) == 2, where
+        assert "withheld" not in text, where
+
+
+def messages(where, text):
+    """The test loggers' messages: desktop.log's lines start with the time, level and logger name,
+    and it also holds the app's own lines."""
+    if where != "desktop.log":
+        return text.splitlines()
+    lines = [line.split(": ", 1) for line in text.splitlines()]
+    return [message for prefix, message in lines if prefix.rsplit(" ", 1)[1].startswith("synthetic.")]
+
+
+def test_a_mapping_argument_without_a_secret_is_formatted_exactly_as_without_the_redaction(
+    three_places, synthetic_secrets
+):
+    signed_in_secrets(three_places.data)
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    keep = Keep()
+    three_places.child.addHandler(keep)
+    mapping = {"count": 7, "name": "synthetic"}
+    try:
+        three_places.child.warning("%(count)d items for %(name)s", mapping)
+    finally:
+        three_places.child.removeHandler(keep)
+    expected = "%(count)d items for %(name)s" % mapping  # noqa: UP031 (the way logging formats)
+    assert [record.getMessage() for record in records] == [expected]
+    assert records[0].args is mapping  # the same object
+    for where, text in three_places.texts().items():
+        assert messages(where, text) == [expected], where
+
+
+def test_a_secret_in_an_extra_field_does_not_reach_the_log_file(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    for secret in (code, token):
+        three_places.child.warning("with an extra field", extra={"synthetic_field": secret})
+    written = three_places.texts()["desktop.log"]
+    for secret in (code, token):
+        assert leaked_part(secret, written) is None
+    assert messages("desktop.log", written) == ["with an extra field"] * 2
 
 
 def test_records_built_outside_the_usual_calls_reach_no_guarded_place(three_places, synthetic_secrets):
