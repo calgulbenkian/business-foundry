@@ -2909,6 +2909,149 @@ print(json.dumps({
         assert.equal(await docRow(doc.id).locator('.r-sub').innerText(), 'Needs review');
       },
     );
+    // Round 10, F2. A deal analysis's or a forecast's reasons follow the documents' rule: a reason
+    // the page cannot read is left out, and the others are shown in the server's order, as text.
+    // The test business's deal analysis and forecasts are served with the reasons changed.
+    const analysisPlaces = async () => {
+      const snap = await snapshotOf(bid);
+      const deal = snap.objects.find((o) => o.kind === 'deal');
+      const plan = snap.objects.filter((o) => o.kind === 'financial_plan').at(-1);
+      assert(deal && plan, 'the test business has a deal analysis and a forecast');
+      const thrown = [];
+      const onError = (e) => thrown.push(e.message);
+      race.on('pageerror', onError);
+      try {
+        await race.reload();
+        await race.locator('#list .today-head').waitFor();
+        await onBusiness(bid, testName);
+        const shown = {};
+        // the page's own notes are neutral flags; the reasons are the others
+        const flags = '#insp .flag:not(.neutral)';
+        for (const [where, source, key, title] of [
+          ['deal', 'deals', 'deal:' + deal.id, deal.title],
+          ['forecast', 'money', 'plan:' + plan.id, plan.title],
+          ['money', 'money', 'money:ending', 'Money position'],
+        ]) {
+          await raceSource(source);
+          await race.locator(`#list .row[data-key="${key}"]`).click();
+          await race.locator('#insp-title', { hasText: title }).waitFor();
+          await quiet(race);
+          shown[where] = {
+            flags: await race.locator(flags).allInnerTexts(),
+            markup: await race.locator(`${flags} :is(b, img)`).count(),
+          };
+        }
+        shown.thrown = thrown;
+        return shown;
+      } finally {
+        race.off('pageerror', onError);
+      }
+    };
+    const inEachView = (messages) => ({
+      deal: { flags: messages, markup: 0 },
+      forecast: { flags: messages, markup: 0 },
+      money: { flags: messages, markup: 0 },
+      thrown: [],
+    });
+    lateCase(
+      'round 10 F2: a deal analysis and a forecast served with reasons the page cannot read',
+      async () => {
+        const first = {
+          code: 'evidence_changed',
+          message: 'Synthetic first reason, from the server.',
+        };
+        const second = {
+          code: 'jurisdiction_changed',
+          message:
+            'Synthetic second reason <b>bold</b> <img src=x onerror="window.injectedAnalysisReason=true"> & “quoted” "plain" \'single\'',
+        };
+        let served;
+        await serveChanged((body) => {
+          for (const o of body.objects.filter((x) => ['deal', 'financial_plan'].includes(x.kind)))
+            Object.assign(o, served);
+        });
+        const unreadable = [
+          null,
+          'a string',
+          7,
+          { code: 'no_message' },
+          { code: 'not_text', message: 5 },
+        ];
+        served = { stale: true, stale_reasons: [null, first, ...unreadable.slice(1), second] };
+        assert.deepEqual(
+          await analysisPlaces(),
+          inEachView([
+            'Synthetic first reason, from the server.',
+            'Synthetic second reason <b>bold</b> <img src=x onerror="window.injectedAnalysisReason=true"> & “quoted” "plain" \'single\'',
+          ]),
+          'two reasons the page can read among five it cannot',
+        );
+        // marked for review, and no reason the page can read: one sentence, and no reason of its own
+        served = { stale: true, stale_reasons: unreadable };
+        assert.deepEqual(
+          await analysisPlaces(),
+          {
+            deal: {
+              flags: ['This deal analysis needs review. Check it before relying on its figures.'],
+              markup: 0,
+            },
+            forecast: {
+              flags: ['This forecast needs review. Check it before relying on its figures.'],
+              markup: 0,
+            },
+            money: {
+              flags: ['This forecast needs review. Check it before relying on its figures.'],
+              markup: 0,
+            },
+            thrown: [],
+          },
+          'no reason the page can read',
+        );
+        // not marked, and no reason the page can read: nothing
+        served = { stale: false, stale_reasons: unreadable };
+        assert.deepEqual(await analysisPlaces(), inEachView([]), 'not marked for review');
+        assert.equal(
+          await race.evaluate(() => Boolean(window.injectedAnalysisReason)),
+          false,
+          'no reason ran a script',
+        );
+      },
+    );
+    lateCase(
+      'round 10 F2: a deal analysis served with the two reasons the server can give together',
+      async () => {
+        const evidence = {
+          code: 'evidence_changed',
+          message:
+            'Supporting evidence has changed since this deal analysis was saved. Run a revised analysis before relying on these figures.',
+        };
+        const jurisdiction = {
+          code: 'jurisdiction_changed',
+          saved_jurisdiction: 'undecided',
+          current_jurisdiction: 'GB',
+          message:
+            'This deal analysis was saved while the planning jurisdiction was undecided. It is now GB. Check its assumptions, the tax rate among them, and run a revised analysis before relying on these figures.',
+        };
+        await serveChanged((body) => {
+          for (const o of body.objects.filter((x) => x.kind === 'deal'))
+            Object.assign(o, { stale: true, stale_reasons: [evidence, jurisdiction] });
+        });
+        const { deal, thrown } = await analysisPlaces();
+        assert.deepEqual(
+          { deal, thrown },
+          {
+            deal: {
+              flags: [
+                'Supporting evidence has changed since this deal analysis was saved. Run a revised analysis before relying on these figures.',
+                'This deal analysis was saved while the planning jurisdiction was undecided. It is now GB. Check its assumptions, the tax rate among them, and run a revised analysis before relying on these figures.',
+              ],
+              markup: 0,
+            },
+            thrown: [],
+          },
+        );
+      },
+    );
     // Round 9, B. The backup command a desktop owner is shown. Only the desktop window's server adds
     // `desktop` to an owner's /api/me, and this test's server is `foundry serve`, so the field is
     // added on its way to the page. Without it, both places say what `foundry serve` always shows.

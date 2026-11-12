@@ -1697,18 +1697,15 @@ function webLink(uri) {
 const goAttr = (src, key) => `data-go="${h(src)}|${h(key)}"`;
 const flag = (body, neutral = false) =>
   `<div class="flag${neutral ? ' neutral' : ''}">${neutral ? '<span></span>' : g('review')}<div>${body}</div></div>`;
-/* Why a saved deal analysis or forecast needs review, in the server's own words, one flag for
-   each reason: evidence it relied on changed, the planning jurisdiction changed, or both. The
-   page writes no reason of its own; where a row has no room for these, it says "needs review". */
-const staleFlags = (o) => (o.stale_reasons || []).map((r) => flag(h(r.message))).join('');
-/* A generated document's reasons for being out of date, in the server's order. A reason the page
-   cannot read (not an object, or without a `message` string) is left out. */
-const docReasons = (o) =>
+/* The reasons the server gives for a record needing review, in the server's order: a generated
+   document's, a deal analysis's or a forecast's. A reason the page cannot read (not an object, or
+   without a `message` string) is left out. */
+const readableReasons = (o) =>
   Array.isArray(o.stale_reasons)
     ? o.stale_reasons.filter((r) => isEntry(r) && typeof r.message === 'string')
     : [];
 /* Whether the server says why a document is out of date, in words the page can show. */
-const hasReasons = (o) => docReasons(o).length > 0;
+const hasReasons = (o) => readableReasons(o).length > 0;
 /* Whether a generated document is out of date: the server marks it stale, or lists a reason for
    it. Every place that speaks about a document asks this, so no two of them can disagree. The page
    prints the server's reasons and states none of its own: one reason the server can give is that
@@ -1721,7 +1718,7 @@ const needsReview = (o) => (o.kind === 'document' ? docStale(o) : Boolean(o.stal
    gives none the page can read, one sentence that says only that the draft is out of date. A view
    opened now and one updated by a reload say the same. */
 const reasonFlags = (o) =>
-  docReasons(o)
+  readableReasons(o)
     .map((r) => flag(h(r.message)))
     .join('');
 const documentFlags = (o) =>
@@ -1730,6 +1727,16 @@ const documentFlags = (o) =>
     : hasReasons(o)
       ? reasonFlags(o)
       : '<div class="flag"><span></span><div>This draft is out of date. Generate a new version.</div></div>';
+/* Why a saved deal analysis or forecast needs review, in the server's own words, one flag for
+   each reason it can read: evidence it relied on changed, the planning jurisdiction changed, or
+   both. When it is marked for review and none of its reasons can be read, one sentence says only
+   that it needs review. The page writes no reason of its own; where a row has no room for these,
+   it says "needs review". */
+const staleFlags = (o) =>
+  reasonFlags(o) ||
+  (needsReview(o)
+    ? `<div class="flag"><span></span><div>This ${o.kind === 'deal' ? 'deal analysis' : 'forecast'} needs review. Check it before relying on its figures.</div></div>`
+    : '');
 function goFor(o) {
   if (o.kind === 'task') {
     const s = M.byId.get(o.id);
