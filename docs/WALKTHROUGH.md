@@ -4,6 +4,15 @@
 
 Start with the README setup. Sign in, choose **New business**, and enter the concept, intended buyer, entry path, accountable person, currency and planning jurisdiction. Leave jurisdiction undecided until there is a reviewed basis for selecting it. A workspace creates work and records; it does not register a legal entity.
 
+When the founders later decide where they will operate, a human owner or reviewer changes the planning jurisdiction as its own recorded decision; **Edit business** cannot change it. Preview the effect, then make the change with a reason and, optionally, reviewed evidence:
+
+```sh
+uv run foundry jurisdiction BUSINESS_ID GB --preview
+uv run foundry jurisdiction BUSINESS_ID GB --reason "Founders confirmed UK operations with an adviser." --evidence EVIDENCE_ID
+```
+
+The earlier guide's steps stay in the workspace as superseded history, the new guide's steps are added, and completed work reopens for review. Records, evidence and reviews stay where they are, and earlier documents are marked stale. Earlier deal analyses and forecasts are marked too, with a notice naming the jurisdiction they were saved under and the one in force now. Their figures are not recalculated: check their assumptions, the tax rate among them, and save a revised analysis or forecast. The notice does not block any step. The change selects which planning guide applies. It is not legal advice and does not form, move or register an entity. The browser interface has no control for it in this release; use the command line or `POST /api/businesses/{id}/jurisdiction` (preview: `GET /api/businesses/{id}/jurisdiction/preview?to=GB`).
+
 To start from configuration instead:
 
 ```sh
