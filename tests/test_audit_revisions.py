@@ -1198,6 +1198,227 @@ def test_event_whose_payload_id_is_not_its_object_id_hides_no_change(setup, whic
     assert_clean(service, actor, other)
 
 
+# An event's object id is text and its payload id is compared with it by value, so a payload id that
+# is not text is never a snapshot, under the record's own id or under that value spelled as text.
+
+NON_TEXT_IDS = {
+    "null": lambda own: None,
+    "false": lambda own: False,
+    "true": lambda own: True,
+    "zero": lambda own: 0,
+    "five": lambda own: 5,
+    "two-point-five": lambda own: 2.5,
+    "list-of-its-id": lambda own: [own],
+    "object-of-its-id": lambda own: {"id": own},
+}
+
+NON_TEXT_OBJECT_IDS = {
+    "own-id": lambda value, own, bid: own,
+    "business-id": lambda value, own, bid: bid,
+    "json-text": lambda value, own, bid: json.dumps(value),
+    "python-text": lambda value, own, bid: str(value),
+}
+
+
+def with_id(payload, value):
+    return canonical({**payload, "id": value})
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize("spelling", list(NON_TEXT_OBJECT_IDS))
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_event_whose_payload_id_is_not_text_is_no_snapshot(setup, payload_id, spelling, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    value = NON_TEXT_IDS[payload_id](item["id"])
+    object_id = NON_TEXT_OBJECT_IDS[spelling](value, item["id"], bid)
+    append_event(store, bid, object_id, with_id(foreign_snapshot(item, version), value))
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_event_whose_payload_id_is_not_text_hides_no_change(setup, payload_id, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    oid = item["id"]
+    forged = foreign_snapshot(item, version)
+    with store.write() as con:
+        con.execute(
+            "UPDATE objects SET title=?,data=?,version=? WHERE id=?",
+            (forged["title"], canonical(forged["data"]), version, oid),
+        )
+    expected = [f"Current record differs from history: {oid}", f"Revision mismatch: {oid}"]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    append_event(store, bid, oid, with_id(forged, NON_TEXT_IDS[payload_id](oid)))
+    after = integrity(setup)
+    assert after["record_errors"] == expected
+    assert not after["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
+def renamed_profile(profile, version):
+    return {**profile, "data": {**profile["data"], "name": "Never approved"}, "version": version}
+
+
+@pytest.mark.parametrize(
+    "version", [pytest.param(1, id="current-version"), pytest.param(99, id="unrecorded-version")]
+)
+@pytest.mark.parametrize(
+    "which", [pytest.param("business", id="business-id"), pytest.param("record", id="records-id")]
+)
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_business_profile_event_whose_payload_id_is_not_text_is_no_snapshot(
+    setup, payload_id, which, version
+):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    profile = service.audit(actor, bid)["events"][0]["payload"]
+    assert profile["id"] == bid and profile["version"] == 1
+    item = history(setup, versions=2)
+    object_id = bid if which == "business" else item["id"]
+    append_event(
+        store,
+        bid,
+        object_id,
+        with_id(renamed_profile(profile, version), NON_TEXT_IDS[payload_id](bid)),
+        "business.updated",
+    )
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_business_profile_event_whose_payload_id_is_not_text_hides_no_change(setup, payload_id):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    profile = service.audit(actor, bid)["events"][0]["payload"]
+    forged = renamed_profile(profile, 2)
+    with store.write() as con:
+        con.execute("UPDATE businesses SET data=?,version=2 WHERE id=?", (canonical(forged["data"]), bid))
+    expected = [f"Current record differs from history: {bid}"]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    append_event(store, bid, bid, with_id(forged, NON_TEXT_IDS[payload_id](bid)), "business.updated")
+    after = integrity(setup)
+    assert after["record_errors"] == expected
+    assert not after["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
+# The empty text is text like any other: a payload id "" is a snapshot only under the object id "".
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize(
+    "which", [pytest.param("record", id="records-id"), pytest.param("business", id="business-id")]
+)
+def test_event_whose_payload_id_is_empty_text_is_no_snapshot_under_another_id(setup, which, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    object_id = item["id"] if which == "record" else bid
+    append_event(store, bid, object_id, with_id(foreign_snapshot(item, version), ""))
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+def test_event_whose_payload_id_and_object_id_are_empty_text_is_a_snapshot(setup, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    append_event(store, bid, "", with_id(foreign_snapshot(item, version), ""))
+    expected = ["Historical record missing: ", f"Historical revision missing:  version {version}"]
+    result = integrity(setup)
+    assert result["record_errors"] == expected
+    assert not result["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
+# Revision rows are attributed to a business through the object id of every event it has, whether
+# or not that event is a snapshot. A row under an id that nothing of the business names is not
+# attributed to it.
+
+UNNAMED_ID = "object_nothing_else_uses"
+
+
+def unnamed_revision(setup):
+    store = setup[0]
+    item = history(setup, versions=2)
+    with store.write() as con:
+        con.execute(
+            "INSERT INTO revisions VALUES(?,?,?,?,?)",
+            (
+                UNNAMED_ID,
+                1,
+                canonical({**item, "id": UNNAMED_ID, "version": 1}),
+                "principal_appender",
+                APPENDED_AT,
+            ),
+        )
+    return item
+
+
+def test_documented_limit_revision_under_an_id_no_event_names_is_not_checked(setup):
+    _, service, actor, bid, _ = setup
+    other = second_business(setup)
+    unnamed_revision(setup)
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize(
+    "payload_id",
+    [
+        pytest.param(lambda own: own, id="records-id"),
+        pytest.param(lambda own: 5, id="five"),
+        pytest.param(lambda own: None, id="null"),
+        pytest.param(lambda own: [own], id="list-of-records-id"),
+    ],
+)
+def test_event_that_is_no_snapshot_attributes_revisions_under_its_object_id(setup, payload_id):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = unnamed_revision(setup)
+    append_event(store, bid, UNNAMED_ID, with_id(foreign_snapshot(item, 1), payload_id(item["id"])))
+    expected = [f"Revision has no recorded history: {UNNAMED_ID} version 1"]
+    result = integrity(setup)
+    assert result["record_errors"] == expected
+    assert not result["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
 UNUSABLE_VERSIONS = [
     pytest.param("2.0", id="float-2.0"),
     pytest.param("2e0", id="exponent-2e0"),
@@ -1369,6 +1590,179 @@ def test_documented_limit_altered_ai_review_with_appended_event_verifies(setup):
         "ai.succeeded",
     )
     assert_clean(service, actor, bid)
+
+
+# Any event counts for an AI review when its payload's run_id and data_sha256 are both truthy,
+# whatever else the payload holds, and the last such event for a run id stands for that run. An
+# event that does not count leaves the one before it standing.
+
+ABSENT = object()
+OTHER_DIGEST = "f" * 64
+
+AI_PAYLOAD_IDS = {
+    "text": lambda own: UNNAMED_ID,
+    "five": lambda own: 5,
+    "null": lambda own: None,
+    "list": lambda own: [own],
+}
+
+AI_OBJECT_IDS = [pytest.param("record", id="records-id"), pytest.param("run", id="runs-id")]
+
+
+def stored_ai_digest(store, run_id):
+    with store.read() as con:
+        data = con.execute("SELECT data FROM ai_calls WHERE id=?", (run_id,)).fetchone()[0]
+    return digest(canonical(json.loads(data)))
+
+
+def append_ai_event(setup, item, run, payload_id, which="record", **fields):
+    """Append an event that is no snapshot, carrying ``fields`` and no key whose value is ABSENT."""
+    store, _, _, bid, _ = setup
+    object_id = item["id"] if which == "record" else run
+    payload = {"id": AI_PAYLOAD_IDS[payload_id](item["id"]), "version": 2, "data": item["data"]}
+    payload.update({name: value for name, value in fields.items() if value is not ABSENT})
+    assert payload["id"] != object_id
+    append_event(store, bid, object_id, canonical(payload), "ai.succeeded")
+
+
+def ai_audit(setup, item, payload_id, which, run_id, data_sha256, state):
+    store, _, actor, bid, _ = setup
+    run = add_ai_review(store, actor, bid)
+    right = stored_ai_digest(store, run)
+    run_id = run if run_id == "run" else run_id
+    append_ai_event(
+        setup, item, run, payload_id, which, run_id=run_id, data_sha256=data_sha256(right), state=state
+    )
+    return integrity(setup)
+
+
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_that_is_no_snapshot_stands_for_its_ai_review(setup, payload_id, which):
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, "run", lambda right: right, "unknown")
+    assert result["record_errors"] == []
+    assert result["valid"]
+
+
+@pytest.mark.parametrize(
+    ("data_sha256", "state"),
+    [
+        pytest.param(lambda right: OTHER_DIGEST, "unknown", id="another-digest"),
+        pytest.param(lambda right: right, "succeeded", id="another-state"),
+        pytest.param(lambda right: 1, "unknown", id="digest-one"),
+        pytest.param(lambda right: True, "unknown", id="digest-true"),
+        pytest.param(lambda right: [right], "unknown", id="digest-list-of-the-right-digest"),
+    ],
+)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_that_is_no_snapshot_and_differs_from_its_ai_review_is_reported(
+    setup, payload_id, which, data_sha256, state
+):
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, "run", data_sha256, state)
+    assert result["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert not result["valid"]
+
+
+@pytest.mark.parametrize(
+    ("run_id", "data_sha256"),
+    [
+        pytest.param("run", lambda right: "", id="digest-empty-text"),
+        pytest.param("run", lambda right: 0, id="digest-zero"),
+        pytest.param("run", lambda right: False, id="digest-false"),
+        pytest.param("run", lambda right: None, id="digest-null"),
+        pytest.param("run", lambda right: [], id="digest-empty-list"),
+        pytest.param("run", lambda right: {}, id="digest-empty-object"),
+        pytest.param("run", lambda right: ABSENT, id="digest-absent"),
+        pytest.param("", lambda right: OTHER_DIGEST, id="run-id-empty-text"),
+        pytest.param(0, lambda right: OTHER_DIGEST, id="run-id-zero"),
+        pytest.param(False, lambda right: OTHER_DIGEST, id="run-id-false"),
+        pytest.param(None, lambda right: OTHER_DIGEST, id="run-id-null"),
+        pytest.param(ABSENT, lambda right: OTHER_DIGEST, id="run-id-absent"),
+    ],
+)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_with_a_falsy_run_id_or_digest_does_not_count_for_an_ai_review(
+    setup, payload_id, which, run_id, data_sha256
+):
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, run_id, data_sha256, "succeeded")
+    assert result["record_errors"] == []
+    assert result["valid"]
+
+
+@pytest.mark.parametrize(
+    ("run_id", "shown"),
+    [
+        pytest.param("review_never_stored", "review_never_stored", id="text"),
+        pytest.param(5, "5", id="five"),
+        pytest.param(True, "True", id="true"),
+    ],
+)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_that_is_no_snapshot_for_an_ai_review_never_stored_is_reported(
+    setup, payload_id, which, run_id, shown
+):
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, run_id, lambda right: OTHER_DIGEST, "succeeded")
+    assert result["record_errors"] == [f"Historical AI review missing: {shown}"]
+    assert not result["valid"]
+
+
+AI_RUNS = [pytest.param(True, id="altered"), pytest.param(False, id="no-history")]
+
+
+def unrecorded_ai_review(setup, chained):
+    """A stored run whose current row no chained event matches, with the state an event would need."""
+    store, _, actor, bid, _ = setup
+    run = add_ai_review(store, actor, bid, chained=chained)
+    if not chained:
+        return run, "unknown"
+    with store.write() as con:
+        con.execute(
+            "UPDATE ai_calls SET data=?,state='succeeded' WHERE id=?",
+            (canonical({"note": "Advice that was never returned."}), run),
+        )
+    return run, "succeeded"
+
+
+@pytest.mark.parametrize("chained", AI_RUNS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_documented_limit_ai_review_verifies_through_an_event_that_is_no_snapshot(setup, payload_id, chained):
+    item = history(setup, versions=2)
+    run, state = unrecorded_ai_review(setup, chained)
+    before = integrity(setup)
+    assert before["record_errors"] == [f"AI review differs from history: {run}"]
+    assert not before["valid"]
+    right = stored_ai_digest(setup[0], run)
+    append_ai_event(setup, item, run, payload_id, run_id=run, data_sha256=right, state=state)
+    result = integrity(setup)
+    assert result["record_errors"] == []
+    assert result["valid"]
+
+
+@pytest.mark.parametrize(
+    "data_sha256", [pytest.param("", id="digest-empty-text"), pytest.param(ABSENT, id="digest-absent")]
+)
+@pytest.mark.parametrize("chained", AI_RUNS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_with_an_empty_or_absent_digest_does_not_hide_an_ai_review_change(
+    setup, payload_id, chained, data_sha256
+):
+    item = history(setup, versions=2)
+    run, state = unrecorded_ai_review(setup, chained)
+    expected = [f"AI review differs from history: {run}"]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    append_ai_event(setup, item, run, payload_id, run_id=run, data_sha256=data_sha256, state=state)
+    result = integrity(setup)
+    assert result["record_errors"] == expected
+    assert not result["valid"]
 
 
 # Gaps named in review: literals that run back as SQL, number and key spellings, REAL and NaN versions.
