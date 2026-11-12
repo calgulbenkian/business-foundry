@@ -67,28 +67,48 @@ const focused = (page) =>
    request reaches the server at once, so the held response is what the server said then,
    delivered late. `requested` resolves with that response once the server has answered. With
    `lose`, release() drops the connection instead, as a lost answer does: the server acted, and
-   the page never hears what it said. */
+   the page never hears what it said. A request the page cancels while it is held never gets
+   its answer; `cancelled()` then says so, and release() lets the held answer go nowhere. */
 async function hold(page, path, { method = null, lose = false } = {}) {
   const match = (url) => url.pathname === path;
   const mine = (r) => match(new URL(r.url())) && (!method || r.method() === method);
-  let open, seen;
+  let open, seen, handled;
   const gate = new Promise((r) => (open = r)),
-    requested = new Promise((r) => (seen = r));
+    requested = new Promise((r) => (seen = r)),
+    done = new Promise((r) => (handled = r));
+  let released = false,
+    cancelled = false;
+  const failed = (r) => {
+    if (!released && mine(r)) cancelled = true;
+  };
+  page.on('requestfailed', failed);
   const handler = async (route) => {
     if (method && route.request().method() !== method) return route.fallback();
     const response = await route.fetch();
     seen(response);
     await gate;
-    if (lose) await route.abort('connectionreset');
-    else await route.fulfill({ response });
+    try {
+      if (lose) await route.abort('connectionreset');
+      else await route.fulfill({ response });
+    } catch {
+      // the page cancelled the request while it was held
+      cancelled = true;
+    }
+    handled();
   };
   await page.route(match, handler);
   return {
     requested,
+    cancelled: () => cancelled,
     async release() {
       const finished = page.waitForEvent(lose ? 'requestfailed' : 'requestfinished', mine);
+      // a cancelled request has no event left to wait for
+      finished.catch(() => {});
+      released = true;
+      page.off('requestfailed', failed);
       open();
-      await finished;
+      await Promise.race([done, finished]);
+      if (!cancelled) await finished;
       await page.unroute(match, handler);
       // let the page's promise chains run on what arrived
       await pause(250);
@@ -1822,6 +1842,174 @@ async function main() {
       assert.deepEqual([at.id, at.visible], ['insp-title', true], 'phone: the inspector heading');
     });
 
+    // Focus when a dialog closes. The browser hands focus back to the control that opened the
+    // dialog; when the page behind it was drawn again meanwhile, that control is gone, and focus
+    // has to land on the control drawn in its place, never on nothing.
+    const focusAfterClose = async () => {
+      await race.waitForFunction(() => !document.querySelector('#dialog').open);
+      // the dialog's close event, and anything it shows in turn, runs after close()
+      await pause(150);
+      return focused(race);
+    };
+    const onKeyControl = (at, what) =>
+      assert.deepEqual(
+        [at.action, at.visible, at.pane],
+        ['new-key', true, 'list'],
+        `${what}: focus is on the visible control that opens the key form`,
+      );
+    const onRecordControl = (at, what) =>
+      assert.deepEqual(
+        [at.action, at.visible, at.pane],
+        ['new-record', true, 'list'],
+        `${what}: focus is on the visible control that opens the record form`,
+      );
+    // Releasing a held answer removes its route, and the page's reload starts at that moment. A
+    // request the browser sends while its last route is being removed can stall, so the cases
+    // below that wait on such a reload keep one pass-through route until settle() clears it.
+    const keepRouting = () =>
+      race.route(
+        () => true,
+        (route) => route.fallback(),
+      );
+    // create a key and wait until the reload after it has drawn the access list again
+    const keyShownOverRedrawnList = async (name, phone = false) => {
+      if (phone) {
+        // on a phone the source list gives way to the list pane once a source is chosen
+        await race.locator('#src-nav .src[data-src="access"]').click();
+        await race.getByRole('button', { name: '+ Create access key', exact: true }).click();
+        await race.getByLabel('Person or agent name', { exact: true }).fill(name);
+      } else await openKeyForm(name);
+      await inDialog('Create key');
+      await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+      await rowIn(name).waitFor();
+      await pause(150);
+    };
+    lateCase('round 4 finding 1: Escape on a new key, after the list was redrawn', async () => {
+      await onBusiness(bid, testName);
+      await keyShownOverRedrawnList('Browser key closed with Escape');
+      await race.keyboard.press('Escape');
+      onKeyControl(await focusAfterClose(), 'Escape');
+    });
+    lateCase('round 4 finding 1: Close on a new key, after the list was redrawn', async () => {
+      await onBusiness(bid, testName);
+      await keyShownOverRedrawnList('Browser key closed with its Close button');
+      await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      onKeyControl(await focusAfterClose(), 'Close');
+    });
+    lateCase('round 4 finding 1: closing “Access key not confirmed”', async () => {
+      await onBusiness(bid, testName);
+      const name = 'Browser key not confirmed, then closed';
+      await keepRouting();
+      await openKeyForm(name);
+      const held = await hold(race, '/api/principals', { method: 'POST', lose: true });
+      await inDialog('Create key');
+      await held.requested;
+      await held.release();
+      await race.locator('#dialog-title', { hasText: 'Access key not confirmed' }).waitFor();
+      // the notice's own reload draws the list again behind it
+      await rowIn(name).waitFor();
+      await pause(150);
+      await inDialog('Close');
+      onKeyControl(await focusAfterClose(), 'Close');
+    });
+    lateCase('round 4 finding 1: a key that waited behind a form, then closed', async () => {
+      await onBusiness(bid, testName);
+      await keepRouting();
+      const held = await holdKey();
+      const name = 'Browser key that waited behind a record form';
+      await openKeyForm(name);
+      await inDialog('Create key');
+      const secret = await keyFrom(held);
+      await race.keyboard.press('Escape');
+      await raceSource('records');
+      await openRecordForm('Browser record cancelled while a key waited');
+      // the key's answer arrives, waits for the form, and its reload redraws the list behind it
+      await held.release();
+      await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
+      assert.equal(await dialogTitle(), 'Add business record', 'the key waits for the form');
+      await inDialog('Cancel');
+      await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+      assert(await shownKeyIs(secret), 'the key shown is the one the server made');
+      await race.keyboard.press('Escape');
+      onRecordControl(await focusAfterClose(), 'after the waiting key');
+    });
+    // a record form open while an earlier save's answer arrives and reloads the list behind it
+    const formOverReloadedList = async (title) => {
+      await onBusiness(bid, testName);
+      await raceSource('records');
+      await keepRouting();
+      const held = await hold(race, `/api/businesses/${bid}/records`, { method: 'POST' });
+      await openRecordForm('Browser record whose answer arrives later');
+      await inDialog('Save record');
+      await held.requested;
+      await race.keyboard.press('Escape');
+      await openRecordForm(title);
+      await held.release();
+      await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
+      await rowIn('Browser record whose answer arrives later').waitFor();
+      await pause(150);
+      assert.equal(await dialogTitle(), 'Add business record', 'the second form is still open');
+    };
+    lateCase('round 4 finding 1: cancelling a form whose list was reloaded', async () => {
+      await formOverReloadedList('Browser record cancelled after a reload');
+      await inDialog('Cancel');
+      onRecordControl(await focusAfterClose(), 'Cancel');
+    });
+    lateCase('round 4 finding 1: saving a form whose list was reloaded', async () => {
+      const title = 'Browser record saved after a reload';
+      const before = await recordsIn(bid, title);
+      await formOverReloadedList(title);
+      const saved = race.waitForResponse(
+        (r) =>
+          r.request().method() === 'GET' && new URL(r.url()).pathname === `/api/businesses/${bid}`,
+      );
+      await inDialog('Save record');
+      await saved;
+      await rowIn(title).waitFor();
+      onRecordControl(await focusAfterClose(), 'Save');
+      assert.equal(await recordsIn(bid, title), before + 1, 'the form saved once');
+    });
+    lateCase('round 4 finding 1: on a phone, focus stays in the pane on screen', async () => {
+      await onBusiness(bid, testName);
+      await race.setViewportSize({ width: 390, height: 844 });
+      if (await race.locator('#back-list').isVisible()) await race.locator('#back-list').click();
+      if (await race.locator('#back-src').isVisible()) await race.locator('#back-src').click();
+      await keyShownOverRedrawnList('Browser key closed on a phone', true);
+      assert.equal(await race.locator('#insp').isVisible(), false, 'the list pane is on screen');
+      await race.keyboard.press('Escape');
+      onKeyControl(await focusAfterClose(), 'phone');
+    });
+
+    lateCase(
+      'round 4 finding 2: a sign-out answer held past a 401 and a new sign-in ends nothing',
+      async () => {
+        await onBusiness(bid, testName);
+        await keepRouting();
+        const held = await hold(race, '/api/logout', { method: 'POST' });
+        await race.locator('.toolbar [data-action="logout"]').click();
+        // the server has ended the session; the next thing the page asks for is refused
+        await held.requested;
+        await race.locator('#src-nav .src[data-src="history"]').click();
+        await race.getByLabel('Access key', { exact: true }).waitFor();
+        await signInAgain();
+        const session = async () =>
+          (await context.cookies(origin)).find((c) => c.name === 'foundry_session')?.value;
+        const signedIn = await session();
+        assert(signedIn, 'the new sign-in has a session cookie');
+        await held.release();
+        await pause(300);
+        // compared, never printed
+        assert((await session()) === signedIn, 'the new session keeps its cookie');
+        await raceSource('history');
+        await race.locator('#list .grp', { hasText: 'Events' }).waitFor();
+        assert(await race.locator('#app').isVisible(), 'the workspace stays on screen');
+        assert(await race.locator('#login').isHidden(), 'sign-in is not asked for');
+        assert.equal(await race.locator('#toast').isVisible(), false, 'no message appears');
+        assert.equal(await dialogOpen(), false, 'nothing opens');
+        assert(held.cancelled(), 'the page cancelled the sign-out when its session ended');
+      },
+    );
+
     race.setDefaultTimeout(10000);
     const lateFailures = [];
     for (const [name, run] of late) {
@@ -1976,7 +2164,7 @@ async function main() {
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, focus after Dismiss on a computer and a phone, lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

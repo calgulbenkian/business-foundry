@@ -2897,6 +2897,16 @@ const FOCUS_FALLBACK = {
    heading, whichever is visible. On a phone showing the sources, the current source. */
 const RESTING_FOCUS = [SELECTED_ROW, '#list .row', '#insp-title', SELECTED_SOURCE];
 const SAME_CONTROL = ['data-src', 'data-key', 'data-action', 'data-id', 'data-to', 'data-go'];
+/* A selector for the control that stands in the place of `el` once the markup is drawn again:
+   the same id, or the same tag with the same identifying attributes. Empty when it has none. */
+function sameControl(el) {
+  if (el.id) return '#' + CSS.escape(el.id);
+  const attrs = SAME_CONTROL.filter((a) => el.hasAttribute(a));
+  return attrs.length
+    ? el.tagName.toLowerCase() +
+        attrs.map((a) => `[${a}="${CSS.escape(el.getAttribute(a))}"]`).join('')
+    : '';
+}
 function focusMemo() {
   const el = document.activeElement;
   const region =
@@ -2904,15 +2914,7 @@ function focusMemo() {
       ? el.closest('#src-nav, #src-foot, #list-right, #list, #insp')
       : null;
   if (!region) return null;
-  let same = el.id ? '#' + CSS.escape(el.id) : '';
-  if (!same) {
-    const attrs = SAME_CONTROL.filter((a) => el.hasAttribute(a));
-    if (attrs.length)
-      same =
-        el.tagName.toLowerCase() +
-        attrs.map((a) => `[${a}="${CSS.escape(el.getAttribute(a))}"]`).join('');
-  }
-  return { el, region: region.id, same };
+  return { el, region: region.id, same: sameControl(el) };
 }
 function rerender(render) {
   const memo = focusMemo();
@@ -3064,14 +3066,21 @@ function failedText(error, scope) {
     ? `The review requested for ${scope.name} did not complete. ${messageFor(error)}`
     : `Not saved to ${scope.name}. ${messageFor(error)}`;
 }
+/* Sign-out requests still waiting for their answer: the AbortController of each. */
+const signingOut = new Set();
 /* Sign-out, or a 401: the previous person's records leave memory and the page, not just the view.
    Any request still in flight belongs to an older load and an older session, so it is dropped,
    and so is anything waiting to be shown, a new access key included. */
 function forget() {
   loadSeq += 1;
   sessionSeq += 1;
+  // A sign-out still waiting is cancelled before anyone can sign in again. Its answer deletes the
+  // session cookie, and arriving after a new sign-in it would delete the new session's.
+  for (const cancel of signingOut) cancel.abort();
+  signingOut.clear();
   waiting.length = 0;
   dialogAbout = null;
+  opener = null;
   clearTimeout(toastTimer);
   Object.assign(state, {
     actor: null,
@@ -3332,11 +3341,41 @@ let dialogAbout = null;
    have been created), shown in turn once no dialog is open. Each belongs to the session it was
    requested in, and the queue is emptied when that session ends. */
 const waiting = [];
+/* The control that opened the dialog, and the session it opened in. A dialog that takes the place
+   of another as it closes (a key that waited behind a form) keeps the first one's opener when
+   nothing outside the dialog had focus by then. Emptied when the session ends. */
+let opener = null;
 function showDialog(title, html, about = null) {
   dialogAbout = about;
   $('#dialog-title').textContent = title;
   $('#dialog-content').innerHTML = html;
-  if (!$('#dialog').open) $('#dialog').showModal();
+  if (!$('#dialog').open) {
+    const el = document.activeElement;
+    if (el && el !== document.body && !app.hidden && app.contains(el))
+      opener = {
+        el,
+        region: el.closest('#src-nav, #src-foot, #list-right, #list, #insp')?.id || null,
+        same: sameControl(el),
+        session: sessionSeq,
+      };
+    $('#dialog').showModal();
+  }
+}
+/* A dialog has closed and none took its place. The browser hands focus back to the control that
+   opened it; when that control was drawn again while the dialog was open, or is no longer shown,
+   focus would be left on nothing. It goes to the control standing in the opener's place, else to
+   the page's resting place. Focus the browser left on a visible control stays where it is, and
+   nothing in the workspace is focused once the session that opened the dialog has ended. */
+function returnFocus(memo) {
+  if (app.hidden || (memo && memo.session !== sessionSeq)) return;
+  const el = document.activeElement;
+  if (el && el !== document.body && visible(el) && !$('#dialog').contains(el)) return;
+  if (memo && memo.el.isConnected && visible(memo.el)) {
+    memo.el.focus({ preventScroll: true });
+    return;
+  }
+  const same = !memo?.same ? [] : memo.region ? [`#${memo.region} ${memo.same}`] : [memo.same];
+  focusFirst([...same, ...RESTING_FOCUS, '#back-list', '#back-src']);
 }
 /* Show a dialog that arrived late, without replacing one the person has open. */
 function showWhenFree(session, title, html, about = null) {
@@ -3363,6 +3402,11 @@ $('#dialog').addEventListener('close', () => {
   }
   dialogAbout = null;
   showWaiting();
+  // a dialog that waited is shown in its place, and keeps its opener
+  if ($('#dialog').open) return;
+  const memo = opener;
+  opener = null;
+  returnFocus(memo);
 });
 /* A form in a dialog. It belongs to the business on screen when it opens (`scope`): `submit`
    receives that scope and sends there. Unless `free` (a form that is not about the business on
@@ -4067,13 +4111,24 @@ async function handle(a, el) {
     if (document.activeElement === document.body || !visible(document.activeElement))
       focusFirst(RESTING_FOCUS);
   } else if (a === 'logout') {
-    const session = sessionSeq;
-    await api('/logout', {
-      method: 'POST',
-      // signing out twice is safe: the second either ends the session or is refused as signed out
-      interrupted:
-        'Connection interrupted, so this page cannot tell whether you were signed out. Signing out again is safe.',
-    });
+    const session = sessionSeq,
+      cancel = new AbortController();
+    signingOut.add(cancel);
+    try {
+      await api('/logout', {
+        method: 'POST',
+        signal: cancel.signal,
+        // signing out twice is safe: the second either ends the session or is refused as signed out
+        interrupted:
+          'Connection interrupted, so this page cannot tell whether you were signed out. Signing out again is safe.',
+      });
+    } catch (error) {
+      // cancelled because the session ended another way: nothing to say
+      if (cancel.signal.aborted) return;
+      throw error;
+    } finally {
+      signingOut.delete(cancel);
+    }
     // an answer for a session that has already ended (a 401 meanwhile) ends nothing newer
     if (session === sessionSeq) showLogin();
   } else if (a === 'new-business') businessDialog();
