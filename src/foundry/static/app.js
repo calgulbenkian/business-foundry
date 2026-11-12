@@ -1061,10 +1061,9 @@ function renderSources() {
       }
       if (s.id === 'documents') {
         const d = objs('document');
-        n = (d.some((x) => x.stale) ? g('review') : '') + d.length;
-        if (d.some((x) => x.stale && !hasReasons(x)))
-          title = 'Some drafts were made from records that changed since';
-        else if (d.some((x) => x.stale)) title = 'Some drafts need review';
+        n = (d.some(docStale) ? g('review') : '') + d.length;
+        if (d.some((x) => docStale(x) && !hasReasons(x))) title = 'Some drafts are out of date';
+        else if (d.some(docStale)) title = 'Some drafts need review';
       }
       if (s.id === 'sales') {
         const inv = objs('invoice');
@@ -1337,15 +1336,15 @@ function renderList() {
     for (const d of docs.slice().reverse())
       out += row({
         key: 'doc:' + d.id,
-        glyph: d.stale ? g('review') : tick,
+        glyph: docStale(d) ? g('review') : tick,
         title: h(d.title),
         right: h(dDay(d.created_at)),
         sub: h(
-          !d.stale
+          !docStale(d)
             ? 'Matches the current records'
             : hasReasons(d)
               ? 'Needs review'
-              : 'Source records changed since this draft',
+              : 'Out of date',
         ),
       });
     if (!docs.length)
@@ -1574,13 +1573,13 @@ function moneyRows(today) {
 }
 function changedRows() {
   const out = [];
-  for (const d of objs('document').filter((x) => x.stale))
+  for (const d of objs('document').filter(docStale))
     out.push(
       row({
         key: 'doc:' + d.id,
         glyph: g('review'),
         title: h(d.title),
-        sub: hasReasons(d) ? 'Draft · needs review' : 'Draft made from records that changed since',
+        sub: hasReasons(d) ? 'Draft · needs review' : 'Draft · out of date',
       }),
     );
   for (const d of objs('deal').filter((x) => x.stale))
@@ -1691,18 +1690,35 @@ const flag = (body, neutral = false) =>
    each reason: evidence it relied on changed, the planning jurisdiction changed, or both. The
    page writes no reason of its own; where a row has no room for these, it says "needs review". */
 const staleFlags = (o) => (o.stale_reasons || []).map((r) => flag(h(r.message))).join('');
-/* Whether the server says why this needs review. A document carries its reasons from servers
-   that send them; it is then read as a deal analysis or forecast is, and the page states no
-   reason of its own. From a server that sends none, a stale document keeps the page's words. */
-const hasReasons = (o) => Array.isArray(o.stale_reasons) && o.stale_reasons.length > 0;
-/* What a stale document's full view says: the server's reasons when it gives them, else the
-   page's sentence. A view opened now and one updated by a reload say the same. */
+/* A generated document's reasons for being out of date, in the server's order. A reason the page
+   cannot read (not an object, or without a `message` string) is left out. */
+const docReasons = (o) =>
+  Array.isArray(o.stale_reasons)
+    ? o.stale_reasons.filter((r) => isEntry(r) && typeof r.message === 'string')
+    : [];
+/* Whether the server says why a document is out of date, in words the page can show. */
+const hasReasons = (o) => docReasons(o).length > 0;
+/* Whether a generated document is out of date: the server marks it stale, or lists a reason for
+   it. Every place that speaks about a document asks this, so no two of them can disagree. The page
+   prints the server's reasons and states none of its own: one reason the server can give is that
+   the overdue obligations changed, which is no change to any record. */
+const docStale = (o) =>
+  o.stale === true || (Array.isArray(o.stale_reasons) && o.stale_reasons.length > 0);
+/* Whether a record needs review: a document by docStale, a deal analysis or forecast by its mark. */
+const needsReview = (o) => (o.kind === 'document' ? docStale(o) : Boolean(o.stale));
+/* What an out-of-date document's full view says: the server's reasons, one flag each, or when it
+   gives none the page can read, one sentence that says only that the draft is out of date. A view
+   opened now and one updated by a reload say the same. */
+const reasonFlags = (o) =>
+  docReasons(o)
+    .map((r) => flag(h(r.message)))
+    .join('');
 const documentFlags = (o) =>
-  !o.stale
+  !docStale(o)
     ? ''
     : hasReasons(o)
-      ? staleFlags(o)
-      : '<div class="flag"><span></span><div>The records this draft was made from have changed since it was generated.</div></div>';
+      ? reasonFlags(o)
+      : '<div class="flag"><span></span><div>This draft is out of date. Generate a new version.</div></div>';
 function goFor(o) {
   if (o.kind === 'task') {
     const s = M.byId.get(o.id);
@@ -1780,7 +1796,7 @@ function usedBy(eid) {
 function objGlyph(o) {
   if (o.kind === 'task') return taskGlyph(o);
   if (o.kind === 'evidence') return evInfo(o).glyph;
-  if (o.kind === 'document' || o.kind === 'deal') return o.stale ? g('review') : tick;
+  if (o.kind === 'document' || o.kind === 'deal') return needsReview(o) ? g('review') : tick;
   if (o.kind === 'financial_plan') return o.stale ? g('review') : dash;
   if (o.kind === 'invoice') return o.evidence_warning ? g('review') : invoiceGlyph(o.state);
   if (o.kind === 'payment') return o.evidence_warning ? g('review') : tick;
@@ -1792,10 +1808,8 @@ function objState(o) {
   if (o.kind === 'evidence') return evInfo(o).label;
   // a deal analysis, a forecast or a document with the server's reasons can need review for more
   // than one reason; its own view says which
-  if (o.stale)
-    return o.kind === 'document' && !hasReasons(o)
-      ? 'Needs review — made from records that changed since'
-      : 'Needs review';
+  if (needsReview(o))
+    return o.kind === 'document' && !hasReasons(o) ? 'Out of date' : 'Needs review';
   if (o.evidence_warning) return `${label(o.state)} · its evidence needs review`;
   return label(o.state);
 }
@@ -1806,7 +1820,7 @@ function attList(items) {
       const [s, k] = goFor(o);
       const amber =
         (o.kind === 'evidence' && o.state === 'rejected') ||
-        o.stale ||
+        needsReview(o) ||
         o.evidence_warning ||
         o.state === 'needs_review';
       const prefix = o.kind === 'task' && M.byId.get(o.id) ? M.byId.get(o.id).n + ' ' : '';
@@ -2672,19 +2686,21 @@ function inspDocument(o) {
     head({
       kicker: `Document · ${h(templates[o.data.template] || label(o.data.template))}`,
       title: h(o.title),
-      glyph: o.stale ? g('review') : tick,
-      stateLabel: !o.stale ? 'Draft' : hasReasons(o) ? 'Needs review' : 'Out of date',
+      glyph: docStale(o) ? g('review') : tick,
+      stateLabel: !docStale(o) ? 'Draft' : hasReasons(o) ? 'Needs review' : 'Out of date',
       next: `generated ${h(dFull(o.created_at))}`,
       actions:
         btn('Read draft', `data-action="document" data-id="${h(o.id)}"`, true) +
         `<a class="btn" href="/api/businesses/${h(state.bid)}/documents/${h(o.id)}/download">Download</a>` +
-        (o.stale && canWrite() ? btn('Generate a new version', 'data-action="new-document"') : ''),
-      extra: !o.stale
+        (docStale(o) && canWrite()
+          ? btn('Generate a new version', 'data-action="new-document"')
+          : ''),
+      extra: !docStale(o)
         ? ''
         : hasReasons(o)
-          ? staleFlags(o)
+          ? reasonFlags(o)
           : flag(
-              '<b>The records this draft was made from have changed since.</b> This copy stays as it was generated. Generate a new version to reflect the current records.',
+              '<b>This draft is out of date.</b> This copy stays as it was generated. Generate a new version.',
             ),
     }) +
     sec(

@@ -2525,8 +2525,11 @@ print(json.dumps({
       await race.locator('#dialog pre.document').waitFor();
     };
     const viewFlags = () => race.locator('#dialog-content .flag').allInnerTexts();
-    const DRAFT_CHANGED =
-      'The records this draft was made from have changed since it was generated.';
+    // what a draft's view says when it is out of date and the server lists no reason
+    const DRAFT_CHANGED = 'This draft is out of date. Generate a new version.';
+    // the server's own reason when a document's records changed, word for word
+    const SOURCE_CHANGED =
+      'The business or its records have changed since this document was generated. Generate a new version before relying on it.';
     lateCase('round 8 B: a document with the server’s reasons, from both servers', async () => {
       const doc = await newDraft();
       const reasons = [
@@ -2601,17 +2604,284 @@ print(json.dumps({
       mode = 'plain';
       await race.reload();
       await race.locator('#list .today-head').waitFor();
-      assert.deepEqual(await everywhere('without reasons'), {
-        row: 'Source records changed since this draft',
-        title: 'Some drafts were made from records that changed since',
+      const withoutReasons = await everywhere('without reasons');
+      assert.deepEqual(withoutReasons, {
+        row: 'Out of date',
+        title: 'Some drafts are out of date',
         state: 'Out of date',
         flags: [
-          'The records this draft was made from have changed since. This copy stays as it was generated. Generate a new version to reflect the current records.',
+          'This draft is out of date. This copy stays as it was generated. Generate a new version.',
         ],
         view: [DRAFT_CHANGED],
-        today: 'Draft made from records that changed since',
-        related: 'Document · Needs review — made from records that changed since',
+        today: 'Draft · out of date',
+        related: 'Document · Out of date',
       });
+      for (const [where, text] of Object.entries(withoutReasons))
+        assert.doesNotMatch(String(text), pageWords, `${where}: no reason of the page’s own`);
+    });
+    // Round 9, D. Whether a document is out of date is decided once, and every place that speaks
+    // about it says the same: the server's reasons when it lists them, and none of the page's own.
+    // Each case has a business of its own, so that only its draft is in the Documents source.
+    const OLD_DOC_WORDS = [
+      'made from records that changed',
+      'Source records changed',
+      'have changed since',
+      'Inputs have changed',
+    ];
+    const docBusiness = async (name) => {
+      const id = (
+        await call('/businesses', 'POST', {
+          name,
+          concept: 'Synthetic business for the out-of-date document checks.',
+        })
+      ).id;
+      const doc = await call(`/businesses/${id}/documents`, 'POST', { template: 'business_plan' });
+      return { id, doc };
+    };
+    const showBusiness = async (id, name) => {
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      await onBusiness(id, name);
+    };
+    // a business's records as the server sends them, changed on their way to the page
+    const serveBusiness = (id, change) =>
+      race.route(
+        (url) => url.pathname === `/api/businesses/${id}`,
+        async (route) => {
+          if (route.request().method() !== 'GET') return route.fallback();
+          const response = await route.fetch();
+          const body = await response.json();
+          change(body);
+          await route.fulfill({ response, json: body });
+        },
+      );
+    // Everything the page says about one draft: the Documents source, its row, its inspector, its
+    // full view, Today, and the record that relates to it. Each reason must be visible, and in the
+    // full view above the draft's text. `texts` is the page's text at each of those places.
+    const docPlaces = async (doc, related) => {
+      const texts = [];
+      await raceSource('documents');
+      const docSource = race.locator('#src-nav .src[data-src="documents"]');
+      await docRow(doc.id).click();
+      await race.locator('#insp-title', { hasText: doc.title }).waitFor();
+      await quiet(race);
+      const shown = {
+        sourceGlyph: (await docSource.locator('svg.g-review').count()) > 0,
+        title: await docSource.getAttribute('title'),
+        rowGlyph: (await docRow(doc.id).locator('svg.g-review').count()) > 0,
+        row: await docRow(doc.id).locator('.r-sub').innerText(),
+        inspectorGlyph: (await race.locator('#insp .i-state svg.g-review').count()) > 0,
+        state: await race.locator('#insp .i-state .st').innerText(),
+        renew: await race
+          .locator('#insp')
+          .getByRole('button', { name: 'Generate a new version', exact: true })
+          .count(),
+        flags: await race.locator('#insp .flag').allInnerTexts(),
+        // the page's own bold words; a reason's markup is shown as text
+        bold: await race.locator('#insp .flag b').count(),
+      };
+      assert.equal(await race.locator('#insp .flag img').count(), 0, 'no image from a reason');
+      for (const f of await race.locator('#insp .flag').all())
+        assert(await f.isVisible(), 'each reason in the inspector can be seen');
+      texts.push(await race.locator('#app').innerText());
+      await race.locator('#insp').getByRole('button', { name: 'Read draft', exact: true }).click();
+      await race.locator('#dialog pre.document').waitFor();
+      const viewFlagEls = race.locator('#dialog-content .flag');
+      shown.view = await viewFlagEls.allInnerTexts();
+      assert.equal(await race.locator('#dialog-content .flag :is(img, b)').count(), 0, 'as text');
+      const textBox = await race.locator('#dialog pre.document').boundingBox();
+      for (const f of await viewFlagEls.all()) {
+        assert(await f.isVisible(), 'each reason in the full view can be seen');
+        const box = await f.boundingBox();
+        assert(box.y + box.height <= textBox.y, 'each reason sits above the draft’s text');
+      }
+      texts.push(await race.locator('#dialog').innerText());
+      await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      await raceSource('today');
+      const todayRow = race.locator(`#list .row[data-key="doc:${doc.id}"]`);
+      shown.today = (await todayRow.count())
+        ? await todayRow.first().locator('.r-sub').innerText()
+        : null;
+      texts.push(await race.locator('#list').innerText());
+      if (related) {
+        await raceSource('records');
+        await rowIn(related.title).click();
+        await race.locator('#insp-title', { hasText: related.title }).waitFor();
+        shown.related = await race
+          .locator('#insp .att-row', { hasText: doc.title })
+          .locator('.sub')
+          .innerText();
+        texts.push(await race.locator('#insp').innerText());
+      }
+      // the row and the full view agree on whether the draft is out of date
+      assert.equal(
+        shown.row !== 'Matches the current records',
+        shown.view.length > 0,
+        'the row and the full view agree',
+      );
+      return { shown, texts };
+    };
+    // no place states a reason of the page's own; the server's sentences are its own words
+    const noPageReason = (texts, messages) => {
+      for (let text of texts) {
+        for (const m of messages) text = text.split(m).join('');
+        for (const w of OLD_DOC_WORDS) assert(!text.includes(w), `the page says “${w}”`);
+      }
+    };
+    const docCurrent = {
+      sourceGlyph: false,
+      title: null,
+      rowGlyph: false,
+      row: 'Matches the current records',
+      inspectorGlyph: false,
+      state: 'Draft',
+      renew: 0,
+      flags: [],
+      bold: 0,
+      view: [],
+      today: null,
+      related: 'Document · Draft',
+    };
+    const docWithReasons = (messages) => ({
+      sourceGlyph: true,
+      title: 'Some drafts need review',
+      rowGlyph: true,
+      row: 'Needs review',
+      inspectorGlyph: true,
+      state: 'Needs review',
+      renew: 1,
+      flags: messages,
+      bold: 0,
+      view: messages,
+      today: 'Draft · needs review',
+      related: 'Document · Needs review',
+    });
+    const docNoReason = {
+      sourceGlyph: true,
+      title: 'Some drafts are out of date',
+      rowGlyph: true,
+      row: 'Out of date',
+      inspectorGlyph: true,
+      state: 'Out of date',
+      renew: 1,
+      flags: [
+        'This draft is out of date. This copy stays as it was generated. Generate a new version.',
+      ],
+      bold: 1,
+      view: [DRAFT_CHANGED],
+      today: 'Draft · out of date',
+      related: 'Document · Out of date',
+    };
+    const without = (o, key) => Object.fromEntries(Object.entries(o).filter(([k]) => k !== key));
+    lateCase('round 9 D: a current draft, then a record saved through the page', async () => {
+      const name = 'Browser document checks, real server';
+      const { id, doc } = await docBusiness(name);
+      await showBusiness(id, name);
+      const served = async () => (await snapshotOf(id)).objects.find((o) => o.id === doc.id);
+      const fresh = await served();
+      assert.equal(fresh.stale, false, 'the server says the draft is current');
+      assert.deepEqual(fresh.stale_reasons, [], 'and lists no reason');
+      const current = await docPlaces(doc, null);
+      assert.deepEqual(current.shown, without(docCurrent, 'related'), 'a current draft');
+      noPageReason(current.texts, []);
+      // a record saved through the page makes the draft out of date on the server
+      await raceSource('records');
+      await openRecordForm('Browser record saved after a draft was generated');
+      await inDialog('Save record');
+      await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
+      await quiet(race);
+      const marked = await served();
+      assert.equal(marked.stale, true);
+      assert.deepEqual(
+        marked.stale_reasons.map((r) => [r.code, r.message]),
+        [['source_changed', SOURCE_CHANGED]],
+        'one reason, in the server’s words',
+      );
+      const related = await call(`/businesses/${id}/records`, 'POST', {
+        kind: 'risk',
+        title: 'Browser record related to a draft that is out of date',
+        details: 'Synthetic record related to a draft.',
+        related_ids: [doc.id],
+      });
+      assert.equal((await served()).stale_reasons.length, 1, 'still the one reason');
+      await showBusiness(id, name);
+      const changed = await docPlaces(doc, related);
+      assert.deepEqual(changed.shown, docWithReasons([SOURCE_CHANGED]), 'a draft the server marks');
+      noPageReason(changed.texts, [SOURCE_CHANGED]);
+    });
+    lateCase('round 9 D: every way a draft can be served, the same in every place', async () => {
+      const name = 'Browser document checks, served';
+      const { id, doc } = await docBusiness(name);
+      const related = await call(`/businesses/${id}/records`, 'POST', {
+        kind: 'risk',
+        title: 'Browser record related to a served draft',
+        details: 'Synthetic record related to a draft.',
+        related_ids: [doc.id],
+      });
+      const first = {
+        code: 'source_changed',
+        message: 'Synthetic first reason, from the server.',
+      };
+      const hostile = {
+        code: 'overdue_changed',
+        as_of: '2030-06-01',
+        today: '2030-06-02',
+        message:
+          'Synthetic second reason <img src=x onerror="window.injectedReason=true"> & “quoted” "plain" \'single\' <b>bold</b>',
+      };
+      let serve;
+      await serveBusiness(id, (body) => {
+        for (const d of body.objects.filter((o) => o.kind === 'document')) {
+          delete d.stale;
+          delete d.stale_reasons;
+          Object.assign(d, serve);
+        }
+      });
+      const states = [
+        [
+          'stale with two reasons',
+          { stale: true, stale_reasons: [first, hostile] },
+          docWithReasons([first.message, hostile.message]),
+        ],
+        ['stale with the list missing', { stale: true }, docNoReason],
+        ['stale with an empty list', { stale: true, stale_reasons: [] }, docNoReason],
+        [
+          'stale with a list that is not a list',
+          { stale: true, stale_reasons: 'not a list' },
+          docNoReason,
+        ],
+        ['not stale with an empty list', { stale: false, stale_reasons: [] }, docCurrent],
+        [
+          'not stale with one reason',
+          { stale: false, stale_reasons: [first] },
+          docWithReasons([first.message]),
+        ],
+        [
+          'stale with reasons that cannot be read',
+          {
+            stale: true,
+            stale_reasons: [null, 'a string', 7, { code: 'no_message' }, { message: 5 }],
+          },
+          docNoReason,
+        ],
+        [
+          'stale with one readable reason among unreadable ones',
+          { stale: true, stale_reasons: [null, first, { code: 'no_message' }] },
+          docWithReasons([first.message]),
+        ],
+      ];
+      for (const [what, value, expected] of states) {
+        serve = value;
+        await showBusiness(id, name);
+        const { shown, texts } = await docPlaces(doc, related);
+        assert.deepEqual(shown, expected, what);
+        noPageReason(texts, [first.message, hostile.message]);
+      }
+      assert.equal(
+        await race.evaluate(() => Boolean(window.injectedReason)),
+        false,
+        'no reason ran a script',
+      );
     });
     // Round 8, N2. A view of one item open across a reload of its own business.
     // that a request a hold() is holding reached the server; a page that never sends it fails here,
@@ -2658,7 +2928,11 @@ print(json.dumps({
       });
       assert(scroll[2] && scroll[0] === 120, 'the draft’s text scrolls');
       await reload.release();
-      assert.deepEqual(await viewFlags(), [DRAFT_CHANGED], 'the open view says the draft is stale');
+      assert.deepEqual(
+        await viewFlags(),
+        [SOURCE_CHANGED],
+        'the open view says the draft is stale',
+      );
       assert(await view.evaluate((el) => el.isConnected && $('#dialog').open), 'never closed');
       assert.deepEqual(
         await race.evaluate(() => [$('#dialog pre.document').scrollTop, $('#dialog').scrollTop]),
@@ -2669,16 +2943,13 @@ print(json.dumps({
         await race.locator('#dialog a', { hasText: 'Download Markdown' }).getAttribute('href'),
         `/api/businesses/${bid}/documents/${doc.id}/download`,
       );
-      assert.equal(
-        await docRow(doc.id).locator('.r-sub').innerText(),
-        'Source records changed since this draft',
-      );
+      assert.equal(await docRow(doc.id).locator('.r-sub').innerText(), 'Needs review');
       await view.dispose();
       // opened again, it says the same
       await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
       await race.locator('#insp').getByRole('button', { name: 'Read draft', exact: true }).click();
       await race.locator('#dialog pre.document').waitFor();
-      assert.deepEqual(await viewFlags(), [DRAFT_CHANGED]);
+      assert.deepEqual(await viewFlags(), [SOURCE_CHANGED]);
     });
     lateCase(
       'round 8 N2: an open draft loses its warning when a reload says it matches',
@@ -2686,7 +2957,11 @@ print(json.dumps({
         const doc = await newDraft();
         let stale = true;
         await serveChanged((body) => {
-          body.objects.find((o) => o.id === doc.id).stale = stale;
+          // the save below makes the draft stale on the server; what is served lists no reason
+          Object.assign(
+            body.objects.find((o) => o.id === doc.id),
+            { stale, stale_reasons: [] },
+          );
         });
         await race.reload();
         await race.locator('#list .today-head').waitFor();
@@ -3522,8 +3797,8 @@ print(json.dumps({
       );
     }
     // The record related to the forecast, the deal analysis and the draft document lists all
-    // three, each with the review glyph. Only the document is said to be made from records that
-    // changed since: for the forecast and the deal the server gives other reasons, in their views.
+    // three, each with the review glyph. None is said to be made from records that changed since:
+    // the server gives each one's reasons, in its own view, the document's included.
     const madeFrom = /made from records that changed since/;
     assert.equal(
       marked.objects.find((o) => o.id === relatedTo.doc.id).stale,
@@ -3540,10 +3815,7 @@ print(json.dumps({
       const shown = await attRow(relatedList, o.title, 'Related records');
       assert.equal(shown.glyph, 'review', `a ${what} that needs review has the review glyph`);
       assert.match(shown.sub, / · Needs review/, `the ${what} reads “Needs review”`);
-      if (o.kind === 'document')
-        assert.match(shown.sub, madeFrom, 'the draft document says why it needs review');
-      else
-        assert.doesNotMatch(shown.sub, madeFrom, `the ${what} carries no reason the page made up`);
+      assert.doesNotMatch(shown.sub, madeFrom, `the ${what} carries no reason the page made up`);
     }
     // the deal also appears under "Used by" on the evidence its adjustment cites
     const adjustmentEvidence = marked.objects.find(
@@ -3942,7 +4214,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
