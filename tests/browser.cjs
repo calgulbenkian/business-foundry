@@ -17,6 +17,83 @@ async function freePort() {
   });
 }
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/* FOUNDRY_BROWSER_SLOWDOWN: see where the browser is launched in main(). */
+const slowdown = (() => {
+  const v = process.env.FOUNDRY_BROWSER_SLOWDOWN;
+  if (v === undefined || v === '') return 1;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 1)
+    throw new Error(`FOUNDRY_BROWSER_SLOWDOWN must be a number of 1 or more, not "${v}"`);
+  return n;
+})();
+/* Run in each page before its own script: the page's requests whose answers it has not yet
+   finished with. A request leaves the list once its answer has been read, or its failure
+   reported, and the page's own code that follows has run: that code runs in promise jobs, and
+   every one queued by then runs before a timer can fire. A request that code sends in turn is
+   on the list before the one that caused it leaves. The page itself is not changed. */
+function trackRequests() {
+  const open = [];
+  window.__browserTestRequests = open;
+  const send = window.fetch;
+  window.fetch = (input, init) => {
+    const entry = {
+      path: new URL(String(input), location.href).pathname,
+      method: String(init?.method || 'GET').toUpperCase(),
+    };
+    open.push(entry);
+    const finish = () =>
+      setTimeout(() => {
+        const at = open.indexOf(entry);
+        if (at >= 0) open.splice(at, 1);
+      }, 0);
+    return send(input, init).then(
+      (response) => {
+        const json = response.json;
+        response.json = function () {
+          const read = json.call(this);
+          read.then(finish, finish);
+          return read;
+        };
+        return response;
+      },
+      (error) => {
+        finish();
+        throw error;
+      },
+    );
+  };
+}
+/* The answers each page's hold()s are still holding back, so quiet() does not wait for them. */
+const holding = new WeakMap();
+const heldOn = (page) => {
+  if (!holding.has(page)) holding.set(page, new Set());
+  return holding.get(page);
+};
+/* Resolve once the page has finished with every request it has sent, except those a hold() is
+   still holding back, and has drawn the result: the moment after which anything the page was
+   going to do with an answer has been done. A check that something did not happen waits for
+   this, never for a fixed time. */
+async function quiet(page) {
+  const held = [...heldOn(page)];
+  await page.waitForFunction(
+    (held) =>
+      window.__browserTestRequests.every((r) =>
+        held.some((h) => h.path === r.path && (!h.method || h.method === r.method)),
+      ),
+    held,
+  );
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0))));
+}
+/* Every page the test opens comes from here, so every one is slowed alike. */
+async function newPage(owner, options) {
+  const p = await owner.newPage(options);
+  await p.addInitScript(trackRequests);
+  if (slowdown > 1) {
+    const cdp = await p.context().newCDPSession(p);
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: slowdown });
+  }
+  return p;
+}
 
 /* Start an isolated server on a temporary database. Never the repository's own .foundry/. */
 async function startServer(python, db, logs) {
@@ -68,7 +145,13 @@ const focused = (page) =>
    delivered late. `requested` resolves with that response once the server has answered. With
    `lose`, release() drops the connection instead, as a lost answer does: the server acted, and
    the page never hears what it said. A request the page cancels while it is held never gets
-   its answer; `cancelled()` then says so, and release() lets the held answer go nowhere. */
+   its answer; `cancelled()` then says so, and release() lets the held answer go nowhere.
+   Once released, the route stays in place and passes every later request on untouched, as if
+   it were gone, so a later hold() or dropNext() on the same path acts as it would without it.
+   It is not removed: the page sends its next request as soon as the held answer arrives, and
+   a request the browser starts while a route is being removed can be left unanswered for good.
+   settle() removes every route, just before the page is loaded again. release() resolves once
+   the page has finished with the answer and with anything it sent because of it (quiet()). */
 async function hold(page, path, { method = null, lose = false } = {}) {
   const match = (url) => url.pathname === path;
   const mine = (r) => match(new URL(r.url())) && (!method || r.method() === method);
@@ -82,8 +165,10 @@ async function hold(page, path, { method = null, lose = false } = {}) {
     if (!released && mine(r)) cancelled = true;
   };
   page.on('requestfailed', failed);
+  const entry = { path, method };
+  heldOn(page).add(entry);
   const handler = async (route) => {
-    if (method && route.request().method() !== method) return route.fallback();
+    if (released || (method && route.request().method() !== method)) return route.fallback();
     const response = await route.fetch();
     seen(response);
     await gate;
@@ -105,18 +190,18 @@ async function hold(page, path, { method = null, lose = false } = {}) {
       // a cancelled request has no event left to wait for
       finished.catch(() => {});
       released = true;
+      heldOn(page).delete(entry);
       page.off('requestfailed', failed);
       open();
       await Promise.race([done, finished]);
       if (!cancelled) await finished;
-      await page.unroute(match, handler);
-      // let the page's promise chains run on what arrived
-      await pause(250);
+      await quiet(page);
     },
   };
 }
 /* Fail the next request for a path as a dropped connection does; later ones go through. A
-   dropped command never reaches the server; a dropped read is a reload that fails. */
+   dropped command never reaches the server; a dropped read is a reload that fails. off() stops
+   it dropping anything; like hold(), the route stays in place and passes requests on. */
 async function dropNext(page, path, method = 'GET') {
   const match = (url) => url.pathname === path;
   let used = false,
@@ -130,9 +215,11 @@ async function dropNext(page, path, method = 'GET') {
   };
   await page.route(match, handler);
   return {
-    // resolves once the failure has reached the page and its promise chains have run on it
-    dropped: dropped.then(() => pause(250)),
-    off: () => page.unroute(match, handler),
+    // resolves once the page has finished with the failure and anything it sent because of it
+    dropped: dropped.then(() => quiet(page)),
+    off: () => {
+      used = true;
+    },
   };
 }
 /* Every list on the page, stated by a role or by ul/ol, holds only list items, and every row of
@@ -259,9 +346,13 @@ async function main() {
     const started = await startServer(python, db, logs);
     server = started.server;
     const origin = started.origin;
+    // Headless, always. Set FOUNDRY_BROWSER_SLOWDOWN to a factor (for example 3 or 6) to run
+    // every page this test opens with its processor slowed by that factor, as on a slow CI
+    // runner, so that a check relying on the page being quick fails here too. Unset, or 1,
+    // means no slow-down: `npm run test:browser` and CI run at full speed.
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1440, height: 1050 } }),
-      page = await context.newPage();
+      page = await newPage(context);
     page.on('pageerror', (e) => errors.push(e.message));
     page.on('console', (m) => {
       if (m.type() === 'error' && !m.text().includes('401')) errors.push(m.text());
@@ -888,7 +979,7 @@ async function main() {
 
     // Late responses. A second page on the same sign-in holds chosen responses back, then
     // releases them after the person has moved on, and checks nothing late reaches the screen.
-    const race = await context.newPage();
+    const race = await newPage(context);
     race.on('pageerror', (e) => errors.push(e.message));
     // the connections this page's tests drop on purpose are logged by the browser as failed loads
     race.on('console', (m) => {
@@ -1221,6 +1312,8 @@ async function main() {
     };
     const settle = async () => {
       await race.unrouteAll({ behavior: 'ignoreErrors' });
+      // the page is loaded again, so nothing a case left held is waited on any more
+      heldOn(race).clear();
       await race.setViewportSize({ width: 1440, height: 1050 });
       await race.goto(origin);
       await race.waitForFunction(
@@ -1296,7 +1389,6 @@ async function main() {
       await race.keyboard.press('Escape');
       await signOut();
       await held.release();
-      await pause(300);
       assert(await race.locator('#login').isVisible(), 'the sign-in page is showing');
       assert.equal(await dialogOpen(), false, 'no dialog opens over the sign-in page');
       assert(!(await pageHolds(secret)), 'the key is nowhere in the page or waiting in memory');
@@ -1311,7 +1403,6 @@ async function main() {
       await signOut();
       await signInAgain();
       await held.release();
-      await pause(300);
       assert.equal(await dialogOpen(), false, 'no key dialog in the new session');
       assert(!(await pageHolds(secret)), 'the key is nowhere in the new session');
     });
@@ -1325,7 +1416,6 @@ async function main() {
       await race.locator('.toolbar [data-action="new-business"]').click();
       await race.getByLabel('Business name', { exact: true }).fill('Browser business never made');
       await held.release();
-      await pause(300);
       assert.equal(await dialogTitle(), 'Create a business', 'the key does not replace the form');
       await context.clearCookies();
       await race
@@ -1333,11 +1423,11 @@ async function main() {
         .fill('Synthetic concept refused because the session has ended.');
       await inDialog('Create workspace');
       await race.getByLabel('Access key', { exact: true }).waitFor();
-      await pause(300);
+      await quiet(race);
       assert.equal(await dialogOpen(), false, 'nothing opens over the sign-in page');
       assert(!(await pageHolds(secret)), 'the waiting key left with the session');
       await signInAgain();
-      await pause(300);
+      await quiet(race);
       assert.equal(await dialogOpen(), false, 'the waiting key is not shown in the next session');
       assert(!(await pageHolds(secret)), 'nor kept for it');
     });
@@ -1354,7 +1444,6 @@ async function main() {
         await race.locator('.toolbar [data-action="new-business"]').click();
         await race.getByLabel('Business name', { exact: true }).fill('Browser business kept open');
         await held.release();
-        await pause(300);
         assert.equal(await dialogTitle(), 'Create a business', 'the open form is not replaced');
         assert.equal(
           await race.getByLabel('Business name', { exact: true }).inputValue(),
@@ -1369,7 +1458,7 @@ async function main() {
         assert.equal(await dialogTitle(), 'Save this access key', 'the key stays open');
         assert(await shownKeyIs(secret), 'still the same key');
         await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
-        await pause(300);
+        await quiet(race);
         assert.equal(await dialogOpen(), false, 'the key is shown once');
         assert(!(await pageHolds(secret)), 'a closed key dialog leaves the key nowhere');
       },
@@ -1388,7 +1477,6 @@ async function main() {
         const typed = 'Browser record typed while a key waited';
         await openRecordForm(typed);
         await held.release();
-        await pause(300);
         assert.equal(await dialogTitle(), 'Add business record', 'the key waits for the form');
         await switching.release();
         await showing(demoName);
@@ -1467,7 +1555,6 @@ async function main() {
       const where = await focused(race);
       const drop = await dropNext(race, '/api/businesses');
       await held.release();
-      await pause(300);
       await drop.off();
       assert.equal(await outdated.isVisible(), false, 'this page is not marked out of date');
       assert.equal(await race.evaluate(() => state.behind), false);
@@ -1492,7 +1579,6 @@ async function main() {
       const where = await focused(race);
       const drop = await dropNext(race, '/api/businesses');
       await held.release();
-      await pause(300);
       await drop.off();
       assert.equal(await outdated.isVisible(), false, 'this page is not marked out of date');
       assert.deepEqual(
@@ -1635,7 +1721,7 @@ async function main() {
       ).token;
       const viewer = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
       try {
-        const v = await viewer.newPage();
+        const v = await newPage(viewer);
         v.on('pageerror', (e) => errors.push(e.message));
         await v.goto(origin);
         await v.getByLabel('Access key', { exact: true }).fill(viewerKey);
@@ -1674,10 +1760,12 @@ async function main() {
       await held.requested;
       await race.keyboard.press('Escape');
       await openRecordForm(typed);
-      // the next list of businesses, built by hand, no longer holds the one on screen
+      // the next list of businesses, built by hand, no longer holds the one on screen; once
+      // that has shown, the route passes requests on rather than being removed (see hold())
       const listPath = (url) => url.pathname === '/api/businesses';
+      let leaving = true;
       const without = async (route) => {
-        if (route.request().method() !== 'GET') return route.fallback();
+        if (!leaving || route.request().method() !== 'GET') return route.fallback();
         const response = await route.fetch();
         const json = (await response.json()).filter((x) => x.id !== bid);
         await route.fulfill({ response, json });
@@ -1685,7 +1773,7 @@ async function main() {
       await race.route(listPath, without);
       await held.release();
       await showing(demoName);
-      await race.unroute(listPath, without);
+      leaving = false;
       assert.equal(await dialogOpen(), false, 'the form for the business that left is closed');
       assert.equal(
         await toastText(),
@@ -1804,7 +1892,7 @@ async function main() {
       await context.clearCookies();
       await race.locator('.toolbar [data-action="logout"]').click();
       await race.getByLabel('Access key', { exact: true }).waitFor();
-      await pause(300);
+      await quiet(race);
       assert.equal(
         await race.locator('#toast').isVisible(),
         false,
@@ -1848,7 +1936,7 @@ async function main() {
     const focusAfterClose = async () => {
       await race.waitForFunction(() => !document.querySelector('#dialog').open);
       // the dialog's close event, and anything it shows in turn, runs after close()
-      await pause(150);
+      await quiet(race);
       return focused(race);
     };
     const onKeyControl = (at, what) =>
@@ -1863,14 +1951,6 @@ async function main() {
         ['new-record', true, 'list'],
         `${what}: focus is on the visible control that opens the record form`,
       );
-    // Releasing a held answer removes its route, and the page's reload starts at that moment. A
-    // request the browser sends while its last route is being removed can stall, so the cases
-    // below that wait on such a reload keep one pass-through route until settle() clears it.
-    const keepRouting = () =>
-      race.route(
-        () => true,
-        (route) => route.fallback(),
-      );
     // create a key and wait until the reload after it has drawn the access list again
     const keyShownOverRedrawnList = async (name, phone = false) => {
       if (phone) {
@@ -1882,7 +1962,7 @@ async function main() {
       await inDialog('Create key');
       await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
       await rowIn(name).waitFor();
-      await pause(150);
+      await quiet(race);
     };
     lateCase('round 4 finding 1: Escape on a new key, after the list was redrawn', async () => {
       await onBusiness(bid, testName);
@@ -1899,7 +1979,6 @@ async function main() {
     lateCase('round 4 finding 1: closing “Access key not confirmed”', async () => {
       await onBusiness(bid, testName);
       const name = 'Browser key not confirmed, then closed';
-      await keepRouting();
       await openKeyForm(name);
       const held = await hold(race, '/api/principals', { method: 'POST', lose: true });
       await inDialog('Create key');
@@ -1908,13 +1987,12 @@ async function main() {
       await race.locator('#dialog-title', { hasText: 'Access key not confirmed' }).waitFor();
       // the notice's own reload draws the list again behind it
       await rowIn(name).waitFor();
-      await pause(150);
+      await quiet(race);
       await inDialog('Close');
       onKeyControl(await focusAfterClose(), 'Close');
     });
     lateCase('round 4 finding 1: a key that waited behind a form, then closed', async () => {
       await onBusiness(bid, testName);
-      await keepRouting();
       const held = await holdKey();
       const name = 'Browser key that waited behind a record form';
       await openKeyForm(name);
@@ -1937,7 +2015,6 @@ async function main() {
     const formOverReloadedList = async (title) => {
       await onBusiness(bid, testName);
       await raceSource('records');
-      await keepRouting();
       const held = await hold(race, `/api/businesses/${bid}/records`, { method: 'POST' });
       await openRecordForm('Browser record whose answer arrives later');
       await inDialog('Save record');
@@ -1947,7 +2024,7 @@ async function main() {
       await held.release();
       await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
       await rowIn('Browser record whose answer arrives later').waitFor();
-      await pause(150);
+      await quiet(race);
       assert.equal(await dialogTitle(), 'Add business record', 'the second form is still open');
     };
     lateCase('round 4 finding 1: cancelling a form whose list was reloaded', async () => {
@@ -1984,7 +2061,6 @@ async function main() {
       'round 4 finding 2: a sign-out answer held past a 401 and a new sign-in ends nothing',
       async () => {
         await onBusiness(bid, testName);
-        await keepRouting();
         const held = await hold(race, '/api/logout', { method: 'POST' });
         await race.locator('.toolbar [data-action="logout"]').click();
         // the server has ended the session; the next thing the page asks for is refused
@@ -1997,7 +2073,6 @@ async function main() {
         const signedIn = await session();
         assert(signedIn, 'the new sign-in has a session cookie');
         await held.release();
-        await pause(300);
         // compared, never printed
         assert((await session()) === signedIn, 'the new session keeps its cookie');
         await raceSource('history');
@@ -2028,7 +2103,10 @@ async function main() {
     // the snapshot is altered on its way to the page. The currency code is one Intl rejects.
     await onBusiness(bid, testName);
     const snapPath = `/api/businesses/${bid}`;
+    // once these checks are done, the route passes requests on rather than being removed
+    let altering = true;
     const alter = async (route) => {
+      if (!altering) return route.fallback();
       const response = await route.fetch();
       const body = await response.json();
       const tasks = body.objects.filter((o) => o.kind === 'task' && !o.data.deal_id);
@@ -2070,7 +2148,7 @@ async function main() {
     await raceSource('sales');
     assert.equal(await race.locator('.inj').count(), 0, 'no markup from a currency code');
     assert.match(await race.locator('#list').innerText(), /100\.00 imgclassinjsrcx/);
-    await race.unroute((url) => url.pathname === snapPath, alter);
+    altering = false;
     const fmt = await race.evaluate(() => ({
       out: [
         money('1<img src=x onerror=alert(1)>', 'U<b>"'),
@@ -2149,7 +2227,7 @@ async function main() {
     assert.equal(init.status, 0, init.stderr);
     let emptyOrigin;
     ({ server: emptyServer, origin: emptyOrigin } = await startServer(python, emptyDb, logs));
-    const fresh = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    const fresh = await newPage(browser, { viewport: { width: 1440, height: 1000 } });
     fresh.on('pageerror', (e) => errors.push(e.message));
     await signIn(fresh, emptyOrigin, join(emptyDir, 'owner.key'));
     await fresh.getByRole('heading', { name: 'Start your first business' }).waitFor();
