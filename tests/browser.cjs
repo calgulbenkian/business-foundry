@@ -82,6 +82,66 @@ async function main() {
       await page.locator('#content h1').waitFor();
       assert((await page.locator('#content').innerText()).length > 100);
     }
+    // Backup panel. Only the desktop window's server adds `desktop` to an owner's /api/me, so this route
+    // adds it here. Without the field the panel is exactly what `foundry serve` has always shown.
+    {
+      const panel = page
+        .locator('#content details')
+        .filter({ has: page.locator('summary', { hasText: 'Backup and restore' }) });
+      const settingsPage = async () => {
+        await page.reload();
+        await page.getByRole('heading', { name: 'Make the next decision count.' }).waitFor();
+        await nav('Access & AI');
+        await panel.waitFor({ state: 'attached' });
+      };
+      const served =
+        '<summary>Backup and restore</summary><p class="small">Run <code>uv run foundry backup /private/path/backup.db</code>. Restore into a new database path using <code>uv run foundry --db /private/path/restored.db restore /private/path/backup.db</code>. Backups contain credential hashes and all businesses; protect them.</p>';
+      await settingsPage();
+      assert.equal(await panel.innerHTML(), served);
+      let field;
+      const addField = async (route) => {
+        const response = await route.fetch();
+        await route.fulfill({ response, json: { ...(await response.json()), desktop: field } });
+      };
+      await page.route('**/api/me', addField);
+      const restoreText =
+        'To restore, put the backup in a new folder: uv run foundry --db /private/path/restored/foundry.db restore /private/path/backup.db. Then open that folder in the app: uv run foundry-desktop --data-dir /private/path/restored.';
+      const protectText = 'Backups contain credential hashes and all businesses; protect them.';
+      const shown = async () => (await panel.locator('p').allTextContents()).map((t) => t.trim());
+      const database = '/Users/founder/Library/Application Support/Business Foundry/foundry.db';
+      const command = `uv run foundry --db '${database}' backup /private/path/backup.db`;
+      field = { database, backup_command: command };
+      await settingsPage();
+      assert.deepEqual(await shown(), [
+        `Business Foundry keeps your records in ${database}.`,
+        `To back them up, open a terminal in the folder you start Business Foundry from. Then run ${command}. Change /private/path/backup.db to where you want the backup saved.`,
+        restoreText,
+        protectText,
+      ]);
+      assert.equal(await panel.locator('code').nth(1).textContent(), command);
+      const hostile =
+        '/Users/a&b/"q" \'x\'/<img src=x onerror="window.injectedBackup=true"><b>bold</b>/foundry.db';
+      field = {
+        database: hostile,
+        backup_command: `uv run foundry --db ${hostile} backup &amp; done`,
+      };
+      await settingsPage();
+      assert.equal(await panel.locator('code').nth(0).textContent(), hostile);
+      assert.equal(await panel.locator('code').nth(1).textContent(), field.backup_command);
+      assert.equal(await panel.locator('img, b').count(), 0);
+      field = { database, backup_command: null };
+      await settingsPage();
+      assert.deepEqual(await shown(), [
+        `Business Foundry keeps your records in ${database}.`,
+        'To back them up, open a terminal in the folder you start Business Foundry from. Then run uv run foundry --db DATABASE_PATH backup /private/path/backup.db. Put the path above, quoted for your shell, in place of DATABASE_PATH. Change /private/path/backup.db to where you want the backup saved.',
+        restoreText,
+        protectText,
+      ]);
+      await page.unroute('**/api/me', addField);
+      await settingsPage();
+      assert.equal(await panel.innerHTML(), served);
+      assert.equal(await page.evaluate(() => Boolean(window.injectedBackup)), false);
+    }
     // A jurisdiction change made through the API: the demo's earlier deal analysis and forecast show the
     // server's own sentence, and the page composes none of its own.
     const demo = await page.locator('#business-select').inputValue();

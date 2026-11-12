@@ -2,6 +2,8 @@
 
 The core application is deterministic and works without AI. There are two optional paths, with different account and data-sharing boundaries.
 
+The MCP path needs `foundry serve`: the desktop app picks a new port at every launch, so an MCP adapter has no fixed address to reach. The direct provider review also works in the desktop window, which builds the same adviser, but only when the app inherits the provider settings below, for example when `foundry-desktop` is started from a terminal in which they are exported. An app opened from Finder or the Start menu does not inherit the settings exported in your shell, so for that use `foundry serve`.
+
 ## 1. Compatible AI client through MCP
 
 Run the Foundry server. In **Access & AI**, create a key with the **agent** role and explicitly select its businesses. Alternatively:
