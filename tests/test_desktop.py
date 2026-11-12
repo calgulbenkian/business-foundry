@@ -2222,6 +2222,32 @@ def test_the_second_stage_starts_although_a_stop_is_already_in_progress(monkeypa
     assert exits == [] and clock["now"] == 1025.0
 
 
+@pytest.mark.parametrize(
+    "starts_at, waits",
+    [
+        # 1.5 seconds late: 2.5 of the window's 4 seconds are left, then 21 to the reader's limit.
+        (1001.5, [(1001.5, 2.5), (1004.0, 21.0)]),
+        # 7 seconds late, after the window's time is up: no wait, and the stop starts at once.
+        (1007.0, [(1007.0, 0.0), (1007.0, 18.0)]),
+    ],
+)
+def test_the_windows_time_to_close_is_counted_from_the_signal(monkeypatch, caplog, starts_at, waits):
+    # The signal arrived at 1000.0, but the shutdown thread only gets to work later (for example
+    # because its log call was held). The window's 4 seconds still end at 1004.0, not 4 seconds
+    # after the thread started; a stop that never finishes leaves the exit to the reader at 1025.0.
+    clock = {"now": starts_at}
+    exits = []
+    app = _StoppingApp(clock, stopping=True)
+    shutdown = shutdown_thread(monkeypatch, app, clock, exits)
+    with caplog.at_level("INFO", logger="foundry.desktop"):
+        shutdown._shut_down()
+    assert "The app did not stop within 4 seconds of the signal; stopping now." in caplog.text
+    assert app.stop_called.wait(20)  # the stop runs on a thread of its own
+    assert app.waits == waits
+    assert app.stops == ["foundry-stop"]
+    assert exits == [] and clock["now"] == 1025.0
+
+
 # A signal raised at the moment SignalShutdown installs the handler for it, before the
 # installation has finished. At 81bfbb4 the handlers were installed before the wakeup socket, so a
 # signal in between reached only the no-op Python handler and was lost.
