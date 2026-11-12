@@ -1439,6 +1439,35 @@ async function main() {
       await race.evaluate((id) => go(`journey|step:${id}`), step.id);
       await race.locator('#insp-title', { hasText: step.title }).waitFor();
     };
+    // what a page holds of the last person's records, in the page and in memory; after a sign-out
+    // or a 401 it is blankPage
+    const pageForgotten = (p) =>
+      p.evaluate(() => ({
+        snapshot: state.snapshot,
+        businesses: state.businesses.length,
+        runs: state.runs.length,
+        principals: state.principals,
+        audit: state.audit,
+        actor: state.actor,
+        steps: M.steps.length,
+        html: ['#src-nav', '#src-foot', '#list', '#list-right', '#insp', '#dialog-content'].map(
+          (s) => document.querySelector(s).innerHTML,
+        ),
+        options: document.querySelector('#business-select').options.length,
+        appHidden: document.querySelector('#app').hidden,
+      }));
+    const blankPage = {
+      snapshot: null,
+      businesses: 0,
+      runs: 0,
+      principals: null,
+      audit: null,
+      actor: null,
+      steps: 0,
+      html: ['', '', '', '', '', ''],
+      options: 0,
+      appHidden: true,
+    };
     const late = [];
     const lateCase = (name, run) => late.push([name, run]);
 
@@ -2736,7 +2765,473 @@ print(json.dumps({
       await readDraft(doc);
       assert.deepEqual(await viewFlags(), messages);
     });
-
+    // Round 8. A change of sign-in in another tab of the same browser. Each case opens its own
+    // browser context with two tabs on one session cookie: tab A signed in as the owner, tab B
+    // opened on the same sign-in. The viewer used below sees only the workflow test business, so
+    // the demo business's name is an owner's record that the viewer never sees.
+    let tabsViewer = null;
+    const viewerForTabs = async () =>
+      (tabsViewer ||= await call('/principals', 'POST', {
+        name: 'Browser viewer for other tabs',
+        role: 'viewer',
+        business_ids: [bid],
+      }));
+    const twoTabs = async (run, { bare = false } = {}) => {
+      const viewer = await viewerForTabs();
+      const tabs = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
+      try {
+        const a = await newPage(tabs),
+          b = await newPage(tabs);
+        for (const p of [a, b]) p.on('pageerror', (e) => errors.push(e.message));
+        // a browser without the signal: tab A's page script finds no BroadcastChannel
+        if (bare) await a.addInitScript(() => delete window.BroadcastChannel);
+        const me = { a: 0, b: 0 },
+          refused = [];
+        for (const [name, p] of [
+          ['a', a],
+          ['b', b],
+        ])
+          p.on('request', (r) => {
+            if (new URL(r.url()).pathname === '/api/me') me[name] += 1;
+          });
+        a.on('response', (r) => {
+          if (r.status() === 401)
+            refused.push(`${r.request().method()} ${new URL(r.url()).pathname}`);
+        });
+        await a.goto(origin);
+        await a.getByLabel('Access key', { exact: true }).fill(ownerKey());
+        await a.getByRole('button', { name: 'Open workspace' }).click();
+        await a.locator('#list .today-head').waitFor();
+        await b.goto(origin);
+        await b.locator('#list .today-head').waitFor();
+        await quiet(a);
+        await quiet(b);
+        assert.equal(
+          await a.evaluate(() => typeof BroadcastChannel),
+          bare ? 'undefined' : 'function',
+        );
+        // counted from here: what each tab asks, and what tab A is refused, once both are open
+        Object.assign(me, { a: 0, b: 0 });
+        refused.length = 0;
+        await run({ a, b, me, refused, viewer });
+      } finally {
+        await tabs.close();
+      }
+    };
+    // a wait for what a tab shows once it has been told, which fails by saying what did not happen
+    const told = (shown, what) =>
+      shown.waitFor({ timeout: 10000 * slowdown }).catch(() => {
+        throw new Error(what);
+      });
+    const signOutIn = async (p) => {
+      await p.locator('.toolbar [data-action="logout"]').click();
+      await p.getByLabel('Access key', { exact: true }).waitFor();
+    };
+    const signInAs = async (p, key) => {
+      await p.getByLabel('Access key', { exact: true }).fill(key);
+      await p.getByRole('button', { name: 'Open workspace' }).click();
+      await p.locator('#list .today-head').waitFor();
+    };
+    const keyFormIn = async (p, name) => {
+      await p.locator('#src-nav .src[data-src="access"]').click();
+      await p.getByRole('button', { name: '+ Create access key', exact: true }).click();
+      await p.getByLabel('Person or agent name', { exact: true }).fill(name);
+    };
+    // whether a secret is anywhere in a tab's page, or waiting in its memory to be shown
+    const holdsIn = (p, secret) =>
+      p.evaluate(
+        (s) =>
+          document.documentElement.innerHTML.includes(s) || waiting.some((w) => w.html.includes(s)),
+        secret,
+      );
+    // what a tab holds that only the owner may see: the demo business, by name or id, anywhere in
+    // the page or its memory, the list of access keys, and an owner's controls
+    const ownerTraces = (p) =>
+      p.evaluate(
+        ([name, id]) => ({
+          inPage: document.documentElement.innerHTML.includes(name),
+          inMemory: JSON.stringify([state.businesses, state.snapshot, state.audit]).includes(id),
+          principals: state.principals,
+          newBusiness: !document.querySelector('[data-action="new-business"]').hidden,
+          waiting: waiting.length,
+        }),
+        [demoName, demoBid],
+      );
+    const noOwnerTraces = {
+      inPage: false,
+      inMemory: false,
+      principals: null,
+      newBusiness: false,
+      waiting: 0,
+    };
+    const CHANGED = 'The sign-in changed in another tab, so this page has started again.';
+    lateCase(
+      'round 8 N1: another tab signs out and a viewer signs in while a new key is held',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          const held = await hold(a, '/api/principals', { method: 'POST' });
+          await keyFormIn(a, 'Browser key held while another tab changes the sign-in');
+          await a
+            .locator('#dialog')
+            .getByRole('button', { name: 'Create key', exact: true })
+            .click();
+          const secret = (await (await sent(held, 'the held request')).json()).token;
+          assert(secret, 'the server made the key');
+          await signOutIn(b);
+          // tab A was told: it forgot the owner's session, as a sign-out does in it
+          await told(
+            a.getByLabel('Access key', { exact: true }),
+            'tab A was not told of the sign-out in tab B',
+          );
+          await quiet(a);
+          assert.deepEqual(await pageForgotten(a), blankPage, 'tab A forgot the owner’s session');
+          assert.equal(
+            await a.locator('#login-note').innerText(),
+            `${CHANGED} “Create scoped access” was closed after it was sent; check whether it was saved before entering it again.`,
+          );
+          // a key typed into tab A's sign-in field and never sent
+          await a.getByLabel('Access key', { exact: true }).fill('synthetic-key-typed-never-sent');
+          await signInAs(b, viewer.token);
+          // tab A follows the new sign-in, and holds nothing of the owner's
+          await told(
+            a.locator('#actor-name', { hasText: viewer.name }),
+            'tab A did not follow the sign-in in tab B',
+          );
+          await quiet(a);
+          assert.deepEqual(await ownerTraces(a), noOwnerTraces, 'before the key’s answer');
+          assert.equal(await a.locator('#toast').innerText(), CHANGED);
+          assert.equal(
+            await a.locator('#login-form input').inputValue(),
+            '',
+            'the key typed into tab A and never sent is not kept behind the workspace',
+          );
+          await held.release();
+          assert.equal(await a.locator('#dialog').evaluate((d) => d.open), false, 'no dialog');
+          assert(!(await holdsIn(a, secret)), 'the key is nowhere in tab A');
+          assert.equal(await a.evaluate(() => state.actor.id), viewer.id, 'tab A shows the viewer');
+          assert.deepEqual(await ownerTraces(a), noOwnerTraces, 'after the key’s answer');
+        });
+      },
+    );
+    lateCase('round 8 N1: without the signal, the key check alone keeps the key off', async () => {
+      await twoTabs(
+        async ({ a, b, me, viewer }) => {
+          const held = await hold(a, '/api/principals', { method: 'POST' });
+          await keyFormIn(a, 'Browser key held in a tab that hears nothing');
+          await a
+            .locator('#dialog')
+            .getByRole('button', { name: 'Create key', exact: true })
+            .click();
+          const secret = (await (await sent(held, 'the held request')).json()).token;
+          await signOutIn(b);
+          await signInAs(b, viewer.token);
+          await quiet(a);
+          // tab A was not told; it still shows the owner's records
+          assert.equal(me.a, 0, 'tab A has not asked who is signed in');
+          assert(await a.locator('#app').isVisible());
+          await held.release();
+          await told(
+            a.locator('#actor-name', { hasText: viewer.name }),
+            'the key check did not find that someone else is signed in',
+          );
+          await quiet(a);
+          assert.equal(me.a, 2, 'the key check asked, then the page started again');
+          assert.equal(await a.locator('#dialog').evaluate((d) => d.open), false, 'no dialog');
+          assert(!(await holdsIn(a, secret)), 'the key is nowhere in tab A');
+          assert.deepEqual(await ownerTraces(a), noOwnerTraces, 'the owner’s records are gone');
+          assert.equal(await a.locator('#toast').innerText(), CHANGED);
+        },
+        { bare: true },
+      );
+    });
+    lateCase('round 8 N1: someone else with the same role does not get the key', async () => {
+      const other = await call('/principals', 'POST', {
+        name: 'Browser second owner for other tabs',
+        role: 'owner',
+        business_ids: [bid],
+      });
+      await twoTabs(
+        async ({ a, b }) => {
+          const ownerId = await a.evaluate(() => state.actor.id);
+          assert.notEqual(other.id, ownerId, 'two owners, one role');
+          const held = await hold(a, '/api/principals', { method: 'POST' });
+          await keyFormIn(a, 'Browser key held while another owner signs in');
+          await a
+            .locator('#dialog')
+            .getByRole('button', { name: 'Create key', exact: true })
+            .click();
+          const secret = (await (await sent(held, 'the key creation')).json()).token;
+          await signOutIn(b);
+          await signInAs(b, other.token);
+          await held.release();
+          await told(
+            a.locator('#actor-name', { hasText: other.name }),
+            'the key check did not find that someone else is signed in',
+          );
+          await quiet(a);
+          assert.equal(await a.locator('#dialog').evaluate((d) => d.open), false, 'no dialog');
+          assert(!(await holdsIn(a, secret)), 'the key is nowhere in tab A');
+          assert.equal(await a.evaluate(() => state.actor.id), other.id);
+        },
+        { bare: true },
+      );
+    });
+    lateCase('round 8 N1: another tab signs out and nobody signs in', async () => {
+      await twoTabs(async ({ a, b, refused }) => {
+        const held = await hold(a, '/api/principals', { method: 'POST' });
+        await keyFormIn(a, 'Browser key held while another tab signs out');
+        await a.locator('#dialog').getByRole('button', { name: 'Create key', exact: true }).click();
+        const secret = (await (await sent(held, 'the held request')).json()).token;
+        await signOutIn(b);
+        await told(
+          a.getByLabel('Access key', { exact: true }),
+          'tab A was not told of the sign-out in tab B',
+        );
+        await quiet(a);
+        // the only request of tab A's refused is the question the signal led it to ask
+        assert.deepEqual(refused, ['GET /api/me'], 'tab A learned of it from the signal');
+        assert.deepEqual(await pageForgotten(a), blankPage);
+        await held.release();
+        assert.equal(await a.locator('#dialog').evaluate((d) => d.open), false, 'no dialog');
+        assert(!(await holdsIn(a, secret)), 'the held key was dropped');
+        assert.deepEqual(await pageForgotten(a), blankPage, 'and tab A still holds nothing');
+      });
+    });
+    lateCase(
+      'round 8 N1: a form open when another tab signs out is gone, and said so',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          const typed = 'Browser record typed in a tab another tab signs out';
+          await a.locator('#src-nav .src[data-src="records"]').click();
+          await a.getByRole('button', { name: '+ Add record', exact: true }).click();
+          await a.getByLabel('Title', { exact: true }).fill(typed);
+          await a.getByLabel('Details', { exact: true }).fill('Synthetic details never sent.');
+          await signOutIn(b);
+          await told(
+            a.getByLabel('Access key', { exact: true }),
+            'tab A was not told of the sign-out in tab B',
+          );
+          await quiet(a);
+          assert.equal(
+            await a.locator('#login-note').innerText(),
+            `${CHANGED} “Add business record” was closed without saving.`,
+          );
+          assert.equal(await a.locator('#dialog').evaluate((d) => d.open), false);
+          assert.equal(await a.locator('#dialog-content').innerHTML(), '');
+          assert.equal(
+            await a.evaluate((t) => document.documentElement.innerHTML.includes(t), typed),
+            false,
+            'nothing of the form’s content is left',
+          );
+          assert.equal(await recordsIn(bid, typed), 0, 'and nothing was saved');
+        });
+      },
+    );
+    lateCase(
+      'round 8 N1: one sign-out sends one question to each other tab, and no more',
+      async () => {
+        await twoTabs(async ({ a, b, me }) => {
+          assert.deepEqual(me, { a: 0, b: 0 }, 'counted from here');
+          await signOutIn(b);
+          await told(
+            a.getByLabel('Access key', { exact: true }),
+            'tab A was not told of the sign-out in tab B',
+          );
+          await quiet(a);
+          await quiet(b);
+          assert.deepEqual(me, { a: 1, b: 0 }, 'tab A asked once; tab B did not hear itself');
+          await quiet(a);
+          await quiet(b);
+          assert.deepEqual(me, { a: 1, b: 0 }, 'the count has settled');
+          // and a sign-in: tab B asks as it starts, tab A once when told
+          await signInAs(b, ownerKey());
+          await told(a.locator('#list .today-head'), 'tab A did not follow the sign-in in tab B');
+          await quiet(a);
+          await quiet(b);
+          await quiet(a);
+          assert.deepEqual(me, { a: 2, b: 1 }, 'after the sign-in, still one question each');
+        });
+      },
+    );
+    lateCase(
+      'round 8 N1: a message of any other shape on the channel changes nothing',
+      async () => {
+        await twoTabs(async ({ a, b, me }) => {
+          const before = await a.evaluate(() => [state.loaded, state.actor.id, state.bid]);
+          // a listener of the test's own in tab A, opened after the page's, hears each message after it
+          await a.evaluate(() => {
+            window.__heard = [];
+            new BroadcastChannel('foundry-session').onmessage = (e) => window.__heard.push(e.data);
+          });
+          const shapes = [
+            {},
+            null,
+            7,
+            'sign-in',
+            'SIGN-IN CHANGED',
+            ['sign-in changed'],
+            { signal: 'sign-in changed', token: 'synthetic' },
+          ];
+          await b.evaluate((list) => {
+            const c = new BroadcastChannel('foundry-session');
+            for (const m of list) c.postMessage(m);
+            c.close();
+          }, shapes);
+          await a.waitForFunction((n) => window.__heard.length === n, shapes.length);
+          await quiet(a);
+          await quiet(b);
+          assert.deepEqual(me, { a: 0, b: 0 }, 'no tab asked who is signed in');
+          assert.deepEqual(
+            await a.evaluate(() => [state.loaded, state.actor.id, state.bid]),
+            before,
+          );
+          assert(await a.locator('#app').isVisible());
+          // the same channel, with the page's own word, is heard: the case above was not deaf
+          await b.evaluate(() => {
+            const c = new BroadcastChannel('foundry-session');
+            c.postMessage('sign-in changed');
+            c.close();
+          });
+          await a.waitForFunction((n) => window.__heard.length === n, shapes.length + 1);
+          await a.waitForFunction(() => state.loaded > 0);
+          await quiet(a);
+          assert.equal(me.a, 1, 'the signal itself makes tab A ask again');
+        });
+      },
+    );
+    lateCase('round 8 N1: a session the server ends in one tab ends in the other', async () => {
+      await twoTabs(async ({ a, b, me }) => {
+        const refusedB = [];
+        b.on('response', (r) => {
+          if (r.status() === 401)
+            refusedB.push(`${r.request().method()} ${new URL(r.url()).pathname}`);
+        });
+        await a.context().clearCookies();
+        await a.locator('#src-nav .src[data-src="history"]').click();
+        await a.getByLabel('Access key', { exact: true }).waitFor();
+        await told(
+          b.getByLabel('Access key', { exact: true }),
+          'tab B was not told that the session ended in tab A',
+        );
+        await quiet(a);
+        await quiet(b);
+        assert.deepEqual(refusedB, ['GET /api/me'], 'tab B learned of it from the signal');
+        assert.deepEqual(await pageForgotten(b), blankPage, 'tab B forgot the session');
+        assert.equal(await b.locator('#login-note').innerText(), CHANGED);
+        assert.deepEqual(me, { a: 0, b: 1 }, 'tab A did not hear its own signal');
+      });
+    });
+    lateCase(
+      'round 8 N1: a sign-out held in one tab is cancelled when another signs in',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          const held = await hold(b, '/api/logout', { method: 'POST' });
+          await b.locator('.toolbar [data-action="logout"]').click();
+          // the server has ended the session; a third tab opens on the sign-in page and signs in
+          await sent(held, 'the held request');
+          const c = await newPage(a.context());
+          c.on('pageerror', (e) => errors.push(e.message));
+          await c.goto(origin);
+          await signInAs(c, ownerKey());
+          const session = async () =>
+            (await a.context().cookies(origin)).find((x) => x.name === 'foundry_session')?.value;
+          const signedIn = await session();
+          assert(signedIn, 'the new sign-in has a session cookie');
+          // tab B was told, and shows the new sign-in's workspace
+          await told(b.locator('#list .today-head'), 'tab B was not told of the sign-in in tab C');
+          await held.release();
+          assert(held.cancelled(), 'tab B cancelled its sign-out when it was told');
+          // compared, never printed
+          assert((await session()) === signedIn, 'the new session keeps its cookie');
+          await quiet(c);
+          assert(await c.locator('#app').isVisible(), 'the tab that signed in stays signed in');
+        });
+      },
+    );
+    // R2 on one tab: before a new key is shown, the server is asked who is signed in
+    lateCase('round 8 N1: the same person, nothing changed: the key is shown once', async () => {
+      await onBusiness(bid, testName);
+      const heldMe = await hold(race, '/api/me', { method: 'GET' });
+      const heldKey = await holdKey();
+      await openKeyForm('Browser key shown after the check');
+      await inDialog('Create key');
+      const secret = await keyFrom(heldKey);
+      await heldKey.release();
+      await sent(heldMe, 'the check of who is signed in');
+      await quiet(race);
+      assert.notEqual(await dialogTitle(), 'Save this access key', 'not before the check answers');
+      assert(!(await race.evaluate(() => $('#dialog').open)), 'nothing is open yet');
+      await heldMe.release();
+      await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+      assert(await shownKeyIs(secret), 'the key shown is the one the server made');
+      await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      await quiet(race);
+      assert.equal(await dialogOpen(), false, 'the key is shown once');
+      assert(!(await pageHolds(secret)), 'and left nothing behind');
+    });
+    lateCase(
+      'round 8 N1: a dialog opened during the check: the key waits and is checked again',
+      async () => {
+        await onBusiness(bid, testName);
+        const first = await hold(race, '/api/me', { method: 'GET' });
+        const made = race.waitForResponse(
+          (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/principals',
+        );
+        await openKeyForm('Browser key checked again after a form');
+        await inDialog('Create key');
+        const secret = (await (await made).json()).token;
+        await sent(first, 'the check of who is signed in');
+        await raceSource('records');
+        await openRecordForm('Browser record opened during a key check');
+        await first.release();
+        assert.equal(await dialogTitle(), 'Add business record', 'the key waits for the form');
+        const second = await hold(race, '/api/me', { method: 'GET' });
+        await inDialog('Cancel');
+        await sent(second, 'the second check of who is signed in');
+        await quiet(race);
+        assert.equal(await dialogOpen(), false, 'not shown until it is checked again');
+        await second.release();
+        await race.locator('#dialog-title', { hasText: 'Save this access key' }).waitFor();
+        assert(await shownKeyIs(secret));
+        await race.getByRole('button', { name: 'Close dialog', exact: true }).click();
+      },
+    );
+    lateCase(
+      'round 8 N1: when the check cannot reach the server, a notice waits its turn',
+      async () => {
+        await onBusiness(bid, testName);
+        const name = 'Browser key whose check could not be made';
+        const heldMe = await hold(race, '/api/me', { method: 'GET', lose: true });
+        const made = race.waitForResponse(
+          (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/principals',
+        );
+        await openKeyForm(name);
+        await inDialog('Create key');
+        const secret = (await (await made).json()).token;
+        await sent(heldMe, 'the check of who is signed in');
+        // the key form has closed; another form is opened while the check waits
+        await raceSource('records');
+        const typed = 'Browser record typed while a key check waited';
+        await openRecordForm(typed);
+        await heldMe.release();
+        assert.equal(
+          await dialogTitle(),
+          'Add business record',
+          'the notice does not replace a form',
+        );
+        assert.equal(await race.getByLabel('Title', { exact: true }).inputValue(), typed);
+        assert(!(await pageHolds(secret)), 'the key is not on the page or waiting');
+        await inDialog('Cancel');
+        await race.locator('#dialog-title', { hasText: 'Access key not shown' }).waitFor();
+        assert.equal(
+          await race.locator('#dialog-content p').innerText(),
+          `This page could not confirm who is signed in, so it cannot show the access key “${name}”. The key was created and cannot be shown again. Look at the access keys under Access & assistants, revoke the key named “${name}”, then create a new one.`,
+        );
+        assert(!(await pageHolds(secret)), 'the notice holds no key');
+        assert.equal((await principalsNamed(name)).length, 1, 'the server made the key');
+        await inDialog('Close');
+      },
+    );
     race.setDefaultTimeout(10000);
     const lateFailures = [];
     for (const [name, run] of late) {
@@ -3361,33 +3856,8 @@ print(json.dumps({
     assert.deepEqual(signs, [0, 0, 1, -1, 1, 1, 0, 0, 0, 0, -1, 1]);
 
     // Signing out, and a 401, leave nothing of the last person's records in the page or memory.
-    const forgotten = () =>
-      race.evaluate(() => ({
-        snapshot: state.snapshot,
-        businesses: state.businesses.length,
-        runs: state.runs.length,
-        principals: state.principals,
-        audit: state.audit,
-        actor: state.actor,
-        steps: M.steps.length,
-        html: ['#src-nav', '#src-foot', '#list', '#list-right', '#insp', '#dialog-content'].map(
-          (s) => document.querySelector(s).innerHTML,
-        ),
-        options: document.querySelector('#business-select').options.length,
-        appHidden: document.querySelector('#app').hidden,
-      }));
-    const blank = {
-      snapshot: null,
-      businesses: 0,
-      runs: 0,
-      principals: null,
-      audit: null,
-      actor: null,
-      steps: 0,
-      html: ['', '', '', '', '', ''],
-      options: 0,
-      appHidden: true,
-    };
+    const forgotten = () => pageForgotten(race);
+    const blank = blankPage;
     await raceSource('history');
     await race.locator('#list .grp', { hasText: 'Events' }).waitFor();
     await race.locator('.toolbar [data-action="logout"]').click();

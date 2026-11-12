@@ -3167,7 +3167,9 @@ async function api(path, { interrupted = SAME_KEY, ...options } = {}) {
   }
   const command = Boolean(options.method) && !['GET', 'HEAD'].includes(options.method);
   if (command) headers['Idempotency-Key'] ||= crypto.randomUUID();
-  const session = sessionSeq;
+  // a 401 ends the session only for a request sent while someone was signed in on this page
+  const session = sessionSeq,
+    signedIn = Boolean(state.actor);
   let response;
   try {
     response = await fetch('/api' + path, { ...options, headers, credentials: 'same-origin' });
@@ -3179,7 +3181,8 @@ async function api(path, { interrupted = SAME_KEY, ...options } = {}) {
   }
   const data = await response.json().catch(() => ({ detail: 'Unexpected server response.' }));
   if (!response.ok) {
-    if (response.status === 401 && path !== '/login' && session === sessionSeq) showLogin();
+    if (response.status === 401 && path !== '/login' && session === sessionSeq && signedIn)
+      sessionEnded();
     throw new RequestError(data.detail || 'The request could not be completed.');
   }
   return data;
@@ -3224,6 +3227,7 @@ function forget() {
   for (const cancel of signingOut) cancel.abort();
   signingOut.clear();
   waiting.length = 0;
+  confirming = null;
   dialogAbout = null;
   opener = null;
   clearTimeout(toastTimer);
@@ -3265,6 +3269,45 @@ function showLogin() {
   app.hidden = true;
   $('#login').hidden = false;
   $('#login input[name="token"]').focus();
+}
+/* The server refused a request because the session this page shows has ended. Every tab shares
+   that session, so the others are told before this one shows the sign-in page. */
+function sessionEnded() {
+  tellOtherTabs();
+  showLogin();
+}
+/* What a change of sign-in closes on this page, said without anything from the records: a form
+   is named by its own title, and a step's decision form is not named at all. */
+function formsClosed() {
+  const notes = [];
+  const about = dialogAbout;
+  if ($('#dialog').open && about?.form)
+    notes.push(
+      about.sent
+        ? `“${about.title}” was closed after it was sent; check whether it was saved before entering it again.`
+        : `“${about.title}” was closed without saving.`,
+    );
+  const tx = $('#tx-form');
+  if (tx)
+    notes.push(
+      tx.querySelector('[type=submit]').disabled || state.open?.unsure
+        ? 'A decision form was closed after it was sent; check the step before deciding again.'
+        : 'A decision form was closed without saving.',
+    );
+  return notes;
+}
+/* The sign-in changed in another tab: another tab said so, or the server named someone else
+   before a new access key was shown. What this tab holds belongs to the session before, so it
+   is forgotten as at sign-out, and the page asks the server who is signed in now, as it does
+   when it starts. One sentence says why the page changed; the forms it closed are named. */
+function signInChanged() {
+  const shown = Boolean(state.actor);
+  const told = [
+    'The sign-in changed in another tab, so this page has started again.',
+    ...formsClosed(),
+  ].join(' ');
+  forget();
+  start({ told, shown });
 }
 /* Load the businesses and the records of the one asked for, then show them. Returns false, and
    changes nothing, when a newer refresh or a sign-out has started meanwhile; its errors are then
@@ -3529,17 +3572,43 @@ function returnFocus(memo) {
   const same = !memo?.same ? [] : memo.region ? [`#${memo.region} ${memo.same}`] : [memo.same];
   focusFirst([...same, ...RESTING_FOCUS, '#back-list', '#back-src']);
 }
-/* Show a dialog that arrived late, without replacing one the person has open. */
-function showWhenFree(session, title, html, about = null) {
+/* Show a dialog that arrived late, without replacing one the person has open. `confirm`, if
+   given, is asked when the dialog's turn comes, just before it would be shown: it resolves true
+   to show it, false to drop it, or with another dialog to show in its place. */
+function showWhenFree(session, title, html, about = null, confirm = null) {
   if (session !== sessionSeq) return;
-  waiting.push({ session, title, html, about });
+  waiting.push({ session, title, html, about, confirm });
   showWaiting();
 }
+/* The check of a waiting dialog that is under way; nothing else waiting is shown meanwhile. */
+let confirming = null;
 function showWaiting() {
-  if ($('#dialog').open) return;
+  if ($('#dialog').open || confirming) return;
   while (waiting.length) {
     const next = waiting.shift();
     if (next.session !== sessionSeq) continue;
+    if (next.confirm) {
+      const mine = (confirming = {});
+      // a check that fails in this page shows nothing
+      Promise.resolve()
+        .then(next.confirm)
+        .catch(() => false)
+        .then((outcome) => {
+          // the session ended meanwhile, and the queue with it
+          if (confirming !== mine) return;
+          confirming = null;
+          if (outcome === true) {
+            if (!$('#dialog').open) {
+              showDialog(next.title, next.html, next.about);
+              return;
+            }
+            // a dialog opened during the check: this one waits again, and is checked again
+            waiting.unshift(next);
+          } else if (outcome) waiting.unshift(outcome);
+          showWaiting();
+        });
+      return;
+    }
     showDialog(next.title, next.html, next.about);
     return;
   }
@@ -4143,8 +4212,10 @@ function keyDialog() {
         true,
       ),
     async (f) => {
-      // captured before the request: a key that arrives after this session ended is dropped
-      const session = sessionSeq;
+      // captured before the request: a key that arrives after this session ended is dropped,
+      // and one is shown only while the server still names the person who asked for it
+      const session = sessionSeq,
+        asker = state.actor?.id;
       name = f.get('name');
       const key = await api('/principals', {
         method: 'POST',
@@ -4152,13 +4223,16 @@ function keyDialog() {
       });
       // Shown once, in this session only, and never over a dialog the person has open: it waits
       // for that dialog (this form included) to close. A change of business does not close it.
-      // A key for a session that has ended is not put anywhere.
+      // A key for a session that has ended is not put anywhere. When its turn comes, the server
+      // is asked who is signed in, and the key is shown only if that is still the person who
+      // asked for it.
       if (session === sessionSeq)
         showWhenFree(
           session,
           'Save this access key',
           `<p>The server stores only a hash. Copy this key into a password manager or your client’s secret settings; it will not be shown again.</p><pre>${h(key.token)}</pre><p class="fine">${h(key.name)} · ${h(label(key.role))}. Never put the key in GitHub, a screenshot or a shared document.</p>`,
           { secret: true },
+          () => stillSignedIn(session, asker, name),
         );
       // the secret is not kept anywhere else
       return { id: key.id, name: key.name };
@@ -4185,6 +4259,34 @@ function keyDialog() {
       },
     },
   );
+}
+/* Just before a new access key is shown: is the person signed in still the one who asked for it?
+   The server is asked, and its answer must name the same principal id, in the same session of
+   this page. Resolves true to show the key. Anyone else: the key is dropped, and this tab starts
+   again as when another tab changes the sign-in. A 401: the session has ended (api() shows the
+   sign-in page), and the key goes with it. No answer: the key is not shown, and a notice says
+   so in its place. The server names a person, not a session: the same person signed out and in
+   again elsewhere passes this check. */
+async function stillSignedIn(session, id, name) {
+  let me;
+  try {
+    me = await api('/me');
+  } catch {
+    if (session !== sessionSeq) return false;
+    const text = `This page could not confirm who is signed in, so it cannot show the access key “${name}”. The key was created and cannot be shown again. Look at the access keys under Access & assistants, revoke the key named “${name}”, then create a new one.`;
+    return {
+      session,
+      title: 'Access key not shown',
+      html: `<p>${h(text)}</p><div class="form-actions">${btn('Close', 'data-action="close-dialog"', true)}</div>`,
+      about: null,
+    };
+  }
+  if (session !== sessionSeq) return false;
+  if (!id || me?.id !== id) {
+    signInChanged();
+    return false;
+  }
+  return true;
 }
 function aiDialog() {
   formDialog(
@@ -4329,8 +4431,9 @@ async function handle(a, el) {
     } finally {
       signingOut.delete(cancel);
     }
-    // an answer for a session that has already ended (a 401 meanwhile) ends nothing newer
-    if (session === sessionSeq) showLogin();
+    // an answer for a session that has already ended (a 401 meanwhile) ends nothing newer;
+    // the other tabs are told before the sign-in page, and so before any new sign-in, is shown
+    if (session === sessionSeq) sessionEnded();
   } else if (a === 'new-business') businessDialog();
   else if (a === 'edit-business') businessDialog(true);
   else if (a === 'new-record') recordDialog();
@@ -4461,6 +4564,7 @@ $('#login-form').addEventListener('submit', async (event) => {
     b = form.querySelector('button');
   b.disabled = true;
   $('#login-error').textContent = '';
+  $('#login-note').textContent = '';
   try {
     await api('/login', {
       method: 'POST',
@@ -4468,6 +4572,8 @@ $('#login-form').addEventListener('submit', async (event) => {
       // a second sign-in only opens another session
       interrupted: 'Connection interrupted. Signing in again is safe.',
     });
+    // the session cookie every tab shares now names this person
+    tellOtherTabs();
     form.reset();
     await start();
   } catch (e) {
@@ -4476,15 +4582,58 @@ $('#login-form').addEventListener('submit', async (event) => {
     b.disabled = false;
   }
 });
-async function start() {
+/* Ask the server who is signed in, and show their workspace or the sign-in page. Only the latest
+   start, in the session it began in, changes anything. After a change of sign-in in another tab,
+   `told` says so: over the workspace, or on the sign-in page when this tab showed a workspace. */
+async function start({ told = '', shown = false } = {}) {
+  const session = sessionSeq;
   try {
-    state.actor = await api('/me');
+    const actor = await api('/me');
+    if (session !== sessionSeq) return;
+    state.actor = actor;
+    // a key typed on the sign-in page and never sent does not stay behind the workspace
+    $('#login-form').reset();
+    $('#login-error').textContent = '';
+    $('#login-note').textContent = '';
     $('#login').hidden = true;
     app.hidden = false;
-    await refresh();
+    if ((await refresh()) && told && session === sessionSeq) toast(told);
   } catch (e) {
+    if (session !== sessionSeq) return;
     showLogin();
     if (e.message !== 'Sign in with a valid access key.') $('#login-error').textContent = e.message;
+    if (told && shown) $('#login-note').textContent = told;
   }
 }
+
+/* ---------------- other tabs ---------------- */
+/* Every tab of this page in one browser shares one session cookie, so signing in or out in one
+   tab, or a session the server ends, changes who is signed in for all of them. The tab where it
+   happens tells the others with this signal: when its sign-in is accepted, when its sign-out is
+   answered, and when the server refuses a request because its session has ended. The signal
+   carries nothing: no key, token, name, record or business id, only a fixed word asking the
+   other tabs to check again. A tab that receives it forgets the previous session and asks the
+   server who is signed in (signInChanged); receiving it can show or grant nothing, and a message
+   of any other shape is ignored. A channel never delivers a tab its own message, and a tab that
+   is told sends nothing in turn, so tabs cannot set each other off. Where BroadcastChannel is
+   missing nothing is sent or received, and the check before a new access key is shown
+   (stillSignedIn) still keeps the key from anyone else. */
+const SIGNAL = 'sign-in changed';
+const otherTabs = (() => {
+  try {
+    return typeof BroadcastChannel === 'function' ? new BroadcastChannel('foundry-session') : null;
+  } catch {
+    return null;
+  }
+})();
+function tellOtherTabs() {
+  try {
+    otherTabs?.postMessage(SIGNAL);
+  } catch {
+    // a channel that fails tells no one; the key check still stands
+  }
+}
+otherTabs?.addEventListener('message', (event) => {
+  if (event.data === SIGNAL) signInChanged();
+});
 start();
