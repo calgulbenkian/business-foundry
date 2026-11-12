@@ -22,7 +22,8 @@ def not_foundry_database(source: Path) -> str:
 def backup_database(source: Path, destination: Path) -> int:
     """Copy the Foundry database at ``source`` to the new file ``destination``.
 
-    The source is opened read-only and never created or changed. A source that is a folder, is
+    The source database file is opened read-only and never created or changed; SQLite may add its
+    own ``-wal`` and ``-shm`` working files beside a source in WAL mode. A source that is a folder, is
     not an SQLite database, or has no Foundry tables is refused, and the destination file is
     removed. Returns the number of businesses in the finished copy, counted from the copy.
     """

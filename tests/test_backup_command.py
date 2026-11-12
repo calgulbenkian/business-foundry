@@ -146,6 +146,30 @@ def test_a_source_that_is_not_a_foundry_database_is_refused_and_left_as_it_was(t
     assert not restored.exists()
 
 
+def test_a_wal_mode_database_that_is_not_foundrys_is_refused_and_only_sqlite_adds_files(tmp_path, capsys):
+    # Opening a database in WAL mode to read it makes SQLite add its own -wal and -shm files
+    # beside it (measured on SQLite 3.50.4 and 3.53.1). Foundry adds nothing, and the database
+    # file itself is not changed.
+    source = tmp_path / "source" / "foundry.db"
+    source.parent.mkdir()
+    con = sqlite3.connect(source)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE notes(body TEXT)")
+    con.execute("INSERT INTO notes VALUES ('Synthetic note.')")
+    con.commit()
+    con.close()  # closed cleanly: SQLite removes its -wal and -shm files
+    assert tree(tmp_path) == ["source", "source/foundry.db"]
+    before = source.read_bytes()
+
+    destination = tmp_path / "out" / "new" / "backup.db"
+    assert refused(capsys, "--db", str(source), "backup", str(destination)) == (
+        1,
+        f"Foundry: {real(source)} is not a Foundry database.\n",
+    )
+    assert tree(tmp_path) == ["source", "source/foundry.db", "source/foundry.db-shm", "source/foundry.db-wal"]
+    assert source.read_bytes() == before
+
+
 # R3: the success line -----------------------------------------------------------------------
 
 
@@ -186,6 +210,95 @@ def test_the_count_is_read_from_the_finished_backup_not_from_the_source(tmp_path
     )
     assert names_in(destination) == ["Added before the copy", "Synthetic business 1"]
     assert len(names_in(source)) == 3
+
+
+class _Patched:
+    """A module with some attributes replaced; every other attribute is the real module's."""
+
+    def __init__(self, real, **replaced):
+        self._real, self._replaced = real, replaced
+
+    def __getattr__(self, name):
+        return self._replaced[name] if name in self._replaced else getattr(self._real, name)
+
+
+def test_backup_database_counts_the_businesses_in_the_copy_it_made(tmp_path, capsys, monkeypatch):
+    # The source loses a business through another connection just before the copy is made, and
+    # another just after. The copy holds one: the source held two before the copy and none after.
+    source = tmp_path / "source" / "foundry.db"
+    database(source, 2)
+
+    def remove_one():
+        other = sqlite3.connect(source)
+        try:
+            other.execute("DELETE FROM businesses WHERE rowid = (SELECT MIN(rowid) FROM businesses)")
+            other.commit()
+        finally:
+            other.close()
+
+    class Busy(sqlite3.Connection):
+        def backup(self, target, *args, **kwargs):
+            remove_one()
+            try:
+                return super().backup(target, *args, **kwargs)
+            finally:
+                remove_one()
+
+    def connect(*args, **kwargs):
+        return sqlite3.connect(*args, factory=Busy, **kwargs)
+
+    monkeypatch.setattr(cli, "sqlite3", _Patched(sqlite3, connect=connect))
+    destination = tmp_path / "out" / "backup.db"
+    cli.main(["--db", str(source), "backup", str(destination)])
+    assert capsys.readouterr().out == (
+        f"Saved {real(destination)}: a copy of {real(source)} holding 1 business.{PRIVATE}\n"
+    )
+    assert names_in(destination) == ["Synthetic business 2"]
+    assert names_in(source) == []
+
+
+def test_the_success_line_names_resolved_paths_for_relative_arguments(tmp_path, capsys, monkeypatch):
+    database(tmp_path / "work" / "foundry.db", 1)
+    monkeypatch.chdir(tmp_path)  # never the repository folder
+    cli.main(["--db", "work/foundry.db", "backup", "out/a.db"])
+    assert capsys.readouterr().out == (
+        f"Saved {real(tmp_path)}/out/a.db: a copy of {real(tmp_path)}/work/foundry.db "
+        f"holding 1 business.{PRIVATE}\n"
+    )
+    assert names_in(tmp_path / "out" / "a.db") == ["Synthetic business 1"]
+
+
+def test_restore_names_a_relative_source_that_is_not_foundrys_by_its_resolved_path(
+    tmp_path, capsys, monkeypatch
+):
+    other_sqlite(tmp_path / "plain.db")
+    before = (tmp_path / "plain.db").read_bytes()
+    monkeypatch.chdir(tmp_path)  # never the repository folder
+    assert refused(capsys, "--db", "new/foundry.db", "restore", "plain.db") == (
+        1,
+        f"Foundry: {real(tmp_path)}/plain.db is not a Foundry database.\n",
+    )
+    assert (tmp_path / "plain.db").read_bytes() == before
+    assert not (tmp_path / "new" / "foundry.db").exists()
+
+
+def test_a_database_with_foundrys_metadata_but_no_businesses_table_is_refused(tmp_path, capsys):
+    folder = tmp_path / "source"
+    folder.mkdir()
+    source = folder / "foundry.db"
+    con = sqlite3.connect(source)
+    con.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+    con.commit()
+    con.close()
+    before = source.read_bytes()
+    destination = tmp_path / "out" / "backup.db"
+    assert refused(capsys, "--db", str(source), "backup", str(destination)) == (
+        1,
+        f"Foundry: {real(source)} is not a Foundry database.\n",
+    )
+    assert source.read_bytes() == before and os.listdir(folder) == ["foundry.db"]
+    assert not destination.exists() and not (tmp_path / "out").exists()
 
 
 # R4: a database in use, and one left by a stopped server ------------------------------------
