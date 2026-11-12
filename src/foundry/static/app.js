@@ -197,9 +197,14 @@ const KNOWN_COLOUR = {
   Acquisition: 'b',
 };
 const FINISHED = new Set(['verified', 'not_applicable']);
+/* A step of a planning guide that no longer applies. When the planning jurisdiction changes, the
+   server keeps the old guide's steps as history in this state, and nothing leads out of it. Such
+   a step is on no line and in no list of steps, and nothing the page counts includes it. */
+const replaced = (o) => o?.kind === 'task' && o.state === 'superseded';
 
 function buildModel(snapshot) {
-  const tasks = (snapshot?.objects || []).filter((o) => o.kind === 'task');
+  // the server's counts in `stats` cover live steps only, and so does every count made from this
+  const tasks = (snapshot?.objects || []).filter((o) => o.kind === 'task' && !replaced(o));
   const lines = [];
   const byKey = new Map();
   for (const t of tasks) {
@@ -281,7 +286,13 @@ const STATES = {
   not_applicable: { g: 'na', label: 'Not applicable', key: 'reviewed and ruled out' },
   needs_review: { g: 'review', label: 'Needs review', key: 'what it relied on changed' },
 };
-const stateOf = (t) => STATES[t.state] || { g: 'none', label: label(t.state), key: '' };
+/* A replaced step is history, not one of the states above: it has no place on the map or in its
+   key, and it is drawn with the neutral dash. */
+const REPLACED = { g: 'none', label: 'Replaced', key: 'kept as history' };
+const stateOf = (t) =>
+  t.state === 'superseded'
+    ? REPLACED
+    : STATES[t.state] || { g: 'none', label: label(t.state), key: '' };
 const ALLOWED = {
   pending: ['in_progress', 'prepared', 'not_applicable'],
   in_progress: ['prepared', 'not_applicable', 'needs_review'],
@@ -450,7 +461,7 @@ const dash =
   '<svg class="g g-off" viewBox="0 0 10 10" width="10" height="10" aria-hidden="true" focusable="false"><path d="M2 5h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
 const ymIcon =
   '<svg class="ym" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true" focusable="false"><rect x="0" y="1" width="12" height="7" fill="currentColor"/><path d="M4 8h4l-2 3Z" fill="currentColor"/></svg>';
-const taskGlyph = (t) => g(stateOf(t).g);
+const taskGlyph = (t) => (t.state === 'superseded' ? dash : g(stateOf(t).g));
 const bul = (l, sm) =>
   `<span class="bul${sm ? ' sm' : ''} lc-${l.k}" aria-hidden="true">${h(l.code)}</span>`;
 const ICON = {
@@ -1130,7 +1141,7 @@ function evInfo(o) {
 }
 const evRow = (o) => {
   const info = evInfo(o);
-  const uses = usedBy(o.id).length;
+  const uses = usedBy(o.id).filter((x) => !replaced(x)).length;
   return row({
     key: 'ev:' + o.id,
     glyph: info.glyph,
@@ -1613,7 +1624,8 @@ function ensureSelection() {
    show it, as long as the record still exists. */
 function selectionExists(key) {
   const [kind, id] = splitKey(key);
-  if (['step', 'jr'].includes(kind)) return M.byId.has(id);
+  if (['step', 'jr'].includes(kind))
+    return M.byId.has(id) || (kind === 'step' && replaced(find(id)));
   if (['ev', 'rec', 'plan', 'deal', 'doc', 'inv', 'pay'].includes(kind)) return Boolean(find(id));
   if (kind === 'money') return Boolean(state.snapshot);
   return false;
@@ -1742,6 +1754,9 @@ function renderInspector() {
       const s = M.byId.get(id);
       out = inspStep(s);
       crumbText = `${s.line.name} › ${s.n} ${s.task.title}`;
+    } else if (kind === 'step' && replaced(find(id))) {
+      out = inspReplaced(find(id));
+      crumbText = `Replaced step › ${find(id).title}`;
     } else if (kind === 'jr' || kind === 'map') {
       const s = kind === 'jr' ? M.byId.get(id) : null;
       out = inspJourney(s);
@@ -1978,8 +1993,11 @@ function inspStep(s) {
   const kicker = `${bul(l, true)}<span>Step ${h(s.n)} of ${M.steps.length} · ${h(l.name)} · ${ext ? 'outside body' : 'internal review'}</span>`;
   const accepted = state.accepted[t.id];
   const open = state.open?.kind === 'tx' && state.open.id === t.id ? txForm(t) : '';
-  const deps = (t.data.depends_on || []).map(find).filter(Boolean);
-  const needed = objs('task').filter((x) => (x.data.depends_on || []).includes(t.id));
+  // linked steps are live steps only; a replaced prerequisite blocks nothing (the server agrees)
+  const deps = (t.data.depends_on || []).map(find).filter((x) => x && !replaced(x));
+  const needed = objs('task').filter(
+    (x) => !replaced(x) && (x.data.depends_on || []).includes(t.id),
+  );
   const evidence = (t.data.evidence_ids || []).map(
     (id) =>
       find(id) || {
@@ -1991,7 +2009,6 @@ function inspStep(s) {
       },
   );
   const advice = adviceFor(t.id);
-  const hist = taskHistory(t).slice().reverse();
   return (
     head({
       kicker,
@@ -2041,17 +2058,58 @@ function inspStep(s) {
         )
       : '') +
     advice +
+    historySec(t)
+  );
+}
+/* Every decision recorded on a step, newest first. */
+function historySec(t) {
+  const hist = taskHistory(t).slice().reverse();
+  return sec(
+    'History',
+    hist.length
+      ? `<div class="att">${hist
+          .map(
+            (e) =>
+              `<div class="att-row">${taskGlyph({ state: e.to })}<span class="an">${h(stateOf({ state: e.from }).label)} → ${h(stateOf({ state: e.to }).label)}<span class="sub">${h(dateTime(e.at))} · ${h(who(e.actor_id))}${e.note ? ' · ' + h(e.note) : ''}</span></span><span></span></div>`,
+          )
+          .join('')}</div>`
+      : '<p class="fine">No decisions recorded yet.</p>',
+  );
+}
+/* A step replaced when the planning jurisdiction changed, reached by a link from a record that
+   cites it. It is read-only: it says what happened, shows what it was and its history, and offers
+   no decision, because the server allows none. */
+function inspReplaced(t) {
+  const change = taskHistory(t).findLast((e) => e && e.to === 'superseded');
+  const from = change?.jurisdiction_from,
+    to = change?.jurisdiction_to;
+  const evidence = (t.data.evidence_ids || []).map(find).filter(Boolean);
+  return (
+    head({
+      kicker: 'Step from an earlier planning guide',
+      title: h(t.title),
+      glyph: dash,
+      stateLabel: REPLACED.label,
+      next: change?.at ? `on ${h(dFull(change.at))}` : '',
+      extra: flag(
+        `<b>This step was replaced when the planning jurisdiction changed${from && to ? ` from ${h(from)} to ${h(to)}` : ''}.</b> It belongs to the earlier planning guide and is kept as history. It is on no line, it is not counted, and no decision can be recorded on it.`,
+        true,
+      ),
+    }) +
     sec(
-      'History',
-      hist.length
-        ? `<div class="att">${hist
-            .map(
-              (e) =>
-                `<div class="att-row">${g(STATES[e.to]?.g || 'none')}<span class="an">${h(STATES[e.from]?.label || label(e.from))} → ${h(STATES[e.to]?.label || label(e.to))}<span class="sub">${h(dateTime(e.at))} · ${h(who(e.actor_id))}${e.note ? ' · ' + h(e.note) : ''}</span></span><span></span></div>`,
-            )
-            .join('')}</div>`
-        : '<p class="fine">No decisions recorded yet.</p>',
-    )
+      'What this was',
+      props([
+        ['What it was', h(t.data.description || '—')],
+        t.data.source_uri
+          ? [
+              'Planning guide',
+              `${webLink(t.data.source_uri)}<span class="sub">Guide ${h(t.data.pack_version || '—')}. Planning guidance, not a compliance certificate.</span>`,
+            ]
+          : null,
+      ]),
+    ) +
+    sec('Evidence it cites', attList(evidence), `<span class="h-note">${evidence.length}</span>`) +
+    historySec(t)
   );
 }
 function adviceFor(id) {
@@ -2163,7 +2221,9 @@ function inspEvidence(o) {
       '<b>Not yet reviewed.</b> A person must review it before it can support an approval, submission or verification.',
       true,
     );
-  const used = usedBy(o.id);
+  const cited = usedBy(o.id),
+    used = cited.filter((x) => !replaced(x)),
+    history = cited.filter(replaced);
   return (
     head({
       kicker: 'Evidence',
@@ -2199,6 +2259,13 @@ function inspEvidence(o) {
       `<pre class="original">${h(d.content)}</pre><p class="fine">Stored as received. Business Foundry never edits an original; a correction is new evidence. Fingerprint <code>${h(d.content_sha256)}</code></p>`,
     ) +
     sec('Used by', attList(used), `<span class="h-note">${used.length}</span>`) +
+    (history.length
+      ? sec(
+          'Cited by replaced steps',
+          attList(history),
+          `<span class="h-note">${history.length}</span>`,
+        )
+      : '') +
     sec(
       'Versions',
       `<div data-versions="${h(o.id)}"><p class="fine">Loading the recorded versions…</p></div>`,
