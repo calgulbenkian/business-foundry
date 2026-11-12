@@ -140,8 +140,11 @@ async function newPage(owner, options) {
 async function startServer(python, db, logs) {
   const port = await freePort(),
     origin = `http://127.0.0.1:${port}`;
+  // The server's stdout carries only uvicorn's access log, a line for every request. Nothing here
+  // reads it, and a pipe nobody reads fills up and stops the server at its next write, so it is
+  // not a pipe at all. Its stderr, the server's own messages, is read as it arrives.
   const server = spawn(python, ['-m', 'foundry.cli', '--db', db, 'serve', '--port', String(port)], {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'ignore', 'pipe'],
   });
   server.stderr.on('data', (d) => logs.push(d.toString()));
   for (let i = 0; i < 100; i++) {
@@ -152,10 +155,36 @@ async function startServer(python, db, logs) {
   }
   return { server, origin };
 }
+/* Wait for a promise for at most `ms`; resolves true if it settled in time, fulfilled or not.
+   Its timer is cleared either way, so it never keeps this process alive. */
+async function within(promise, ms) {
+  let timer;
+  const late = new Promise((r) => (timer = setTimeout(() => r(false), ms)));
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      late,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+/* End a server for certain: SIGTERM, up to 3 seconds for it to leave, then SIGKILL and up to 5
+   more for its exit. A server that has already left is not an error. Returns only once the
+   process is gone; throws if it is somehow still there after the SIGKILL. */
 async function stopServer(server) {
   if (!server) return;
+  const gone = () => server.exitCode !== null || server.signalCode !== null;
+  if (gone()) return;
+  const exited = new Promise((r) => server.once('exit', r));
   server.kill('SIGTERM');
-  await Promise.race([new Promise((r) => server.once('exit', r)), pause(3000)]);
+  if ((await within(exited, 3000)) || gone()) return;
+  server.kill('SIGKILL');
+  if ((await within(exited, 5000)) || gone()) return;
+  throw new Error(`the server (pid ${server.pid}) did not end after SIGKILL`);
 }
 async function signIn(page, origin, keyFile) {
   await page.goto(origin);
@@ -3234,15 +3263,29 @@ print(json.dumps({
     );
     race.setDefaultTimeout(10000);
     const lateFailures = [];
+    // A failure while the page is loaded again for a case names that case, and lists what the
+    // cases before it had already recorded, which would otherwise never be printed.
+    const settleFor = async (next) => {
+      try {
+        await settle();
+      } catch (error) {
+        const before = lateFailures.length
+          ? `Failures recorded before it:\n${lateFailures.join('\n')}`
+          : 'No failure was recorded before it.';
+        throw new Error(`Loading the page again ${next} failed: ${error.message}\n${before}`, {
+          cause: error,
+        });
+      }
+    };
     for (const [name, run] of late) {
-      await settle();
+      await settleFor(`for the case “${name}”`);
       try {
         await run();
       } catch (error) {
         lateFailures.push(`${name}: ${String(error.message).split('\n')[0]}`);
       }
     }
-    await settle();
+    await settleFor('after the last case');
     race.setDefaultTimeout(30000);
     assert.deepEqual(lateFailures, [], 'late answers act only on their own session and business');
 
@@ -3905,13 +3948,34 @@ print(json.dumps({
     console.error(logs.slice(-8).join(''));
     throw error;
   } finally {
-    if (browser) await browser.close();
-    await stopServer(server);
-    await stopServer(emptyServer);
-    rmSync(temp, { recursive: true, force: true });
+    // Every wait here is bounded: 10 seconds for the browser, and 8 for each server.
+    if (browser && !(await within(browser.close(), 10000)))
+      console.error(
+        'The browser did not close within 10 seconds; it is ended when this test exits.',
+      );
+    try {
+      await stopServer(server);
+    } finally {
+      try {
+        await stopServer(emptyServer);
+      } finally {
+        rmSync(temp, { recursive: true, force: true });
+      }
+    }
   }
 }
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+/* The test ends once main() has, passing or failing, after what it printed has been written.
+   Playwright kills a browser it launched when this process exits, so no browser is left. */
+function end(code) {
+  let left = 2;
+  const done = () => --left || process.exit(code);
+  process.stdout.write('', done);
+  process.stderr.write('', done);
+}
+main().then(
+  () => end(0),
+  (error) => {
+    console.error(error);
+    end(1);
+  },
+);
