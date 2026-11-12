@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import collections.abc
 import contextlib
 import ctypes
 import hmac
@@ -275,17 +276,44 @@ _START_QUERY = re.compile(r"(/desktop/start\?(?:[^\s#?]*&)?)code=[A-Za-z0-9_-]*"
 _PLAIN = logging.Formatter()
 
 
-class LogRedaction(logging.Filter):
-    """Keeps every launch code and the window's session token out of every log record.
+class _RedactedArgument:
+    """Stands in for a log argument that held a secret: it prints the argument's redacted text."""
 
-    It is installed as the process's log record factory, so it sees each record from any
-    logger, at whatever level a library has set, as the record is made and before any handler
-    or formatter, including handlers a library adds for itself (pywebview writes to stderr).
-    Each secret is added before it exists outside this module. If a secret, or a start address,
-    is in a record's message, its arguments (it formats them once to check), the text of a logged
-    exception or a stack, that part is replaced by the redacted text. As second layers it is also
-    a filter on the handlers present when logging is set up and when the window library loads,
-    and the log file's formatter redacts each finished line.
+    __slots__ = ("_str", "_repr")
+
+    def __init__(self, text: str, representation: str):
+        self._str, self._repr = text, representation
+
+    def __str__(self):
+        return self._str
+
+    def __repr__(self):
+        return self._repr
+
+
+class LogRedaction(logging.Filter):
+    """Keeps every launch code and the window's session token out of log records.
+
+    It is installed as the process's log record factory, so it sees each record made through
+    the logging module's usual calls (``Logger.debug`` to ``Logger.critical``, ``Logger.log``,
+    ``Logger.exception`` and the module-level functions), from any logger, at whatever level a
+    library has set, as the record is made and before any handler or formatter, including
+    handlers a library adds for itself (pywebview writes to stderr). Each secret is added before
+    it exists outside this module.
+
+    Each argument is checked before the message is formatted, so that a format which shortens it
+    (``%.20s``) cannot leave part of a secret behind: an argument whose ``str()`` or ``repr()``
+    holds a whole secret, or a start address, is replaced by its redacted text. Then a whole
+    secret, or a start address, in the formatted message, the text of a logged exception or a
+    stack is replaced. A start address's ``code=`` parameter is replaced even when it holds only
+    part of a code; any other piece of a secret is not recognised. A record that cannot be
+    checked is withheld.
+
+    As second layers it is also a filter on the handlers present when logging is set up and when
+    the window library loads, and the log file's formatter redacts each finished line. Those
+    layers also check a record built another way, which the factory does not check:
+    ``logging.makeLogRecord`` fills a record in after the factory has made it, and ``LogRecord``
+    called directly does not use the factory. A handler added later does not check it.
     """
 
     def __init__(self):
@@ -295,7 +323,7 @@ class LogRedaction(logging.Filter):
         self._installed = False
 
     def protect(self, secret: str):
-        """Remove ``secret`` from every log record from now on."""
+        """Remove ``secret`` from log records from now on, as far as the class docstring says."""
         self.install()
         with self._lock:
             if secret and secret not in self._secrets:
@@ -319,8 +347,43 @@ class LogRedaction(logging.Filter):
             text = text.replace(secret, REDACTED)
         return text
 
+    def _holds_secret(self, value) -> bool:
+        return any(self.redact(text) != text for text in (str(value), repr(value)))
+
+    def _checked(self, value):
+        """``value`` itself when it holds no secret, otherwise a stand-in for its redacted text."""
+        text, representation = str(value), repr(value)
+        clean, clean_representation = self.redact(text), self.redact(representation)
+        if clean == text and clean_representation == representation:
+            return value
+        return _RedactedArgument(clean, clean_representation)
+
+    def _checked_args(self, args):
+        """The arguments with each one that holds a secret replaced; None when none does."""
+        if isinstance(args, tuple):
+            checked = tuple(self._checked(value) for value in args)
+            changed = any(new is not old for new, old in zip(checked, args, strict=True))
+        elif isinstance(args, collections.abc.Mapping):
+            # A key is printed by ``"%s" % mapping``, but one that holds a secret cannot be
+            # replaced without breaking the lookup, so the record is withheld.
+            if any(self._holds_secret(key) for key in args):
+                raise ValueError("a mapping key holds a secret")
+            checked = {key: self._checked(value) for key, value in args.items()}
+            # ``"%s" % mapping`` prints the mapping's own text, which a mapping type may write
+            # its own way; the plain dict printed in its place holds the checked values.
+            changed = any(checked[key] is not args[key] for key in args) or self._holds_secret(args)
+        else:
+            checked = self._checked(args)
+            changed = checked is not args
+        return checked if changed else None
+
     def scrub(self, record: logging.LogRecord) -> logging.LogRecord:
         try:
+            # Before formatting: a precision or width in the format can shorten an argument, and
+            # a shortened secret would not be found in the formatted message.
+            checked = self._checked_args(record.args) if record.args else None
+            if checked is not None:
+                record.args = checked
             try:
                 message = record.getMessage()
                 clean = self.redact(message)
@@ -328,7 +391,7 @@ class LogRedaction(logging.Filter):
                 # Arguments that do not fit the message would otherwise be printed raw, with the
                 # logging error, to stderr.
                 message, clean = None, self.redact(f"{record.msg} {record.args!r}")
-            if clean != message:
+            if checked is not None or clean != message:
                 record.msg, record.args = clean, None
             if record.exc_info:
                 text = _PLAIN.formatException(record.exc_info)

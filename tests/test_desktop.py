@@ -6,6 +6,7 @@ imported by one test only, which is skipped when the desktop extra is not instal
 
 import contextlib
 import importlib.util
+import io
 import logging
 import os
 import signal
@@ -221,6 +222,14 @@ def test_the_real_linux_mount_table_gives_a_type_for_the_root_and_the_temp_folde
     mounts = os.fsdecode(Path("/proc/self/mounts").read_bytes())
     assert desktop._linux_filesystem(Path("/"), mounts) != ""
     assert desktop._linux_filesystem(tmp_path.resolve(), mounts) != ""
+
+
+def test_security_md_names_every_network_filesystem_the_linux_check_refuses():
+    text = (Path(__file__).parents[1] / "SECURITY.md").read_text()
+    bullet = next(line for line in text.splitlines() if line.startswith("- **Data location.**"))
+    linux = bullet.split("On Linux", 1)[1]
+    missing = sorted(name for name in desktop.NETWORK_FILESYSTEMS if f"`{name}`" not in linux)
+    assert not missing
 
 
 def test_a_network_data_dir_is_refused_before_anything_is_created(tmp_path, monkeypatch):
@@ -1053,6 +1062,169 @@ def test_no_logger_at_any_level_writes_a_launch_code(tmp_path, capfd, isolated_l
     assert "Arguments that do not fit" in written and "Logging error" not in err
 
 
+# Fixed synthetic secrets, so that "no part of it" can be checked exactly. They are not codes the
+# app ever issued.
+SYNTHETIC_CODE = "4xJTwA8-0ZEyaqiy1Xi60baeetlN5QA68tkMCG6y7NY"
+SYNTHETIC_TOKEN = "nGo1eX7venMoo-OkO0KuCTTX-d1Ew9GFVD0QRneR4fXSRXosp3nThQ"
+
+
+def leaked_part(secret, text, run=4):
+    """The first run of ``run`` consecutive characters of ``secret`` found in ``text``, or None."""
+    return next(
+        (secret[i : i + run] for i in range(len(secret) - run + 1) if secret[i : i + run] in text), None
+    )
+
+
+@pytest.fixture
+def synthetic_secrets(monkeypatch):
+    """A launch code and a session token protected through the app's own calls.
+
+    The code is protected by ``LaunchSignIn.issue`` and the token by ``LaunchSignIn.redeem``,
+    with ``secrets.token_urlsafe`` returning the fixed synthetic values.
+    """
+    real = desktop.secrets.token_urlsafe
+    fixed = {32: SYNTHETIC_CODE, 40: SYNTHETIC_TOKEN}
+    monkeypatch.setattr(desktop.secrets, "token_urlsafe", lambda n=None: fixed.get(n) or real(n))
+    return SYNTHETIC_CODE, SYNTHETIC_TOKEN
+
+
+class ThreePlaces:
+    """desktop.log, a handler present when the guard ran, and one added afterwards to a child."""
+
+    def __init__(self, data):
+        self.data = data
+        self.library = logging.getLogger("synthetic.round5.library")
+        self.guarded_stream, self.late_stream = io.StringIO(), io.StringIO()
+        self.guarded = logging.StreamHandler(self.guarded_stream)
+        self.library.addHandler(self.guarded)
+        self.library.setLevel(logging.DEBUG)
+        desktop.configure_logging(data)
+        self.child = logging.getLogger("synthetic.round5.library.child")
+        self.late = logging.StreamHandler(self.late_stream)
+        self.child.addHandler(self.late)
+
+    def texts(self):
+        for handler in (self.guarded, self.late):
+            handler.flush()
+        return {
+            "desktop.log": (self.data / "desktop.log").read_text(),
+            "guarded handler": self.guarded_stream.getvalue(),
+            "late handler": self.late_stream.getvalue(),
+        }
+
+    def close(self):
+        self.library.removeHandler(self.guarded)
+        self.child.removeHandler(self.late)
+
+
+@pytest.fixture
+def three_places(tmp_path, isolated_logging):
+    places = ThreePlaces(desktop.prepare_data_dir(tmp_path / "data"))
+    try:
+        yield places
+    finally:
+        places.close()
+
+
+def signed_in_secrets(data):
+    store = Store(data / "foundry.db")
+    store.bootstrap()
+    signin = LaunchSignIn(store, "127.0.0.1:9")
+    code = signin.issue().rsplit("=", 1)[1]
+    token = signin.redeem(code)
+    return code, token
+
+
+def test_a_format_that_shortens_an_argument_prints_no_part_of_a_secret(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    assert (code, token) == synthetic_secrets  # protected by issue() and by redeem()
+    for secret in (code, token):
+        three_places.child.warning("precision %.40s", secret)
+        three_places.child.warning("%.40r", ("x", secret))
+        three_places.child.warning("%-20.20s|", secret)
+        three_places.child.warning("%(a).40s", {"a": secret})
+    for where, text in three_places.texts().items():
+        for secret in (code, token):
+            assert leaked_part(secret, text) is None, where
+        # The records were written, with the redacted text in place of each argument.
+        assert text.count("precision [redacted]") == 2, where
+        assert text.count("('x', '[redacted]')") == 2, where
+        assert text.count("[redacted]          |") == 2, where
+
+
+def test_records_built_outside_the_usual_calls_reach_no_guarded_place(three_places, synthetic_secrets):
+    code, token = signed_in_secrets(three_places.data)
+    for secret in (code, token):
+        for fields in (
+            {"msg": f"in the message {secret}"},
+            {"msg": "in the arguments %.40s", "args": (secret,)},
+        ):
+            record = logging.makeLogRecord(
+                {
+                    "name": three_places.library.name,
+                    "levelno": logging.WARNING,
+                    "levelname": "WARNING",
+                    **fields,
+                }
+            )
+            three_places.library.handle(record)
+    texts = three_places.texts()
+    for where in ("desktop.log", "guarded handler"):
+        for secret in (code, token):
+            assert leaked_part(secret, texts[where]) is None, where
+        assert texts[where].count("in the message [redacted]") == 2, where
+        assert texts[where].count("in the arguments [redacted]") == 2, where
+
+
+def test_ordinary_arguments_are_formatted_exactly_as_without_the_redaction(three_places, synthetic_secrets):
+    signed_in_secrets(three_places.data)
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    keep = Keep()
+    three_places.child.addHandler(keep)
+    try:
+        ratio, name = 2.0 / 3.0, types.SimpleNamespace(label="synthetic")
+        args = (7, ratio, name)
+        three_places.child.warning("%d items, %.2f ratio, %s name", *args)
+    finally:
+        three_places.child.removeHandler(keep)
+    expected = "%d items, %.2f ratio, %s name" % args  # noqa: UP031 (the way logging formats)
+    assert [record.getMessage() for record in records] == [expected]
+    assert all(new is old for new, old in zip(records[0].args, args, strict=True))  # the same objects
+    for where, text in three_places.texts().items():
+        assert expected in text, where
+
+
+def test_an_argument_that_cannot_be_turned_into_text_is_withheld_without_raising(
+    three_places, synthetic_secrets
+):
+    code, _ = signed_in_secrets(three_places.data)
+
+    class BadRepr:
+        def __str__(self):
+            return code
+
+        def __repr__(self):
+            raise RuntimeError("no repr")
+
+    class BadStr:
+        def __str__(self):
+            raise RuntimeError("no str")
+
+        def __repr__(self):
+            return code
+
+    three_places.child.warning("shortened str %.20s", BadRepr())  # does not raise
+    three_places.child.warning("shortened repr %.20r", BadStr())
+    for where, text in three_places.texts().items():
+        assert leaked_part(code, text) is None, where
+        assert text.count("(a log record withheld: it could not be checked for secrets)") == 2, where
+
+
 PYWEBVIEW_CHILD = textwrap.dedent("""\
     import sys
     from pathlib import Path
@@ -1358,6 +1530,53 @@ def test_sigterm_before_the_window_opens_skips_the_window(tmp_path):
     assert code == 0 and "WINDOW OPENED" not in out and "MAIN RETURNED" in out
     assert assert_cleaned_up(data) == 0
     assert "Stopping before the window opened." in read_log(data)
+
+
+class _Exited(Exception):
+    pass
+
+
+class _Patched:
+    """A module with some attributes replaced; every other attribute is the real module's."""
+
+    def __init__(self, real, **replaced):
+        self._real, self._replaced = real, replaced
+
+    def __getattr__(self, name):
+        return self._replaced[name] if name in self._replaced else getattr(self._real, name)
+
+
+def test_the_signal_watcher_ends_the_process_exactly_at_the_limit(monkeypatch):
+    # A controlled clock, so the deadline itself is checked and no wall-clock margin is needed.
+    # Sleeps may return early (each advances the clock by at most 7 seconds); the process must
+    # still end when the clock reads the signal's time plus SIGNAL_EXIT_SECONDS, not earlier and
+    # not later.
+    clock = {"now": 1000.0}
+    exits = []
+
+    def sleep(seconds):
+        assert seconds > 0
+        clock["now"] += min(seconds, 7.0)
+
+    def exit_now(status):
+        exits.append((clock["now"], status))
+        raise _Exited
+
+    monkeypatch.setattr(desktop, "time", _Patched(time, monotonic=lambda: clock["now"], sleep=sleep))
+    monkeypatch.setattr(desktop, "os", _Patched(os, _exit=exit_now))
+    watcher = object.__new__(desktop.SignalShutdown)
+    watcher._reader, writer = socket.socketpair()
+    try:
+        watcher.signals = [signal.SIGTERM]
+        watcher.received, watcher._go = threading.Event(), threading.Event()
+        writer.send(bytes([signal.SIGTERM]))
+        with pytest.raises(_Exited):
+            watcher._watch()
+    finally:
+        watcher._reader.close()
+        writer.close()
+    assert exits == [(1000.0 + desktop.SIGNAL_EXIT_SECONDS, 128 + signal.SIGTERM)]
+    assert watcher.received.is_set() and watcher._exit_at == 1000.0 + desktop.SIGNAL_EXIT_SECONDS
 
 
 # A signal raised at the moment SignalShutdown installs the handler for it, before the
