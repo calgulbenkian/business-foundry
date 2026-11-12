@@ -54,10 +54,11 @@ SESSION_DAYS = 30
 SERVER_START_SECONDS = 15
 SHUTDOWN_SECONDS = 10
 # After a termination signal the app ends its own process SIGNAL_EXIT_SECONDS after it read the
-# signal at the latest, whatever the window, the server or the database are doing (if the process
-# is not being run at that moment, as soon as it runs again). The window first has
-# SIGNAL_CLOSE_SECONDS to close the normal way; if it has not, the app runs the same cleanup
-# itself in the time that remains.
+# signal at the latest, whatever the window, the server or the database are doing. Time the
+# computer spends asleep does not count towards it (SignalShutdown says why); if the process is
+# paused, or the computer is too busy to run it, when the time is up, it ends as soon as it runs
+# again. The window first has SIGNAL_CLOSE_SECONDS to close the normal way; if it has not, the
+# app runs the same cleanup itself in the time that remains.
 SIGNAL_EXIT_SECONDS = 30
 SIGNAL_CLOSE_SECONDS = 10
 
@@ -1025,9 +1026,11 @@ class SignalShutdown:
     - The reader takes the time the moment it reads the signal and, from then on, only sleeps:
       SIGNAL_EXIT_SECONDS later it ends the process with ``os._exit``. It takes no lock and
       writes no log, so nothing the window, the server, the database or the log does can hold
-      it, and it ends the process then even if ``main`` never returns. It can do so only while
-      the process is being run: if it is paused, or the computer is asleep or busy, at that
-      moment, the process ends as soon as it runs again.
+      it, and it ends the process then even if ``main`` never returns. The time is counted on
+      ``time.monotonic()``, which does not advance while the computer is asleep, so time asleep
+      does not count towards the limit. The reader can end the process only while the process
+      is being run: if it is paused, or the computer is too busy to run it, when the limit is
+      up, the process ends as soon as it runs again.
     - The shutdown thread closes the window, from a thread of its own (pywebview's ``destroy``
       can wait for the GUI for a long time). That runs the same shutdown as the close button.
       If the app has not finished stopping SIGNAL_CLOSE_SECONDS after the signal, it starts
