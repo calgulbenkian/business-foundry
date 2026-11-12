@@ -1051,7 +1051,10 @@ function renderSources() {
       }
       if (s.id === 'records')
         n = String(objs().filter((o) => RECORD_KINDS.includes(o.kind)).length);
-      if (s.id === 'money') n = String(objs('financial_plan').length);
+      if (s.id === 'money') {
+        const p = objs('financial_plan');
+        n = (p.some((x) => x.stale) ? g('review') : '') + p.length;
+      }
       if (s.id === 'deals') {
         const d = objs('deal');
         n = (d.some((x) => x.stale) ? g('review') : '') + d.length;
@@ -1303,11 +1306,11 @@ function renderList() {
       for (const p of plans.slice().reverse())
         out += row({
           key: 'plan:' + p.id,
-          glyph: p === plans.at(-1) ? tick : dash,
+          glyph: p.stale ? g('review') : p === plans.at(-1) ? tick : dash,
           title: h(p.title),
           right: h(dDay(p.created_at)),
           sub: h(
-            `${p.data.inputs.months} months · ${p.data.scenarios.base.summary.statements_balance ? 'statements balance' : 'balance check failed'}${p === plans.at(-1) ? ' · latest' : ''}`,
+            `${p.data.inputs.months} months · ${p.data.scenarios.base.summary.statements_balance ? 'statements balance' : 'balance check failed'}${p === plans.at(-1) ? ' · latest' : ''}${p.stale ? ' · needs review' : ''}`,
           ),
         });
     }
@@ -1321,11 +1324,8 @@ function renderList() {
         glyph: d.stale ? g('review') : tick,
         title: h(d.title),
         right: d.stale ? 'Needs review' : 'Screening',
-        sub: h(
-          d.stale
-            ? 'Supporting evidence changed since this analysis'
-            : `Normalized EBITDA ${money(d.data.analysis.normalized_ebitda)}`,
-        ),
+        // why it needs review is the server's to say, in the analysis itself
+        sub: h(`Normalized EBITDA ${money(d.data.analysis.normalized_ebitda)}`),
       });
     if (!deals.length)
       out += `<p class="empty">Screen a target with explicit assumptions. Unsupported add-backs are excluded; reviewed evidence is still a human assessment, not an audit.</p>`;
@@ -1530,11 +1530,13 @@ function moneyRows(today) {
     out += grp(today ? 'Money' : 'Latest model · base case', '', CALC_NOTE);
     out += row({
       key: 'money:ending',
-      glyph: dash,
+      glyph: p.stale ? g('review') : dash,
       title: 'Ending cash',
       right: money(sum.ending_cash),
       fig: true,
-      sub: h(`${p.title} · month ${p.data.inputs.months}, base case`),
+      sub: h(
+        `${p.title} · month ${p.data.inputs.months}, base case${p.stale ? ' · needs review' : ''}`,
+      ),
     });
     out += row({
       key: 'money:needed',
@@ -1579,7 +1581,16 @@ function changedRows() {
         key: 'deal:' + d.id,
         glyph: g('review'),
         title: h(d.title),
-        sub: 'Acquisition analysis · supporting evidence changed',
+        sub: 'Acquisition analysis · needs review',
+      }),
+    );
+  for (const p of objs('financial_plan').filter((x) => x.stale))
+    out.push(
+      row({
+        key: 'plan:' + p.id,
+        glyph: g('review'),
+        title: h(p.title),
+        sub: 'Forecast · needs review',
       }),
     );
   for (const o of [...objs('invoice'), ...objs('payment')].filter((x) => x.evidence_warning))
@@ -1668,6 +1679,10 @@ function webLink(uri) {
 const goAttr = (src, key) => `data-go="${h(src)}|${h(key)}"`;
 const flag = (body, neutral = false) =>
   `<div class="flag${neutral ? ' neutral' : ''}">${neutral ? '<span></span>' : g('review')}<div>${body}</div></div>`;
+/* Why a saved deal analysis or forecast needs review, in the server's own words, one flag for
+   each reason: evidence it relied on changed, the planning jurisdiction changed, or both. The
+   page writes no reason of its own; where a row has no room for these, it says "needs review". */
+const staleFlags = (o) => (o.stale_reasons || []).map((r) => flag(h(r.message))).join('');
 function goFor(o) {
   if (o.kind === 'task') {
     const s = M.byId.get(o.id);
@@ -1710,6 +1725,7 @@ function objGlyph(o) {
   if (o.kind === 'task') return taskGlyph(o);
   if (o.kind === 'evidence') return evInfo(o).glyph;
   if (o.kind === 'document' || o.kind === 'deal') return o.stale ? g('review') : tick;
+  if (o.kind === 'financial_plan') return o.stale ? g('review') : dash;
   if (o.kind === 'invoice') return o.evidence_warning ? g('review') : invoiceGlyph(o.state);
   if (o.kind === 'payment') return o.evidence_warning ? g('review') : tick;
   if (RECORD_KINDS.includes(o.kind)) return certaintyGlyph(o.state);
@@ -1718,7 +1734,11 @@ function objGlyph(o) {
 function objState(o) {
   if (o.kind === 'task') return stateOf(o).label;
   if (o.kind === 'evidence') return evInfo(o).label;
-  if (o.stale) return 'Needs review — made from records that changed since';
+  // a deal analysis or forecast can need review for more than one reason; its own view says which
+  if (o.stale)
+    return o.kind === 'document'
+      ? 'Needs review — made from records that changed since'
+      : 'Needs review';
   if (o.evidence_warning) return `${label(o.state)} · its evidence needs review`;
   return label(o.state);
 }
@@ -2461,7 +2481,7 @@ function inspMoney() {
     const cases = ['base', 'downside', 'upside'].filter((c) => p.data.scenarios[c]);
     out += sec(
       'Latest model',
-      `<div class="tbl-wrap"><table><thead><tr><th>Figure</th>${cases.map((c) => `<th class="num">${label(c)}</th>`).join('')}</tr></thead><tbody>
+      `${staleFlags(p)}<div class="tbl-wrap"><table><thead><tr><th>Figure</th>${cases.map((c) => `<th class="num">${label(c)}</th>`).join('')}</tr></thead><tbody>
         <tr><td>Ending cash</td>${cases.map((c) => `<td class="num">${money(p.data.scenarios[c].summary.ending_cash)}</td>`).join('')}</tr>
         <tr><td>Additional cash needed</td>${cases.map((c) => `<td class="num">${money(p.data.scenarios[c].summary.additional_cash_needed)}</td>`).join('')}</tr>
         <tr><td>Lowest cash</td>${cases.map((c) => `<td class="num">${money(p.data.scenarios[c].summary.minimum_cash)}</td>`).join('')}</tr>
@@ -2485,6 +2505,7 @@ function inspPlan(p) {
   let out = head({
     kicker: `Money · financial model${latest ? ' · latest' : ' · earlier version'}`,
     title: h(p.title),
+    extra: staleFlags(p),
     stateLabel: sum.statements_balance ? 'Statements balance' : 'Balance check failed',
     next: `saved ${h(dFull(p.created_at))}`,
     actions: ['base', 'downside', 'upside']
@@ -2541,11 +2562,7 @@ function inspDeal(o) {
         ? btn('Create investment memo', `data-action="investment-memo" data-id="${h(o.id)}"`)
         : '') +
       (canWrite() ? btn('Revise assumptions', `data-action="new-deal" data-id="${h(o.id)}"`) : ''),
-    extra: o.stale
-      ? flag(
-          '<b>Supporting evidence changed since this analysis.</b> Create a new analysis before relying on its adjustments.',
-        )
-      : '',
+    extra: staleFlags(o),
   });
   out += `<p class="prose spaced">${h(o.data.inputs.thesis)}</p>`;
   out += sec(
