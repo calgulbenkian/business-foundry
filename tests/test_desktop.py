@@ -350,6 +350,33 @@ def test_a_code_is_accepted_just_inside_its_time_limit(tmp_path):
         assert client.get(path, follow_redirects=False).status_code == 303
 
 
+def test_without_a_clock_the_time_limit_is_counted_on_the_monotonic_clock(tmp_path, monkeypatch):
+    # SECURITY.md's sentence about time asleep rests on the default clock being time.monotonic().
+    # Both clocks are the test's, far apart, and moved differently: only the monotonic one decides.
+    clocks = {"monotonic": 1000.0, "wall": 5_000_000.0}
+    monkeypatch.setattr(
+        desktop, "time", _Patched(time, monotonic=lambda: clocks["monotonic"], time=lambda: clocks["wall"])
+    )
+    store = Store(tmp_path / "foundry.db")
+    store.bootstrap()
+    on_time = LaunchSignIn(store, "testserver")
+    late = LaunchSignIn(store, "testserver")
+    assert on_time.lifetime == 180
+    on_time_path = on_time.issue().removeprefix(on_time.origin)
+    late_path = late.issue().removeprefix(late.origin)
+    # Exactly 180 seconds on the monotonic clock, a day on the wall clock: accepted.
+    clocks["monotonic"], clocks["wall"] = 1180.0, 5_086_400.0
+    with TestClient(create_app(store.path, allowed_hosts=["testserver"], desktop=on_time)) as client:
+        response = client.get(on_time_path, follow_redirects=False)  # a failure shows no code
+        assert response.status_code == 303
+    # Just over 180 seconds on the monotonic clock, none on the wall clock: refused.
+    clocks["monotonic"], clocks["wall"] = 1180.5, 5_000_000.0
+    with TestClient(create_app(store.path, allowed_hosts=["testserver"], desktop=late)) as client:
+        response = client.get(late_path, follow_redirects=False)
+        assert response.status_code == 403
+        assert session_cookie(response) == []
+
+
 def test_nothing_is_accepted_before_a_code_is_issued_and_none_after_sign_in(tmp_path):
     store = Store(tmp_path / "foundry.db")
     store.bootstrap()
