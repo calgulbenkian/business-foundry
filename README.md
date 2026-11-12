@@ -34,7 +34,7 @@ uv sync --locked --extra desktop
 uv run foundry-desktop
 ```
 
-This opens the same interface in a native window and signs you in automatically: there is no key to paste. Records are kept in your per-user application data folder (`~/Library/Application Support/Business Foundry` on macOS, `%LOCALAPPDATA%\Business Foundry` on Windows), not in the folder you launched from. The command-line tools can use that database with `--db`. Windows needs the Microsoft Edge WebView2 Runtime. Only one copy of the app can be open at a time. If you choose **Sign out** inside the window, the sign-in screen appears; quit and reopen the app to sign in again. There is no installer, code signing or automatic update yet, and the app has been run on macOS only, not yet on Windows. See [security](SECURITY.md#desktop-app) for how the window signs in.
+This opens the same interface in a native window and signs you in automatically: there is no key to paste. Records are kept in your per-user application data folder (`~/Library/Application Support/Business Foundry` on macOS, `%LOCALAPPDATA%\Business Foundry` on Windows, `~/.local/share/Business Foundry` on Linux unless `XDG_DATA_HOME` names another folder), not in the folder you launched from. The command-line tools can use that database with `--db`. Windows needs the Microsoft Edge WebView2 Runtime. Only one copy of the app can be open at a time. If you choose **Sign out** inside the window, the sign-in screen appears; quit and reopen the app to sign in again. There is no installer, code signing or automatic update yet, and the app has been run on macOS only, not yet on Windows. See [security](SECURITY.md#desktop-app) for how the window signs in.
 
 ## What works
 

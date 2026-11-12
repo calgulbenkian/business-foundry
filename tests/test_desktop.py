@@ -214,6 +214,15 @@ def test_the_linux_check_reads_the_mount_table_as_bytes(tmp_path, monkeypatch):
     assert desktop.is_network_path(tmp_path / "data", platform="linux") is True
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="reads the kernel's own mount table")
+def test_the_real_linux_mount_table_gives_a_type_for_the_root_and_the_temp_folder(tmp_path):
+    # Read the way is_network_path reads it. Only that a type is found is checked: a developer's
+    # temp folder may be on any filesystem, so which type, or whether it is local, is not.
+    mounts = os.fsdecode(Path("/proc/self/mounts").read_bytes())
+    assert desktop._linux_filesystem(Path("/"), mounts) != ""
+    assert desktop._linux_filesystem(tmp_path.resolve(), mounts) != ""
+
+
 def test_a_network_data_dir_is_refused_before_anything_is_created(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop, "is_network_path", lambda path: True)
     target = tmp_path / "remote"
