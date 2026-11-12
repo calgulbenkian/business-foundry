@@ -2168,6 +2168,289 @@ async function main() {
       },
     );
 
+    // the test business's records as the server sends them, changed on their way to the page
+    const serveChanged = (change) =>
+      race.route(
+        (url) => url.pathname === `/api/businesses/${bid}`,
+        async (route) => {
+          if (route.request().method() !== 'GET') return route.fallback();
+          const response = await route.fetch();
+          const body = await response.json();
+          change(body);
+          await route.fulfill({ response, json: body });
+        },
+      );
+    // Round 8, A. What a piece of evidence is used by follows the server's rule for withdrawn
+    // evidence. The rule's own code, from the server, gives the expected steps for each piece.
+    const SERVER_RULE = `
+import json, sys
+from foundry.service import COMPLETED, evidence_basis
+snapshot = json.load(sys.stdin)
+objects = snapshot["objects"]
+def relies(task):
+    refs = list(task["data"].get("evidence_ids", []))
+    if task["state"] in COMPLETED:
+        refs += list(evidence_basis(task["data"].get("history", [])))
+    return refs
+print(json.dumps({
+    e["id"]: sorted(
+        t["id"] for t in objects
+        if t["kind"] == "task" and t["state"] != "superseded" and e["id"] in relies(t)
+    )
+    for e in objects if e["kind"] == "evidence"
+}))
+`;
+    const serverRule = (snapshot) => {
+      const run = spawnSync(python, ['-c', SERVER_RULE], {
+        input: JSON.stringify(snapshot),
+        encoding: 'utf8',
+      });
+      assert.equal(run.status, 0, run.stderr);
+      return JSON.parse(run.stdout);
+    };
+    // the steps the page counts as using each piece of evidence, from the records it holds
+    const pageRule = () =>
+      race.evaluate(() =>
+        Object.fromEntries(
+          objs('evidence').map((e) => [
+            e.id,
+            usedBy(e.id)
+              .filter((o) => o.kind === 'task' && !replaced(o))
+              .map((o) => o.id)
+              .sort(),
+          ]),
+        ),
+      );
+    const sameAsServer = async (what) =>
+      assert.deepEqual(
+        await pageRule(),
+        serverRule(await race.evaluate(() => state.snapshot)),
+        `${what}: the page counts what the server's rule gives`,
+      );
+    // A business of its own for these checks, so that each has steps of its own to decide. Its
+    // records let four steps with no prerequisite be approved.
+    const usageName = 'Browser usage checks';
+    let usageBid = null;
+    const usageBusiness = async () => {
+      if (!usageBid) {
+        usageBid = (
+          await call('/businesses', 'POST', {
+            name: usageName,
+            concept: 'Synthetic business for checking which evidence each step relies on.',
+          })
+        ).id;
+        for (const kind of ['customer', 'offer', 'decision', 'asset'])
+          await call(`/businesses/${usageBid}/records`, 'POST', {
+            kind,
+            title: `Browser usage ${kind}`,
+            details: 'Synthetic record for the usage checks.',
+          });
+      }
+      return usageBid;
+    };
+    // the page on the usage business, after changes made through the API
+    const showUsage = async () => {
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      await onBusiness(usageBid, usageName);
+    };
+    let usageRun = 0;
+    const reviewedPair = async (where = bid) => {
+      usageRun += 1;
+      const pair = [];
+      for (const which of ['A', 'B']) {
+        const e = await call(`/businesses/${where}/evidence`, 'POST', {
+          title: `Browser usage source ${which}${usageRun}`,
+          content: `Synthetic source ${which} for the usage checks.`,
+          source_type: 'document',
+        });
+        pair.push(
+          await call(`/businesses/${where}/evidence/${e.id}/review`, 'POST', {
+            note: 'Synthetic review for the usage checks.',
+            expected_version: e.version,
+          }),
+        );
+      }
+      return pair;
+    };
+    const freeStep = async () => {
+      const t = (await snapshotOf(usageBid)).objects.find(
+        (o) =>
+          o.kind === 'task' &&
+          o.state === 'pending' &&
+          !o.data.deal_id &&
+          !o.data.external &&
+          !o.blockers?.length,
+      );
+      assert(t, 'an internal step with nothing blocking it');
+      return t;
+    };
+    const moveStep = async (id, to, evidence) => {
+      const t = (await snapshotOf(usageBid)).objects.find((o) => o.id === id);
+      return call(`/businesses/${usageBid}/tasks/${id}/transition`, 'POST', {
+        state: to,
+        note: 'Synthetic decision for the usage checks.',
+        evidence_ids: evidence,
+        expected_version: t.version,
+      });
+    };
+    const evSub = (id) => race.locator(`#list .row[data-key="ev:${id}"] .r-sub`).innerText();
+    const usedBySection = () =>
+      race.locator('#insp .i-sec').filter({ has: race.locator('h3', { hasText: /^Used by/ }) });
+    const openEvidence = async (e) => {
+      await raceSource('evidence');
+      await race.locator(`#list .row[data-key="ev:${e.id}"]`).click();
+      await race.locator('#insp-title', { hasText: e.title }).waitFor();
+      await quiet(race);
+    };
+    const usedRows = async () => usedBySection().locator('.att-row .sub').allInnerTexts();
+    const EARLIER = ' · relied on from an earlier decision, not attached now';
+    lateCase('round 8 A: evidence a completed step relied on earlier is used by it', async () => {
+      const [a, b] = await reviewedPair(await usageBusiness());
+      const t = await freeStep();
+      await moveStep(t.id, 'prepared', [a.id]);
+      await moveStep(t.id, 'approved', [a.id]);
+      await moveStep(t.id, 'verified', [b.id]);
+      await showUsage();
+      await raceSource('evidence');
+      assert.match(await evSub(a.id), / · used by 1$/, 'A’s row counts the step');
+      assert.match(await evSub(b.id), / · used by 1$/);
+      await openEvidence(a);
+      assert.deepEqual(await usedRows(), [`Task · Verified${EARLIER}`], 'A’s view lists the step');
+      assert((await usedBySection().innerText()).includes(t.title));
+      await openEvidence(b);
+      assert.deepEqual(await usedRows(), ['Task · Verified'], 'B’s view lists it as attached');
+      await sameAsServer('a step verified on other evidence');
+      // withdrawn through the page, A reopens the step, and the step's new cycle no longer uses it
+      await openEvidence(a);
+      await race.locator('#insp').getByRole('button', { name: 'Withdraw verification' }).click();
+      await race
+        .getByLabel('Review note', { exact: true })
+        .fill('Synthetic withdrawal for the usage checks.');
+      await inDialog('Confirm withdrawal');
+      await race.locator('#toast', { hasText: 'Saved to the workspace.' }).waitFor();
+      await quiet(race);
+      const reopened = (await snapshotOf(usageBid)).objects.find((o) => o.id === t.id);
+      assert.equal(reopened.state, 'needs_review', 'the server reopened the step');
+      assert.equal(reopened.data.history.at(-1).note, `Evidence withdrawn: ${a.title}`);
+      await raceSource('evidence');
+      assert.match(await evSub(a.id), / · not used yet$/, 'A is no longer used by it');
+      await openEvidence(a);
+      assert.deepEqual(await usedRows(), []);
+      await sameAsServer('after the withdrawal');
+    });
+    lateCase('round 8 A: only the latest preparation onward counts', async () => {
+      const [a, b] = await reviewedPair(await usageBusiness());
+      const t = await freeStep();
+      await moveStep(t.id, 'prepared', [a.id]);
+      await moveStep(t.id, 'in_progress', []);
+      await moveStep(t.id, 'prepared', [b.id]);
+      await moveStep(t.id, 'approved', [b.id]);
+      await showUsage();
+      await raceSource('evidence');
+      assert.match(await evSub(a.id), / · not used yet$/, 'A came before the latest preparation');
+      assert.match(await evSub(b.id), / · used by 1$/);
+      await sameAsServer('a step prepared again on other evidence');
+    });
+    lateCase('round 8 A: a step not completed counts only what it attaches now', async () => {
+      // the API records no change of evidence that keeps a step prepared; a prepared step is
+      // sent back to work with only B attached
+      const [a, b] = await reviewedPair(await usageBusiness());
+      const t = await freeStep();
+      await moveStep(t.id, 'prepared', [a.id]);
+      await showUsage();
+      await raceSource('evidence');
+      assert.match(await evSub(a.id), / · used by 1$/, 'a prepared step uses what it attaches');
+      await moveStep(t.id, 'in_progress', [b.id]);
+      await showUsage();
+      await raceSource('evidence');
+      assert.match(await evSub(a.id), / · not used yet$/, 'A is only in its history');
+      assert.match(await evSub(b.id), / · used by 1$/);
+      await sameAsServer('a step sent back to work');
+    });
+    lateCase('round 8 A: a step reopened and decided again counts only its new cycle', async () => {
+      const [a, b] = await reviewedPair(await usageBusiness());
+      const t = await freeStep();
+      await moveStep(t.id, 'prepared', [a.id]);
+      await moveStep(t.id, 'approved', [a.id]);
+      await moveStep(t.id, 'needs_review', []);
+      await moveStep(t.id, 'not_applicable', [b.id]);
+      await showUsage();
+      await raceSource('evidence');
+      assert.match(await evSub(a.id), / · not used yet$/, 'A came before the step was reopened');
+      assert.match(await evSub(b.id), / · used by 1$/);
+      await sameAsServer('a step reopened and ruled out');
+    });
+    lateCase('round 8 A: unreadable histories and replaced steps, served by the test', async () => {
+      const [e] = await reviewedPair();
+      const pending = (await snapshotOf(bid)).objects.filter(
+        (o) => o.kind === 'task' && o.state === 'pending' && !o.data.deal_id,
+      );
+      assert(pending.length >= 4, 'four steps to serve changed');
+      const [notList, strings, gone, earlier] = pending;
+      const at = new Date().toISOString();
+      await serveChanged((body) => {
+        const set = (id, changes) => {
+          const t = body.objects.find((o) => o.id === id);
+          Object.assign(t, { state: changes.state });
+          Object.assign(t.data, changes.data);
+        };
+        set(notList.id, { state: 'verified', data: { history: 'not a list', evidence_ids: [] } });
+        set(strings.id, {
+          state: 'verified',
+          data: {
+            history: ['an entry that is a string', { to: 'prepared', evidence_ids: [42, null] }, 7],
+            evidence_ids: [],
+          },
+        });
+        set(gone.id, {
+          state: 'superseded',
+          data: {
+            history: [
+              { from: 'pending', to: 'prepared', evidence_ids: [e.id], at },
+              { from: 'prepared', to: 'approved', evidence_ids: [e.id], at },
+              { from: 'approved', to: 'superseded', note: 'Synthetic replacement.', at },
+            ],
+            evidence_ids: [],
+          },
+        });
+        set(earlier.id, {
+          state: 'approved',
+          data: {
+            history: [
+              { from: 'pending', to: 'prepared', evidence_ids: [e.id], at },
+              { from: 'prepared', to: 'approved', evidence_ids: [], at },
+            ],
+            evidence_ids: [],
+          },
+        });
+      });
+      await race.reload();
+      await race.locator('#list .today-head').waitFor();
+      await onBusiness(bid, testName);
+      await raceSource('evidence');
+      assert.match(await evSub(e.id), / · used by 1$/, 'only the approved step counts');
+      await openEvidence(e);
+      assert.deepEqual(await usedRows(), [`Task · Approved${EARLIER}`]);
+      assert((await usedBySection().innerText()).includes(earlier.title));
+      assert.equal(
+        await race.locator('#insp h3', { hasText: 'Cited by replaced steps' }).count(),
+        0,
+        'a replaced step is not listed through its history',
+      );
+      assert.doesNotMatch(await race.locator('#insp').innerText(), new RegExp(gone.title));
+      await sameAsServer('served histories');
+      for (const t of [notList, strings]) {
+        await showStep(t);
+        await quiet(race);
+        assert.doesNotMatch(
+          await race.locator('#insp').innerText(),
+          /could not be shown|TypeError|Cannot read/,
+          `${t.title}: its view is drawn`,
+        );
+      }
+    });
+
     race.setDefaultTimeout(10000);
     const lateFailures = [];
     for (const [name, run] of late) {

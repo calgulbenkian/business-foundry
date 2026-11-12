@@ -1702,22 +1702,58 @@ function linkTo(o, text) {
   const prefix = o.kind === 'task' && M.byId.get(o.id) ? M.byId.get(o.id).n + ' ' : '';
   return `<button type="button" class="link" ${goAttr(s, k)}>${h(text ?? prefix + o.title)}</button>`;
 }
+/* What a record attaches now: its evidence list, its single evidence fields, and for a deal the
+   evidence its adjustments cite. */
+function attached(o) {
+  const d = o.data || {};
+  const refs = new Set(Array.isArray(d.evidence_ids) ? d.evidence_ids : []);
+  for (const k of [
+    'contract_evidence_id',
+    'acceptance_evidence_id',
+    'evidence_id',
+    'issue_evidence_id',
+  ])
+    if (d[k]) refs.add(d[k]);
+  if (o.kind === 'deal')
+    for (const a of d.inputs?.adjustments || []) if (a.evidence_id) refs.add(a.evidence_id);
+  return refs;
+}
+/* The evidence a live step's standing relies on, by the server's rule for withdrawn evidence
+   (Service.invalidate and evidence_basis in service.py), so that the page calls evidence used
+   exactly where withdrawing it would reopen a step:
+   - A replaced step relies on nothing. It is history, listed apart by what it attaches.
+   - A step in a completed state (approved, submitted, verified or not applicable) relies on the
+     evidence it attaches now and on the basis of its history.
+   - Any other step relies only on the evidence it attaches now.
+   The basis of a history. A history that is not a list gives nothing. The current cycle is every
+   entry after the latest one whose `to` is needs_review, or the whole history if there is none.
+   Within that cycle, the basis is the latest entry whose `to` is prepared and every entry after
+   it, or the last entry alone if there is none. An empty cycle gives nothing. Ids are read only
+   from an entry that is an object, from its `evidence_ids` when that is a list, and only the
+   items that are strings. */
+const COMPLETED = new Set(['approved', 'submitted', 'verified', 'not_applicable']);
+const isEntry = (e) => typeof e === 'object' && e !== null && !Array.isArray(e);
+const movesTo = (e, to) => isEntry(e) && e.to === to;
+function evidenceBasis(history) {
+  const basis = new Set();
+  if (!Array.isArray(history)) return basis;
+  const cycle = history.slice(lastIndex(history, (e) => movesTo(e, 'needs_review')) + 1);
+  const from = lastIndex(cycle, (e) => movesTo(e, 'prepared'));
+  for (const e of from < 0 ? cycle.slice(-1) : cycle.slice(from))
+    if (isEntry(e) && Array.isArray(e.evidence_ids))
+      for (const id of e.evidence_ids) if (typeof id === 'string') basis.add(id);
+  return basis;
+}
+const reliesOnHistory = (o) => o.kind === 'task' && !replaced(o) && COMPLETED.has(o.state);
+/* Everything that uses a piece of evidence: what attaches it now, and every completed live step
+   whose history it is part of. `earlier` marks a step that relies on it only from its history. */
 function usedBy(eid) {
   const out = [];
   for (const o of objs()) {
     if (o.id === eid) continue;
-    const d = o.data || {};
-    const refs = new Set(Array.isArray(d.evidence_ids) ? d.evidence_ids : []);
-    for (const k of [
-      'contract_evidence_id',
-      'acceptance_evidence_id',
-      'evidence_id',
-      'issue_evidence_id',
-    ])
-      if (d[k]) refs.add(d[k]);
-    if (o.kind === 'deal')
-      for (const a of d.inputs?.adjustments || []) if (a.evidence_id) refs.add(a.evidence_id);
-    if (refs.has(eid)) out.push(o);
+    if (attached(o).has(eid)) out.push(o);
+    else if (reliesOnHistory(o) && evidenceBasis(o.data?.history).has(eid))
+      out.push({ ...o, earlier: true });
   }
   return out;
 }
@@ -1753,7 +1789,9 @@ function attList(items) {
         o.evidence_warning ||
         o.state === 'needs_review';
       const prefix = o.kind === 'task' && M.byId.get(o.id) ? M.byId.get(o.id).n + ' ' : '';
-      return `<div class="att-row">${objGlyph(o)}<span class="an">${h(prefix + o.title)}<span class="sub${amber ? ' amber' : ''}">${h(label(o.kind === 'financial_plan' ? 'financial model' : o.kind))} · ${h(objState(o))}</span></span>${btn('Open', goAttr(s, k))}</div>`;
+      // a step that relies on the evidence only through an earlier decision says so
+      const earlier = o.earlier ? ' · relied on from an earlier decision, not attached now' : '';
+      return `<div class="att-row">${objGlyph(o)}<span class="an">${h(prefix + o.title)}<span class="sub${amber ? ' amber' : ''}">${h(label(o.kind === 'financial_plan' ? 'financial model' : o.kind))} · ${h(objState(o))}${h(earlier)}</span></span>${btn('Open', goAttr(s, k))}</div>`;
     })
     .join('')}</div>`;
 }
