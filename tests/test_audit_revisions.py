@@ -1,5 +1,6 @@
 """Integrity verification covers every stored revision, not only the current one."""
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -1220,13 +1221,24 @@ NON_TEXT_OBJECT_IDS = {
 }
 
 
+# For these values the JSON text and the Python text are the same text ("0", "5", "2.5"), so the
+# python-text case would repeat the json-text case exactly. It is left out for them.
+SAME_JSON_AND_PYTHON_TEXT = {"zero", "five", "two-point-five"}
+
+NON_TEXT_ID_SPELLINGS = [
+    pytest.param(payload_id, spelling, id=f"{payload_id}-{spelling}")
+    for payload_id in NON_TEXT_IDS
+    for spelling in NON_TEXT_OBJECT_IDS
+    if not (spelling == "python-text" and payload_id in SAME_JSON_AND_PYTHON_TEXT)
+]
+
+
 def with_id(payload, value):
     return canonical({**payload, "id": value})
 
 
 @pytest.mark.parametrize("version", FOREIGN_VERSIONS)
-@pytest.mark.parametrize("spelling", list(NON_TEXT_OBJECT_IDS))
-@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+@pytest.mark.parametrize(("payload_id", "spelling"), NON_TEXT_ID_SPELLINGS)
 def test_event_whose_payload_id_is_not_text_is_no_snapshot(setup, payload_id, spelling, version):
     store, service, actor, bid, _ = setup
     other = second_business(setup)
@@ -1593,8 +1605,8 @@ def test_documented_limit_altered_ai_review_with_appended_event_verifies(setup):
 
 
 # Any event counts for an AI review when its payload's run_id and data_sha256 are both truthy,
-# whatever else the payload holds, and the last such event for a run id stands for that run. An
-# event that does not count leaves the one before it standing.
+# whatever else the payload holds and whatever its action, and the last such event for a run id
+# stands for that run. An event that does not count leaves the one before it standing.
 
 ABSENT = object()
 OTHER_DIGEST = "f" * 64
@@ -1608,6 +1620,12 @@ AI_PAYLOAD_IDS = {
 
 AI_OBJECT_IDS = [pytest.param("record", id="records-id"), pytest.param("run", id="runs-id")]
 
+# An event counts whatever its action: one the AI service writes and one it never writes.
+AI_ACTIONS = [
+    pytest.param("ai.succeeded", id="action-ai-succeeded"),
+    pytest.param("record.updated", id="action-record-updated"),
+]
+
 
 def stored_ai_digest(store, run_id):
     with store.read() as con:
@@ -1615,36 +1633,57 @@ def stored_ai_digest(store, run_id):
     return digest(canonical(json.loads(data)))
 
 
-def append_ai_event(setup, item, run, payload_id, which="record", **fields):
+def append_ai_event(setup, item, run, payload_id, which="record", action="ai.succeeded", **fields):
     """Append an event that is no snapshot, carrying ``fields`` and no key whose value is ABSENT."""
     store, _, _, bid, _ = setup
     object_id = item["id"] if which == "record" else run
     payload = {"id": AI_PAYLOAD_IDS[payload_id](item["id"]), "version": 2, "data": item["data"]}
     payload.update({name: value for name, value in fields.items() if value is not ABSENT})
     assert payload["id"] != object_id
-    append_event(store, bid, object_id, canonical(payload), "ai.succeeded")
+    append_event(store, bid, object_id, canonical(payload), action)
 
 
-def ai_audit(setup, item, payload_id, which, run_id, data_sha256, state):
+def ai_audit(setup, item, payload_id, which, run_id, data_sha256, state, action="ai.succeeded"):
     store, _, actor, bid, _ = setup
     run = add_ai_review(store, actor, bid)
     right = stored_ai_digest(store, run)
     run_id = run if run_id == "run" else run_id
     append_ai_event(
-        setup, item, run, payload_id, which, run_id=run_id, data_sha256=data_sha256(right), state=state
+        setup,
+        item,
+        run,
+        payload_id,
+        which,
+        action,
+        run_id=run_id,
+        data_sha256=data_sha256(right),
+        state=state,
     )
     return integrity(setup)
 
 
+def assert_export_and_other_business(setup, other, result):
+    """The export reports what the audit reported, and the second business audits clean."""
+    _, service, actor, _, _ = setup
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == result["record_errors"]
+    assert exported["valid"] is result["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("action", AI_ACTIONS)
 @pytest.mark.parametrize("which", AI_OBJECT_IDS)
 @pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
-def test_event_that_is_no_snapshot_stands_for_its_ai_review(setup, payload_id, which):
+def test_event_that_is_no_snapshot_stands_for_its_ai_review(setup, payload_id, which, action):
+    other = second_business(setup)
     item = history(setup, versions=2)
-    result = ai_audit(setup, item, payload_id, which, "run", lambda right: right, "unknown")
+    result = ai_audit(setup, item, payload_id, which, "run", lambda right: right, "unknown", action)
     assert result["record_errors"] == []
     assert result["valid"]
+    assert_export_and_other_business(setup, other, result)
 
 
+@pytest.mark.parametrize("action", AI_ACTIONS)
 @pytest.mark.parametrize(
     ("data_sha256", "state"),
     [
@@ -1658,12 +1697,14 @@ def test_event_that_is_no_snapshot_stands_for_its_ai_review(setup, payload_id, w
 @pytest.mark.parametrize("which", AI_OBJECT_IDS)
 @pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
 def test_event_that_is_no_snapshot_and_differs_from_its_ai_review_is_reported(
-    setup, payload_id, which, data_sha256, state
+    setup, payload_id, which, data_sha256, state, action
 ):
+    other = second_business(setup)
     item = history(setup, versions=2)
-    result = ai_audit(setup, item, payload_id, which, "run", data_sha256, state)
+    result = ai_audit(setup, item, payload_id, which, "run", data_sha256, state, action)
     assert result["record_errors"] == ["AI review differs from history: review_synthetic"]
     assert not result["valid"]
+    assert_export_and_other_business(setup, other, result)
 
 
 @pytest.mark.parametrize(
@@ -1688,10 +1729,12 @@ def test_event_that_is_no_snapshot_and_differs_from_its_ai_review_is_reported(
 def test_event_with_a_falsy_run_id_or_digest_does_not_count_for_an_ai_review(
     setup, payload_id, which, run_id, data_sha256
 ):
+    other = second_business(setup)
     item = history(setup, versions=2)
     result = ai_audit(setup, item, payload_id, which, run_id, data_sha256, "succeeded")
     assert result["record_errors"] == []
     assert result["valid"]
+    assert_export_and_other_business(setup, other, result)
 
 
 @pytest.mark.parametrize(
@@ -1707,10 +1750,12 @@ def test_event_with_a_falsy_run_id_or_digest_does_not_count_for_an_ai_review(
 def test_event_that_is_no_snapshot_for_an_ai_review_never_stored_is_reported(
     setup, payload_id, which, run_id, shown
 ):
+    other = second_business(setup)
     item = history(setup, versions=2)
     result = ai_audit(setup, item, payload_id, which, run_id, lambda right: OTHER_DIGEST, "succeeded")
     assert result["record_errors"] == [f"Historical AI review missing: {shown}"]
     assert not result["valid"]
+    assert_export_and_other_business(setup, other, result)
 
 
 AI_RUNS = [pytest.param(True, id="altered"), pytest.param(False, id="no-history")]
@@ -1733,16 +1778,19 @@ def unrecorded_ai_review(setup, chained):
 @pytest.mark.parametrize("chained", AI_RUNS)
 @pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
 def test_documented_limit_ai_review_verifies_through_an_event_that_is_no_snapshot(setup, payload_id, chained):
+    other = second_business(setup)
     item = history(setup, versions=2)
     run, state = unrecorded_ai_review(setup, chained)
     before = integrity(setup)
     assert before["record_errors"] == [f"AI review differs from history: {run}"]
     assert not before["valid"]
+    assert_export_and_other_business(setup, other, before)
     right = stored_ai_digest(setup[0], run)
     append_ai_event(setup, item, run, payload_id, run_id=run, data_sha256=right, state=state)
     result = integrity(setup)
     assert result["record_errors"] == []
     assert result["valid"]
+    assert_export_and_other_business(setup, other, result)
 
 
 @pytest.mark.parametrize(
@@ -1753,16 +1801,155 @@ def test_documented_limit_ai_review_verifies_through_an_event_that_is_no_snapsho
 def test_event_with_an_empty_or_absent_digest_does_not_hide_an_ai_review_change(
     setup, payload_id, chained, data_sha256
 ):
+    other = second_business(setup)
     item = history(setup, versions=2)
     run, state = unrecorded_ai_review(setup, chained)
     expected = [f"AI review differs from history: {run}"]
     before = integrity(setup)
     assert before["record_errors"] == expected
     assert not before["valid"]
+    assert_export_and_other_business(setup, other, before)
     append_ai_event(setup, item, run, payload_id, run_id=run, data_sha256=data_sha256, state=state)
     result = integrity(setup)
     assert result["record_errors"] == expected
     assert not result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+# One business's AI reviews are invisible to another's audit and export. The audit reads only this
+# business's AI review rows and only this business's events, and the export carries only this
+# business's AI review rows.
+
+SECOND_RUN = "review_second_business"
+SYNTHETIC_RUN_ENTRY = {
+    "id": "review_synthetic",
+    "state": "unknown",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "data": {"note": "Synthetic run written for this test."},
+}
+SECOND_RUN_ENTRY = {**SYNTHETIC_RUN_ENTRY, "id": "review_second_business"}
+
+
+def alter_ai_review(store, run_id):
+    """Change a stored run by SQL to a state and data its chained event does not carry."""
+    changed = {"note": "Advice that was never returned."}
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET data=?,state='succeeded' WHERE id=?", (canonical(changed), run_id)
+            ).rowcount
+            == 1
+        )
+    return changed
+
+
+def audited(service, actor, bid, export=False):
+    return service.audit(actor, bid, export)["integrity"]
+
+
+def assert_audit_and_export(service, actor, bid, expected):
+    for export in (False, True):
+        result = audited(service, actor, bid, export)
+        assert result["record_errors"] == expected
+        assert result["valid"] is (expected == [])
+
+
+def test_ai_review_of_one_business_is_not_in_another_business_audit(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid)
+    assert_audit_and_export(service, actor, bid, [])
+    assert_audit_and_export(service, actor, other, [])
+
+
+def test_altered_ai_review_of_one_business_is_reported_only_there(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid)
+    alter_ai_review(store, "review_synthetic")
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    assert_audit_and_export(service, actor, other, [])
+
+
+def test_ai_review_without_history_of_one_business_is_reported_only_there(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid, chained=False)
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    assert_audit_and_export(service, actor, other, [])
+
+
+def test_each_business_checks_only_its_own_ai_review(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid)
+    add_ai_review(store, actor, other, run_id=SECOND_RUN)
+    assert_audit_and_export(service, actor, bid, [])
+    assert_audit_and_export(service, actor, other, [])
+    alter_ai_review(store, "review_synthetic")
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    assert_audit_and_export(service, actor, other, [])
+    alter_ai_review(store, "review_second_business")
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    assert_audit_and_export(service, actor, other, ["AI review differs from history: review_second_business"])
+
+
+def test_event_in_another_business_chain_stands_for_nothing_here(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid)
+    changed = alter_ai_review(store, "review_synthetic")
+    # An event appended to the second business's chain carries the first business's run id and the
+    # state and digest of its altered row: it would make that row verify if it were in this chain.
+    append_event(
+        store,
+        other,
+        "review_synthetic",
+        canonical(
+            {"run_id": "review_synthetic", "state": "succeeded", "data_sha256": digest(canonical(changed))}
+        ),
+        "ai.succeeded",
+    )
+    # Rule: a business's AI reviews are compared with its own events only. The event in the other
+    # chain hides nothing here, so the altered row is still reported.
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    # Rule: an AI review a business's own history names must be a row of that business. The second
+    # business holds no row for this run id, whichever business does.
+    assert_audit_and_export(service, actor, other, ["Historical AI review missing: review_synthetic"])
+
+
+# A business's export carries its own AI review rows and no other business's.
+
+
+def exported_archive(service, actor, bid):
+    return service.audit(actor, bid, True)
+
+
+def test_export_of_a_business_without_ai_reviews_carries_none_of_another_business(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid)
+    assert exported_archive(service, actor, other)["ai_runs"] == []
+    assert exported_archive(service, actor, bid)["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
+
+
+def test_export_of_each_business_carries_only_its_own_ai_review(setup):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    add_ai_review(store, actor, bid)
+    add_ai_review(store, actor, other, run_id=SECOND_RUN)
+    assert exported_archive(service, actor, bid)["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
+    assert exported_archive(service, actor, other)["ai_runs"] == [SECOND_RUN_ENTRY]
+
+
+def test_export_digest_covers_the_archive_with_its_ai_review(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
+    body = {name: value for name, value in archive.items() if name != "sha256"}
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    assert archive["sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # Gaps named in review: literals that run back as SQL, number and key spellings, REAL and NaN versions.
@@ -2110,8 +2297,7 @@ def test_null_id_of_a_current_record_is_reported(setup):
     assert export_integrity(setup)["record_errors"] == expected
 
 
-def add_ai_review(store, actor, bid, chained=True):
-    run_id = "review_synthetic"
+def add_ai_review(store, actor, bid, chained=True, run_id="review_synthetic"):
     data = {"note": "Synthetic run written for this test."}
     with store.write() as con:
         con.execute(
