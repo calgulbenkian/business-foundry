@@ -3639,7 +3639,7 @@ function businessDialog(edit = false) {
     },
     edit ? 'Save changes' : 'Create workspace',
     edit
-      ? 'Changes reopen completed work for review. Jurisdiction is fixed in this release; use a new workspace for a reviewed jurisdiction change.'
+      ? 'Changes reopen completed work for review. This form cannot change the jurisdiction: an owner or reviewer changes it as a separate, recorded decision with a reason, using the API or the foundry jurisdiction command.'
       : 'A concept creates the workspace and its dependency-aware steps. Unknowns can stay unknown until you have evidence.',
     (result) => {
       // the new business opens on its Today list once its records arrive
