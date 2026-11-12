@@ -61,6 +61,13 @@ const saved = {
 let loadSeq = 0;
 /* Every sign-out starts a new session; a late 401 from an earlier session is not acted on. */
 let sessionSeq = 0;
+/* Each start is numbered; only the latest one acts. */
+let startSeq = 0;
+/* The sentence about a change of sign-in in another tab that the latest start has still to say,
+   and whether this tab showed a workspace when it was told. A start that replaces it after
+   another signal says it in its place (signInChanged); a person's own sign-in does not, because
+   the page then changes for that reason and no other. */
+let toldPending = null;
 const state = {
   actor: null,
   businesses: [],
@@ -3280,6 +3287,7 @@ function forget() {
   signingOut.clear();
   waiting.length = 0;
   confirming = null;
+  toldPending = null;
   dialogAbout = null;
   opener = null;
   clearTimeout(toastTimer);
@@ -3353,9 +3361,12 @@ function formsClosed() {
    is forgotten as at sign-out, and the page asks the server who is signed in now, as it does
    when it starts. One sentence says why the page changed; the forms it closed are named. */
 function signInChanged() {
-  const shown = Boolean(state.actor);
+  // A start told of an earlier change that has not said so yet hands its sentence to this one:
+  // the page did change for that reason, and the forms it closed are still to be named.
+  const before = toldPending;
+  const shown = Boolean(state.actor) || Boolean(before?.shown);
   const told = [
-    'The sign-in changed in another tab, so this page has started again.',
+    before?.told || 'The sign-in changed in another tab, so this page has started again.',
     ...formsClosed(),
   ].join(' ');
   forget();
@@ -4635,13 +4646,24 @@ $('#login-form').addEventListener('submit', async (event) => {
   }
 });
 /* Ask the server who is signed in, and show their workspace or the sign-in page. Only the latest
-   start, in the session it began in, changes anything. After a change of sign-in in another tab,
-   `told` says so: over the workspace, or on the sign-in page when this tab showed a workspace. */
+   start, in the session it began in, changes anything: an earlier one changes nothing when its
+   answer arrives, whether the server named someone or refused, and so does one whose session has
+   ended since. After a change of sign-in in another tab, `told` says so: over the workspace, or on
+   the sign-in page when this tab showed a workspace. */
 async function start({ told = '', shown = false } = {}) {
-  const session = sessionSeq;
+  const mine = ++startSeq;
+  let session = sessionSeq;
+  toldPending = told ? { told, shown } : null;
   try {
     const actor = await api('/me');
     if (session !== sessionSeq) return;
+    if (mine !== startSeq) return;
+    // Another person's records on screen go before this person's are loaded, so the page never
+    // shows one person's name or controls over the other's records.
+    if (state.actor && state.actor.id !== actor?.id) {
+      forget();
+      session = sessionSeq;
+    }
     state.actor = actor;
     // a key typed on the sign-in page and never sent does not stay behind the workspace
     $('#login-form').reset();
@@ -4649,9 +4671,13 @@ async function start({ told = '', shown = false } = {}) {
     $('#login-note').textContent = '';
     $('#login').hidden = true;
     app.hidden = false;
-    if ((await refresh()) && told && session === sessionSeq) toast(told);
+    const loaded = await refresh();
+    if (session !== sessionSeq || mine !== startSeq) return;
+    toldPending = null;
+    if (loaded && told) toast(told);
   } catch (e) {
     if (session !== sessionSeq) return;
+    if (mine !== startSeq) return;
     showLogin();
     if (e.message !== 'Sign in with a valid access key.') $('#login-error').textContent = e.message;
     if (told && shown) $('#login-note').textContent = told;

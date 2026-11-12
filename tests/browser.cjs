@@ -3666,6 +3666,270 @@ print(json.dumps({
         await inDialog('Close');
       },
     );
+    // Round 9, X1. Two starts in one session of a tab: tab B, on the sign-in page, is told that the
+    // sign-in changed and asks who is signed in; before that answer arrives, a person signs in in
+    // tab B itself, and it asks again. Only the latest start acts, whatever order the answers
+    // arrive in. Each answer is held by holdNext(), so no case waits a fixed time.
+    // Hold back only the next answer for a path until release(); later requests pass untouched. With
+    // `lose`, release() drops the connection instead. quiet() does not wait for that path meanwhile.
+    const holdNext = async (p, path, { lose = false } = {}) => {
+      let open, seen, done;
+      const gate = new Promise((r) => (open = r)),
+        requested = new Promise((r) => (seen = r)),
+        handled = new Promise((r) => (done = r));
+      let taken = false;
+      const entry = { path, method: 'GET' };
+      heldOn(p).add(entry);
+      await p.route(
+        (url) => url.pathname === path,
+        async (route) => {
+          if (taken || route.request().method() !== 'GET') return route.fallback();
+          taken = true;
+          const response = await route.fetch();
+          seen(response);
+          await gate;
+          try {
+            if (lose) await route.abort('connectionreset');
+            else await route.fulfill({ response });
+          } catch {
+            // the page cancelled the request while it was held
+          }
+          done();
+        },
+      );
+      return {
+        requested,
+        async release() {
+          heldOn(p).delete(entry);
+          open();
+          await handled;
+          await quiet(p);
+        },
+      };
+    };
+    // the signal alone, from another tab, as a tab sends it: the sign-in itself does not change
+    const bareSignal = (p) =>
+      p.evaluate(() => new BroadcastChannel('foundry-session').postMessage('sign-in changed'));
+    // what a tab shows: the sign-in page or a workspace, whose, and anything it says
+    const tabShows = async (p) => ({
+      signInPage: await p.locator('#login').isVisible(),
+      workspace: await p.locator('#app').isVisible(),
+      name: await p.locator('#actor-name').innerText(),
+      actor: await p.evaluate(() => state.actor?.id ?? null),
+      newBusiness: await p.locator('.toolbar [data-action="new-business"]').isVisible(),
+      note: await p.locator('#login-note').innerText(),
+      error: await p.locator('#login-error').innerText(),
+      toast: (await p.locator('#toast').isVisible()) ? await p.locator('#toast').innerText() : null,
+    });
+    // the owner's workspace, as the server names the person signed in in that tab
+    const ownerWorkspace = async (p) => {
+      const me = await (await p.context().request.get(origin + '/api/me')).json();
+      assert.equal(me.role, 'owner', 'the server says the owner is signed in');
+      return {
+        signInPage: false,
+        workspace: true,
+        name: `${me.name} · Owner`,
+        actor: me.id,
+        newBusiness: true,
+        note: '',
+        error: '',
+        toast: null,
+      };
+    };
+    const signedOutPage = {
+      signInPage: true,
+      workspace: false,
+      name: '',
+      actor: null,
+      newBusiness: false,
+      note: '',
+      error: '',
+      toast: null,
+    };
+    // both tabs on the sign-in page, nobody signed in
+    const bothSignedOut = async (a, b) => {
+      await signOutIn(b);
+      await told(a.getByLabel('Access key', { exact: true }), 'tab A was not told of the sign-out');
+      await quiet(a);
+      await quiet(b);
+    };
+    const typeKey = async (p, key) => {
+      await p.getByLabel('Access key', { exact: true }).fill(key);
+      await p.getByRole('button', { name: 'Open workspace' }).click();
+    };
+    lateCase(
+      'round 9 X1 A: an earlier answer naming someone else arrives after this tab’s own sign-in',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await bothSignedOut(a, b);
+          const first = await holdNext(b, '/api/me');
+          // tab A's sign-in as the viewer is the signal; tab B's question about it is held
+          await signInAs(a, viewer.token);
+          const named = await (await sent(first, 'tab B’s question after the signal')).json();
+          assert.equal(named.role, 'viewer');
+          await signInAs(b, ownerKey());
+          await quiet(b);
+          await first.release();
+          assert.deepEqual(await tabShows(b), await ownerWorkspace(b), 'tab B shows the owner');
+        });
+      },
+    );
+    lateCase(
+      'round 9 X1 B: an earlier refusal arrives after this tab’s own sign-in has shown the workspace',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await bothSignedOut(a, b);
+          const afterSignIn = await holdNext(b, '/api/me');
+          await signInAs(a, viewer.token);
+          await sent(afterSignIn, 'tab B’s question after the sign-in in tab A');
+          const afterSignOut = await holdNext(b, '/api/me');
+          await signOutIn(a);
+          const refusal = await sent(afterSignOut, 'tab B’s question after the sign-out in tab A');
+          assert.equal(refusal.status(), 401);
+          // this one's session ended with the second signal
+          await afterSignIn.release();
+          assert.deepEqual(await tabShows(b), signedOutPage, 'tab B is still on the sign-in page');
+          await signInAs(b, ownerKey());
+          await quiet(b);
+          await afterSignOut.release();
+          assert.deepEqual(await tabShows(b), await ownerWorkspace(b), 'tab B shows the owner');
+        });
+      },
+    );
+    lateCase(
+      'round 9 X1 C: an earlier refusal arrives between this tab’s accepted sign-in and its answer',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await bothSignedOut(a, b);
+          const afterSignIn = await holdNext(b, '/api/me');
+          await signInAs(a, viewer.token);
+          await sent(afterSignIn, 'tab B’s question after the sign-in in tab A');
+          const afterSignOut = await holdNext(b, '/api/me');
+          await signOutIn(a);
+          await sent(afterSignOut, 'tab B’s question after the sign-out in tab A');
+          await afterSignIn.release();
+          const own = await holdNext(b, '/api/me');
+          await typeKey(b, ownerKey());
+          const named = await (await sent(own, 'tab B’s question after its own sign-in')).json();
+          assert.equal(named.role, 'owner');
+          // the refusal, asked before the sign-in, arrives first
+          await afterSignOut.release();
+          await own.release();
+          assert.deepEqual(await tabShows(b), await ownerWorkspace(b), 'tab B shows the owner');
+        });
+      },
+    );
+    lateCase('round 9 X1: two answers arriving in the order they were asked', async () => {
+      await twoTabs(async ({ a, b, viewer }) => {
+        await bothSignedOut(a, b);
+        const first = await holdNext(b, '/api/me');
+        await signInAs(a, viewer.token);
+        await sent(first, 'tab B’s question after the signal');
+        const own = await holdNext(b, '/api/me');
+        await typeKey(b, ownerKey());
+        await sent(own, 'tab B’s question after its own sign-in');
+        await first.release();
+        await own.release();
+        const { toast, ...shown } = await tabShows(b);
+        const { toast: none, ...owner } = await ownerWorkspace(b);
+        assert.deepEqual(shown, owner, 'tab B shows the owner');
+      });
+    });
+    lateCase(
+      'round 9 X1: an earlier answer shown while this tab’s sign-in is sent is cleared before the next person’s records',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await bothSignedOut(a, b);
+          const first = await holdNext(b, '/api/me');
+          await signInAs(a, viewer.token);
+          await sent(first, 'tab B’s question after the signal');
+          const login = await hold(b, '/api/login', { method: 'POST' });
+          await typeKey(b, ownerKey());
+          await sent(login, 'tab B’s sign-in');
+          // the earlier answer arrives while the sign-in is on its way: it is still the latest
+          await first.release();
+          assert.equal(await b.locator('#actor-name').innerText(), `${viewer.name} · Viewer`);
+          const records = await holdNext(b, '/api/businesses');
+          await login.release();
+          // the owner is named; the viewer's records are gone before the owner's arrive
+          const between = await b.evaluate(() => ({
+            actor: state.actor?.role,
+            snapshot: state.snapshot,
+            businesses: state.businesses.length,
+            name: document.querySelector('#actor-name').textContent,
+            list: document.querySelector('#list').innerHTML,
+          }));
+          assert.deepEqual(between, {
+            actor: 'owner',
+            snapshot: null,
+            businesses: 0,
+            name: '',
+            list: '',
+          });
+          await records.release();
+          assert.deepEqual(await tabShows(b), await ownerWorkspace(b), 'tab B shows the owner');
+        });
+      },
+    );
+    lateCase(
+      'round 9 X1: a sentence about another tab survives a second change before it is said',
+      async () => {
+        await twoTabs(async ({ a, b, viewer }) => {
+          await b.locator('#src-nav .src[data-src="records"]').click();
+          await b.getByRole('button', { name: '+ Add record', exact: true }).click();
+          await b.getByLabel('Title', { exact: true }).fill('Browser record form open in tab B');
+          const first = await holdNext(b, '/api/me');
+          // the first change closes tab B's form; its answer is held
+          await signOutIn(a);
+          assert.equal((await sent(first, 'tab B’s first question')).status(), 401);
+          // the second is answered at once, and tab B follows it
+          await signInAs(a, viewer.token);
+          await told(
+            b.locator('#actor-name', { hasText: viewer.name }),
+            'tab B did not follow the sign-in in tab A',
+          );
+          await quiet(b);
+          const sentence = `${CHANGED} “Add business record” was closed without saving.`;
+          assert.equal(await b.locator('#toast').innerText(), sentence, 'the form is still named');
+          // the first answer, for a session that has ended, changes nothing
+          await first.release();
+          assert.equal(await b.locator('#actor-name').innerText(), `${viewer.name} · Viewer`);
+          assert(await b.locator('#login').isHidden(), 'tab B still shows the workspace');
+        });
+      },
+    );
+    lateCase(
+      'round 9 G8: an answer for a start whose session this tab ended changes nothing',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          const answer = await holdNext(b, '/api/me');
+          await bareSignal(a);
+          await sent(answer, 'tab B’s question after the signal');
+          // tab B signs itself out before the answer arrives: a new session, and no new start
+          await signOutIn(b);
+          await quiet(b);
+          const asked = [];
+          b.on('request', (r) => asked.push(new URL(r.url()).pathname));
+          await answer.release();
+          assert.deepEqual(await tabShows(b), signedOutPage, 'tab B stays signed out');
+          assert.deepEqual(asked, [], 'and asks nothing more');
+        });
+      },
+    );
+    lateCase(
+      'round 9 G8: a failed answer for a start whose session this tab ended changes nothing',
+      async () => {
+        await twoTabs(async ({ a, b }) => {
+          const answer = await holdNext(b, '/api/me', { lose: true });
+          await bareSignal(a);
+          await sent(answer, 'tab B’s question after the signal');
+          await signOutIn(b);
+          await quiet(b);
+          await answer.release();
+          assert.deepEqual(await tabShows(b), signedOutPage, 'no error and no note');
+        });
+      },
+    );
     race.setDefaultTimeout(10000);
     const lateFailures = [];
     // A failure while the page is loaded again for a case names that case, and lists what the
@@ -4344,7 +4608,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, and a closed form is still named after a second change), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
