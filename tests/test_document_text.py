@@ -212,12 +212,33 @@ def compact(tmp_path_factory):
     # the second, so the many record and step fields are checked against shorter documents.
     work = [o for o in objects if o["kind"] in {"evidence", "customer", "offer", "obligation", "risk"}]
     work += [o for o in objects if o["kind"] == "task" and o["data"]["key"] in KEPT_STEPS]
-    money = [o for o in objects if o["kind"] in {"evidence", "financial_plan", "deal"}] + [deal_step]
     # A snapshot built without per-obligation flags prints the overdue count from the stats instead.
     count = [{k: v for k, v in o.items() if k != "overdue"} for o in objects if o["kind"] == "obligation"]
+    # The money half is read after the deal's evidence is withdrawn and the planning jurisdiction changes,
+    # so the deal carries two stale reasons and the forecast one, each printed as a warning.
+    s.review_evidence(
+        a,
+        bid,
+        interview["id"],
+        key(),
+        dump(models.Review, note="Withdrawn.", expected_version=2),
+        revoke=True,
+    )
+    version = s.snapshot(a, bid)["business"]["version"]
+    s.change_jurisdiction(
+        a,
+        bid,
+        key(),
+        dump(
+            models.JurisdictionChange, expected_version=version, jurisdiction="GB", reason="Synthetic move."
+        ),
+    )
+    later = s.snapshot(a, bid)
+    money = [o for o in later["objects"] if o["kind"] in {"evidence", "financial_plan", "deal"}]
+    money += [o for o in later["objects"] if o["id"] == deal_step["id"]]
     halves = {}
-    for name, kept in (("work", work), ("money", money), ("count", count)):
-        half = copy.deepcopy({**snapshot, "objects": kept})
+    for name, source, kept in (("work", snapshot, work), ("money", later, money), ("count", snapshot, count)):
+        half = copy.deepcopy({**source, "objects": kept})
         halves[name] = half, next((o for o in half["objects"] if o["id"] == deal["id"]), None)
     return halves
 
@@ -305,6 +326,16 @@ def test_no_value_in_the_snapshot_can_change_document_structure_or_add_markup(co
     }[half] <= printed
     if half == "money":
         assert any(p[-2:] == ("inputs", "months") for p in checked)
+        # Every stale reason's message is walked: two on the deal, one on the forecast.
+        stale = [
+            (o["kind"], i) for o in snapshot["objects"] for i, _ in enumerate(o.get("stale_reasons", []))
+        ]
+        assert sorted(stale) == [("deal", 0), ("deal", 1), ("financial_plan", 0)]
+        assert {p for p in checked if p[-1] == "message"} == {
+            ("objects", i, "stale_reasons", n, "message")
+            for i, o in enumerate(snapshot["objects"])
+            for n in range(len(o.get("stale_reasons", [])))
+        }
     if half == "count":
         assert ("stats", "overdue_obligations") in checked
 

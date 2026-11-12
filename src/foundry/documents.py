@@ -172,10 +172,19 @@ INPUT_ROWS = (
 DCF_NOT_AVAILABLE = "Not available — needs at least 12 months and positive terminal cash flow"
 
 
+STALE_WITHOUT_MESSAGE = (
+    "These figures are marked out of date, but no reason was recorded. Check them before relying on them."
+)
+
+
 def stale_warnings(snapshot_object) -> list[str]:
-    """One warning per reason the snapshot gives for a stale deal analysis or forecast, in its words."""
-    reasons = (snapshot_object or {}).get("stale_reasons", [])
-    return [line for r in reasons for line in (f"WARNING: {r['message']}", "")]
+    """One warning per reason the snapshot gives for a stale deal analysis or forecast, in its words.
+
+    A reason with no message still gets a warning, in general words, so a stale mark is never dropped.
+    """
+    reasons = (snapshot_object or {}).get("stale_reasons") or []
+    messages = [inline(r.get("message") or "") if isinstance(r, dict) else "" for r in reasons]
+    return [line for m in messages for line in (f"WARNING: {m or STALE_WITHOUT_MESSAGE}", "")]
 
 
 def financial_section(p, currency) -> list[str]:

@@ -12,7 +12,7 @@ import pytest
 
 from foundry import models
 from foundry.demo import seed
-from foundry.documents import render_document
+from foundry.documents import STALE_WITHOUT_MESSAGE, render_document, stale_warnings
 from foundry.store import DomainError, canonical, digest
 
 ID = re.compile(r"[a-z_]+_[0-9a-f]{20}")
@@ -655,6 +655,36 @@ def test_superseded_steps_are_listed_as_replaced_and_unknown_states_are_never_fi
         "A completed checklist reflects recorded reviews. It does not establish legal compliance, "
         "commercial viability or an independently audited result.",
     ]
+
+
+def test_a_stale_reason_without_a_message_still_warns_and_a_missing_list_warns_nothing(setup):
+    _, s, a, bid, _ = setup
+    s.save_forecast(
+        a, bid, key(), dump(models.ForecastCreate, title="Pilot", inputs=models.ForecastInputs(months=12))
+    )
+    version = s.snapshot(a, bid)["business"]["version"]
+    s.change_jurisdiction(
+        a,
+        bid,
+        key(),
+        dump(models.JurisdictionChange, expected_version=version, jurisdiction="GB", reason="Synthetic."),
+    )
+    snapshot = s.snapshot(a, bid)
+    plan = next(o for o in snapshot["objects"] if o["kind"] == "financial_plan")
+    [reason] = plan["stale_reasons"]
+    fallback = "WARNING: " + STALE_WITHOUT_MESSAGE
+    for missing in ({k: v for k, v in reason.items() if k != "message"}, {**reason, "message": None}, {}):
+        plan["stale_reasons"] = [missing, reason]
+        _, content = render_document("business_plan", snapshot)
+        assert f"## Financial scenarios\n\n{fallback}\n\nWARNING: {reason['message']}\n\nModel: " in content
+        assert "WARNING: None" not in content and content.count("WARNING:") == 2
+    # A snapshot built by hand, with no stale_reasons at all, prints the figures with no warning.
+    for absent in ({}, {"stale_reasons": None}):
+        plan.pop("stale_reasons", None)
+        plan.update(absent)
+        _, content = render_document("business_plan", snapshot)
+        assert "WARNING:" not in content and "## Financial scenarios\n\nModel: Pilot. " in content
+    assert stale_warnings(None) == []
 
 
 def test_a_single_step_and_a_missing_deal_read_correctly():
