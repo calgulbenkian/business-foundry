@@ -227,7 +227,8 @@ def build_server():
         return (
             opening(business_id, "Run a structured readiness review.")
             + "Step 2: inspect tasks and their blockers, records still at assumption or reported "
-            "certainty without reviewed evidence, and deals or documents marked stale.\n"
+            "certainty without reviewed evidence, and deals, forecasts or documents marked stale (a stale deal "
+            "or forecast lists why in stale_reasons).\n"
             "Step 3: summarize the gaps for the human, grouped by severity, and ask before making any "
             "change.\n\n" + rules
         )

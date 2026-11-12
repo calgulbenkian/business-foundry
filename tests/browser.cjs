@@ -82,6 +82,46 @@ async function main() {
       await page.locator('#content h1').waitFor();
       assert((await page.locator('#content').innerText()).length > 100);
     }
+    // A jurisdiction change made through the API: the demo's earlier deal analysis and forecast show the
+    // server's own sentence, and the page composes none of its own.
+    const demo = await page.locator('#business-select').inputValue();
+    const demoUrl = origin + '/api/businesses/' + demo;
+    const changed = await context.request.post(demoUrl + '/jurisdiction', {
+      headers: { Origin: origin, 'Idempotency-Key': 'browser-jurisdiction-change' },
+      data: {
+        expected_version: (await (await context.request.get(demoUrl)).json()).business.version,
+        jurisdiction: 'GB',
+        reason: 'Synthetic browser check of earlier analyses after a jurisdiction change.',
+        evidence_ids: [],
+      },
+    });
+    assert.equal(changed.status(), 200, await changed.text());
+    const marked = await (await context.request.get(demoUrl)).json();
+    const reasonOf = (kind) => {
+      const [reason] = marked.objects.find((o) => o.kind === kind).stale_reasons;
+      assert.equal(reason.code, 'jurisdiction_changed');
+      return reason.message;
+    };
+    const dealReason = reasonOf('deal'),
+      planReason = reasonOf('financial_plan');
+    assert(
+      dealReason.startsWith(
+        'This deal analysis was saved while the planning jurisdiction was undecided. It is now GB.',
+      ),
+    );
+    assert(
+      planReason.startsWith(
+        'This forecast was saved while the planning jurisdiction was undecided. It is now GB.',
+      ),
+    );
+    await page.reload();
+    await page.getByRole('heading', { name: 'Make the next decision count.' }).waitFor();
+    await page.locator('#content .notice').filter({ hasText: planReason }).waitFor();
+    await nav('Acquisitions');
+    await page.locator('#content .notice').filter({ hasText: dealReason }).waitFor();
+    assert.equal(await page.getByText('Supporting evidence changed.', { exact: false }).count(), 0);
+    await nav('Financial model');
+    await page.locator('#content .notice').filter({ hasText: planReason }).waitFor();
     // Operate a separate workspace through the same forms a founder uses.
     await page.getByRole('button', { name: '+ New business', exact: true }).click();
     await page.getByLabel('Business name', { exact: true }).fill('Browser workflow test');
@@ -216,7 +256,7 @@ async function main() {
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, workspace creation, records, evidence review, task decisions, forecast, acquisition, document, invoice, payment, persistence, integrity, XSS text handling and mobile layout.',
+      'Browser checks passed: login, workspace creation, records, evidence review, task decisions, forecast, acquisition, marks on earlier analyses after a jurisdiction change, document, invoice, payment, persistence, integrity, XSS text handling and mobile layout.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

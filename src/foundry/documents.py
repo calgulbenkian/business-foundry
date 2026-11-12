@@ -128,10 +128,16 @@ INPUT_ROWS = (
 DCF_NOT_AVAILABLE = "Not available — needs at least 12 months and positive terminal cash flow"
 
 
+def stale_warnings(snapshot_object) -> list[str]:
+    """One warning per reason the snapshot gives for a stale deal analysis or forecast, in its words."""
+    reasons = (snapshot_object or {}).get("stale_reasons", [])
+    return [line for r in reasons for line in (f"WARNING: {r['message']}", "")]
+
+
 def financial_section(p, currency) -> list[str]:
     data = p["data"]
     scenarios = data["scenarios"]
-    out = [
+    out = stale_warnings(p) + [
         f"Model: {cell(p['title'])} ({p['id']}). Currency: {currency}. "
         f"Horizon: {data['inputs']['months']} months. These are forecasts, not booked actuals.",
         "",
@@ -225,13 +231,7 @@ def coverage(value) -> str:
 def deal_section(deal, snapshot, currency) -> list[str]:
     a, inp = deal["data"]["analysis"], deal["data"]["inputs"]
     snap_deal = next((o for o in snapshot["objects"] if o["id"] == deal["id"]), None)
-    out = []
-    if snap_deal and snap_deal.get("stale"):
-        out += [
-            "WARNING: Supporting evidence has changed since this deal analysis was saved. "
-            "Run a revised analysis before relying on these figures.",
-            "",
-        ]
+    out = stale_warnings(snap_deal)
     out += [f"Currency: {currency}.", "", "### Earnings normalization", ""]
     rows = [
         ["Reported EBITDA", fmt_money(inp["reported_ebitda"]), ""],

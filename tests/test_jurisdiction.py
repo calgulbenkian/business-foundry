@@ -6,6 +6,7 @@ hand below; they are deliberately not derived from the catalog at run time.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -19,6 +20,7 @@ from mcp.client.stdio import stdio_client
 from test_mcp import foundry_api
 
 from foundry import catalog, cli, models
+from foundry import service as service_module
 from foundry.api import create_app
 from foundry.demo import seed
 from foundry.service import Service
@@ -1150,3 +1152,525 @@ def test_agent_through_mcp_has_no_jurisdiction_tool_and_cannot_move_superseded_s
         )
         assert preview.status_code == 200 and preview.json()["to"] == "SE"
     assert all_tasks(service, owner, bid)[old["id"]] == superseded
+
+
+# Earlier deal analyses and forecasts after a jurisdiction change. The mark is worked out when the records
+# are read, from the event sequence; nothing stored is rewritten and no step is blocked by it.
+
+EVIDENCE_CHANGED = (
+    "Supporting evidence has changed since this deal analysis was saved. "
+    "Run a revised analysis before relying on these figures."
+)
+DEAL_SAVED_UNDER = (
+    "This deal analysis was saved while the planning jurisdiction was {saved}. It is now {now}. "
+    "Check its assumptions, the tax rate among them, and run a revised analysis before relying on these figures."
+)
+FORECAST_SAVED_UNDER = (
+    "This forecast was saved while the planning jurisdiction was {saved}. It is now {now}. "
+    "Check its assumptions, the tax rate among them, and save a revised forecast before relying on these figures."
+)
+# What a deal and a forecast row held before this round; it adds no stored field.
+DEAL_FIELDS = {"inputs", "analysis", "evidence_ids", "evidence_versions"}
+FORECAST_FIELDS = {
+    "model_version",
+    "inputs",
+    "scenarios",
+    "scenario_definitions",
+    "assumptions",
+    "evidence_ids",
+}
+
+
+def evidence_reason():
+    return {"code": "evidence_changed", "message": EVIDENCE_CHANGED}
+
+
+def jurisdiction_reason(kind, saved, now):
+    template = DEAL_SAVED_UNDER if kind == "deal" else FORECAST_SAVED_UNDER
+    return {
+        "code": "jurisdiction_changed",
+        "saved_jurisdiction": saved,
+        "current_jurisdiction": now,
+        "message": template.format(saved=saved, now=now),
+    }
+
+
+def save_forecast(service, actor, bid, title="Synthetic forecast"):
+    return service.save_forecast(
+        actor,
+        bid,
+        key(),
+        dump(models.ForecastCreate, title=title, inputs=dump(models.ForecastInputs, months=12)),
+    )
+
+
+def save_deal(service, actor, bid, target="Synthetic target", evidence=()):
+    return service.save_deal(
+        actor,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target=target,
+            thesis="A synthetic deal thesis.",
+            evidence_ids=[e["id"] for e in evidence],
+        ),
+    )
+
+
+def marks(snapshot):
+    """(stale, reasons) of every deal and forecast in a snapshot, by id."""
+    return {
+        o["id"]: (o["stale"], o["stale_reasons"])
+        for o in snapshot["objects"]
+        if o["kind"] in {"deal", "financial_plan"}
+    }
+
+
+def mark(service, actor, bid, record):
+    return marks(service.snapshot(actor, bid))[record["id"]]
+
+
+def unmarked():
+    return (False, [])
+
+
+def document(service, actor, bid, template, deal=None):
+    payload = dump(models.DocumentCreate, template=template, deal_id=deal["id"] if deal else None)
+    return service.generate_document(actor, bid, key(), payload)["data"]["content"]
+
+
+def test_demo_through_the_api_marks_the_deal_and_forecast_and_documents_warn_above_figures(setup, client):
+    _, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    before = client.get(f"/api/businesses/{bid}").json()
+    deal = next(o for o in before["objects"] if o["kind"] == "deal")
+    plan = next(o for o in before["objects"] if o["kind"] == "financial_plan")
+    assert (deal["stale"], deal["stale_reasons"]) == unmarked()
+    assert (plan["stale"], plan["stale_reasons"]) == unmarked()
+
+    response = client.post(
+        f"/api/businesses/{bid}/jurisdiction",
+        json=change_body(version=before["business"]["version"]),
+        headers={"Idempotency-Key": key()},
+    )
+    assert response.status_code == 200
+
+    snapshot = client.get(f"/api/businesses/{bid}").json()
+    by_id = {o["id"]: o for o in snapshot["objects"]}
+    assert next(o for o in snapshot["objects"] if o["kind"] == "document")["stale"] is True
+    deal_reason = jurisdiction_reason("deal", "undecided", "GB")
+    plan_reason = jurisdiction_reason("financial_plan", "undecided", "GB")
+    assert (by_id[deal["id"]]["stale"], by_id[deal["id"]]["stale_reasons"]) == (True, [deal_reason])
+    assert (by_id[plan["id"]]["stale"], by_id[plan["id"]]["stale_reasons"]) == (True, [plan_reason])
+
+    memo = client.post(
+        f"/api/businesses/{bid}/documents",
+        json={"template": "investment_memo", "deal_id": deal["id"]},
+        headers={"Idempotency-Key": key()},
+    ).json()["data"]["content"]
+    assert "Planning jurisdiction: GB." in memo
+    assert memo.count("WARNING:") == 1
+    assert (
+        "These values are input-dependent scenarios. Multiples are user assumptions, not fetched market "
+        f"comparables.\n\nWARNING: {deal_reason['message']}\n\nCurrency: USD.\n\n### Earnings normalization"
+    ) in memo
+    plan_doc = client.post(
+        f"/api/businesses/{bid}/documents",
+        json={"template": "business_plan"},
+        headers={"Idempotency-Key": key()},
+    ).json()["data"]["content"]
+    assert plan_doc.count("WARNING:") == 1
+    assert f"## Financial scenarios\n\nWARNING: {plan_reason['message']}\n\nModel: " in plan_doc
+
+
+def test_a_deal_with_changed_evidence_and_an_earlier_jurisdiction_lists_and_prints_both(setup):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    unreviewed = source(service, owner, bid, review=False)
+    deal = save_deal(service, owner, bid, evidence=[unreviewed])
+    assert mark(service, owner, bid, deal) == unmarked()
+    source_review = service.review_evidence(
+        owner,
+        bid,
+        unreviewed["id"],
+        key(),
+        dump(models.Review, note="Checked the synthetic source text.", expected_version=1),
+    )
+    assert source_review["version"] == 2
+    assert mark(service, owner, bid, deal) == (True, [evidence_reason()])
+
+    change(service, owner, bid, "SE")
+
+    reasons = [evidence_reason(), jurisdiction_reason("deal", "undecided", "SE")]
+    assert mark(service, owner, bid, deal) == (True, reasons)
+    memo = document(service, owner, bid, "investment_memo", deal)
+    assert f"WARNING: {reasons[0]['message']}\n\nWARNING: {reasons[1]['message']}\n\nCurrency: USD.\n" in memo
+    assert memo.count("WARNING:") == 2
+
+
+def test_a_forecast_saved_under_an_earlier_jurisdiction_is_marked(setup):
+    _, service, owner, bid, _ = setup
+    plan = save_forecast(service, owner, bid)
+    assert mark(service, owner, bid, plan) == unmarked()
+    change(service, owner, bid, "US-DE")
+    assert mark(service, owner, bid, plan) == (
+        True,
+        [jurisdiction_reason("financial_plan", "undecided", "US-DE")],
+    )
+
+
+def test_nothing_changes_a_deal_or_forecast_after_it_is_created(setup):
+    """Requirement 5: the figures are calculated once. Withdrawing cited evidence, adding records and
+    changing the jurisdiction leave each record at version 1 with exactly the fields it was created with."""
+    store, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    cited = source(service, owner, bid)
+    deal = save_deal(service, owner, bid, evidence=[cited])
+    plan = save_forecast(service, owner, bid)
+    change(service, owner, bid, "GB")
+    withdraw(service, owner, bid, cited)
+    service.add_record(owner, bid, key(), dump(models.RecordCreate, kind="risk", title="A new risk"))
+    with store.read() as con:
+        rows = {
+            r["id"]: (r["version"], set(json.loads(r["data"])))
+            for r in con.execute("SELECT * FROM objects WHERE id IN (?,?)", (deal["id"], plan["id"]))
+        }
+        actions = [
+            r[0]
+            for r in con.execute(
+                "SELECT action FROM events WHERE object_id IN (?,?) ORDER BY seq", (deal["id"], plan["id"])
+            )
+        ]
+    assert rows == {deal["id"]: (1, DEAL_FIELDS), plan["id"]: (1, FORECAST_FIELDS)}
+    assert actions == ["deal.created", "financial_plan.created"]
+
+
+@pytest.mark.parametrize("clock", ["same tick", "clock runs backwards"])
+def test_order_comes_from_the_event_sequence_not_the_clock(setup, monkeypatch, clock):
+    """A record saved just before the change is marked; one saved just after is not, even when both
+    saves and the change carry the same timestamp, or the later save carries an earlier one."""
+    store, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    stamps = iter(["2026-11-11T12:00:00.000000+00:00"] * 1000)
+    if clock == "clock runs backwards":
+        stamps = iter(f"2026-11-11T12:00:00.{999999 - i:06d}+00:00" for i in range(1000))
+
+    def fixed():
+        return next(stamps)
+
+    monkeypatch.setattr("foundry.store.now", fixed)
+    monkeypatch.setattr("foundry.service.now", fixed)
+    seq = last_seq(store)
+    early_deal, early_plan = (
+        save_deal(service, owner, bid, "Early"),
+        save_forecast(service, owner, bid, "Early"),
+    )
+    change(service, owner, bid, "GB")
+    late_deal, late_plan = save_deal(service, owner, bid, "Late"), save_forecast(service, owner, bid, "Late")
+    with store.read() as con:
+        stamped = [
+            r[0] for r in con.execute("SELECT created_at FROM events WHERE seq>? ORDER BY seq", (seq,))
+        ]
+    if clock == "same tick":
+        assert len(set(stamped)) == 1
+    else:
+        assert stamped == sorted(stamped, reverse=True)
+
+    found = marks(service.snapshot(owner, bid))
+    assert found[early_deal["id"]] == (True, [jurisdiction_reason("deal", "undecided", "GB")])
+    assert found[early_plan["id"]] == (True, [jurisdiction_reason("financial_plan", "undecided", "GB")])
+    assert found[late_deal["id"]] == unmarked()
+    assert found[late_plan["id"]] == unmarked()
+
+
+def test_records_stored_without_any_new_field_are_marked_without_a_migration(setup):
+    """Requirement 7. Saving is unchanged by this round: a deal or forecast row holds exactly the fields
+    the earlier code wrote, and the mark is read from events that code already recorded. So a record
+    written before the upgrade is the same thing as one written here; it is marked after a later change."""
+    store, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    deal, plan = save_deal(service, owner, bid), save_forecast(service, owner, bid)
+    with store.read() as con:
+        stored = {
+            r["id"]: set(json.loads(r["data"]))
+            for r in con.execute("SELECT id, data FROM objects WHERE kind IN ('deal','financial_plan')")
+        }
+    assert stored == {deal["id"]: DEAL_FIELDS, plan["id"]: FORECAST_FIELDS}
+
+    change(service, owner, bid, "GB")
+
+    assert mark(service, owner, bid, deal) == (True, [jurisdiction_reason("deal", "undecided", "GB")])
+    assert mark(service, owner, bid, plan) == (
+        True,
+        [jurisdiction_reason("financial_plan", "undecided", "GB")],
+    )
+
+
+def test_away_and_back_clears_the_mark_only_for_records_saved_under_the_original(setup):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    first_deal, first_plan = (
+        save_deal(service, owner, bid, "First"),
+        save_forecast(service, owner, bid, "First"),
+    )
+    change(service, owner, bid, "GB")
+    gb_deal, gb_plan = (
+        save_deal(service, owner, bid, "Under GB"),
+        save_forecast(service, owner, bid, "Under GB"),
+    )
+    change(service, owner, bid, "undecided")
+
+    found = marks(service.snapshot(owner, bid))
+    assert found[first_deal["id"]] == unmarked()
+    assert found[first_plan["id"]] == unmarked()
+    assert found[gb_deal["id"]] == (True, [jurisdiction_reason("deal", "GB", "undecided")])
+    assert found[gb_plan["id"]] == (True, [jurisdiction_reason("financial_plan", "GB", "undecided")])
+
+
+def test_several_changes_name_the_jurisdiction_each_record_was_saved_under(setup):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    first = save_forecast(service, owner, bid, "First")
+    change(service, owner, bid, "US-DE")
+    delaware_deal, delaware_plan = save_deal(service, owner, bid), save_forecast(service, owner, bid, "US-DE")
+    change(service, owner, bid, "GB")
+
+    found = marks(service.snapshot(owner, bid))
+    assert found[first["id"]] == (True, [jurisdiction_reason("financial_plan", "undecided", "GB")])
+    assert found[delaware_deal["id"]] == (True, [jurisdiction_reason("deal", "US-DE", "GB")])
+    assert found[delaware_plan["id"]] == (True, [jurisdiction_reason("financial_plan", "US-DE", "GB")])
+
+
+@pytest.mark.parametrize("jurisdiction", list(PACKAGE))
+def test_a_business_with_no_jurisdiction_change_marks_nothing(setup, jurisdiction):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, jurisdiction, route="acquire")["id"]
+    deal, plan = save_deal(service, owner, bid), save_forecast(service, owner, bid)
+    found = marks(service.snapshot(owner, bid))
+    assert found == {deal["id"]: unmarked(), plan["id"]: unmarked()}
+    assert "WARNING:" not in document(service, owner, bid, "investment_memo", deal)
+    assert "WARNING:" not in document(service, owner, bid, "business_plan")
+
+
+def test_records_saved_after_the_change_have_no_mark_and_documents_no_warning(setup):
+    _, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    change(service, owner, bid, "GB")
+    deal, plan = save_deal(service, owner, bid, "Fresh"), save_forecast(service, owner, bid, "Fresh")
+    found = marks(service.snapshot(owner, bid))
+    assert found[deal["id"]] == unmarked() and found[plan["id"]] == unmarked()
+    # The earlier demo deal and forecast stay marked; documents printing only the fresh ones do not warn.
+    assert sum(stale for stale, _ in found.values()) == 2
+    assert "WARNING:" not in document(service, owner, bid, "investment_memo", deal)
+    business_plan = document(service, owner, bid, "business_plan")
+    assert f"Model: Fresh ({plan['id']})" in business_plan and "WARNING:" not in business_plan
+
+
+def test_a_change_leaves_every_stored_deal_forecast_revision_and_earlier_event_byte_for_byte(setup):
+    store, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    save_deal(service, owner, bid, "Second")
+    save_forecast(service, owner, bid, "Second")
+    with store.read() as con:
+        ids = [r[0] for r in con.execute("SELECT id FROM objects WHERE kind IN ('deal','financial_plan')")]
+    assert len(ids) == 4
+    seq = last_seq(store)
+
+    def rows():
+        stored = raw(store)
+        return (
+            [r for r in stored["objects"] if r[0] in ids],
+            [r for r in stored["revisions"] if r[0] in ids],
+            [r for r in stored["events"] if r[0] <= seq],
+        )
+
+    before = rows()
+    change(service, owner, bid, "GB")
+    assert all(stale for stale, _ in marks(service.snapshot(owner, bid)).values())
+    assert rows() == before
+
+
+def test_the_jurisdiction_mark_blocks_no_deal_step_and_changed_evidence_still_does(setup):
+    _, service, owner, _, _ = setup
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    reviewed = source(service, owner, bid)
+    deal = save_deal(service, owner, bid, evidence=[reviewed])
+    steps = deal_steps(service, owner, bid)
+    change(service, owner, bid, "GB")
+    assert mark(service, owner, bid, deal)[0] is True
+    after = deal_steps(service, owner, bid)
+    assert {i: t["blockers"] for i, t in after.items()} == {i: t["blockers"] for i, t in steps.items()}
+    mandate = next(t for t in after.values() if t["data"]["key"] == "mandate")
+    assert mandate["blockers"] == []
+    for state in ("prepared", "approved", "verified"):
+        mandate = move(service, owner, bid, mandate, state, [reviewed])
+    assert mandate["state"] == "verified"
+
+    unreviewed = source(service, owner, bid, review=False, title="Later source")
+    changed_deal = save_deal(service, owner, bid, "Changed basis", evidence=[unreviewed])
+    service.review_evidence(
+        owner,
+        bid,
+        unreviewed["id"],
+        key(),
+        dump(models.Review, note="Checked the synthetic source text.", expected_version=1),
+    )
+    assert mark(service, owner, bid, changed_deal) == (True, [evidence_reason()])
+    blocked = next(
+        t
+        for t in deal_steps(service, owner, bid).values()
+        if t["data"]["deal_id"] == changed_deal["id"] and t["data"]["key"] == "mandate"
+    )
+    assert blocked["blockers"] == ["Supporting deal evidence changed; create and review a fresh analysis"]
+    blocked = move(service, owner, bid, blocked, "prepared", [reviewed])
+    with pytest.raises(DomainError, match="Supporting deal evidence changed"):
+        move(service, owner, bid, blocked, "approved", [reviewed])
+
+
+def test_the_snapshot_fingerprint_is_the_same_hash_of_stored_rows_so_no_document_flips(setup):
+    """Requirement 12. The fingerprint is a hash of the stored business and non-document rows, worked out
+    independently here; the new marks are not part of it, so upgrading alone changes no document's mark."""
+    store, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    change(service, owner, bid, "GB")
+    save_forecast(service, owner, bid, "After the change")
+    service.generate_document(owner, bid, key(), dump(models.DocumentCreate, template="business_plan"))
+
+    def unpack(row):
+        return {**dict(row), "data": json.loads(row["data"])}
+
+    with store.read() as con:
+        business = unpack(con.execute("SELECT * FROM businesses WHERE id=?", (bid,)).fetchone())
+        rows = [
+            unpack(r)
+            for r in con.execute(
+                "SELECT * FROM objects WHERE business_id=? AND kind!='document' ORDER BY created_at,id",
+                (bid,),
+            )
+        ]
+    expected = hashlib.sha256(
+        json.dumps(
+            {"business": business, "objects": rows},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    snapshot = service.snapshot(owner, bid)
+    assert snapshot["source_fingerprint"] == expected
+    documents = [o for o in snapshot["objects"] if o["kind"] == "document"]
+    assert [d["stale"] for d in documents] == [True, False]
+    assert all(set(d) == set(documents[0]) for d in documents) and "stale_reasons" not in documents[0]
+
+
+def test_every_reader_sees_the_same_mark_http_agent_adapter_and_document(setup, client):
+    store, service, owner, bid, _ = setup
+    agent = service.add_principal(owner, {"name": "Mark agent", "role": "agent", "business_ids": [bid]})
+    service_deal = save_deal(service, owner, bid)
+    plan = save_forecast(service, owner, bid)
+    change(service, owner, bid, "SE")
+    expected = {
+        service_deal["id"]: (True, [jurisdiction_reason("deal", "undecided", "SE")]),
+        plan["id"]: (True, [jurisdiction_reason("financial_plan", "undecided", "SE")]),
+    }
+    assert marks(service.snapshot(owner, bid)) == expected
+    assert marks(client.get(f"/api/businesses/{bid}").json()) == expected
+    viewer = service.add_principal(owner, {"name": "Viewer", "role": "viewer", "business_ids": [bid]})
+    assert marks(service.snapshot(store.authenticate(viewer["token"]), bid)) == expected
+    memo = document(service, owner, bid, "investment_memo", service_deal)
+    assert f"WARNING: {expected[service_deal['id']][1][0]['message']}" in memo
+    assert f"WARNING: {expected[plan['id']][1][0]['message']}" in document(
+        service, owner, bid, "business_plan"
+    )
+
+    async def check(url):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "foundry.cli", "mcp"],
+            env={**os.environ, "FOUNDRY_API_URL": url, "FOUNDRY_API_TOKEN": agent["token"]},
+        )
+        async with stdio_client(parameters) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                body = json.loads(
+                    (await session.call_tool("get_business", {"business_id": bid})).content[0].text
+                )
+                assert marks(body) == expected
+
+    with foundry_api(store) as url:
+        asyncio.run(check(url))
+
+
+# Prerequisites of added package steps resolve against the live steps that remain. Today's catalog cannot
+# show this (each package step depends only on the base structure step), so these use a synthetic catalog.
+
+
+def synthetic_packages(monkeypatch, se_prerequisites):
+    packages = {
+        "undecided": [catalog.task("first_local", "First local step", "Setup", "Synthetic step.")],
+        "GB": [catalog.task("gb_local", "GB local step", "Setup", "Synthetic step.")],
+        "SE": [catalog.task("se_local", "SE local step", "Setup", "Synthetic step.", se_prerequisites)],
+        "US-DE": [],
+        "other": [],
+    }
+    monkeypatch.setattr(catalog, "JURISDICTIONS", packages)
+    monkeypatch.setattr(service_module, "PACKAGE_KEYS", {"first_local", "gb_local", "se_local"})
+
+
+def added_prerequisites(service, owner, bid, to):
+    preview = service.preview_jurisdiction(owner, bid, to)
+    result = change(service, owner, bid, to)
+    [added] = result["added"]
+    stored = all_tasks(service, owner, bid)[added["id"]]
+    assert preview["added"][0]["depends_on"] == added["depends_on"] == stored["data"]["depends_on"]
+    return added["depends_on"]
+
+
+def test_a_prerequisite_found_only_on_a_superseded_step_is_not_wired(setup, monkeypatch):
+    _, service, owner, _, _ = setup
+    synthetic_packages(monkeypatch, ["first_local", "gb_local", "structure"])
+    bid = make_business(service, owner, "undecided")["id"]
+    first = live_core(service, owner, bid)["first_local"]
+    change(service, owner, bid, "GB")  # supersedes first_local
+    assert all_tasks(service, owner, bid)[first["id"]]["state"] == "superseded"
+    structure = live_core(service, owner, bid)["structure"]["id"]
+    # first_local was superseded earlier; gb_local is superseded by this change itself.
+    assert added_prerequisites(service, owner, bid, "SE") == [structure]
+
+
+def test_a_prerequisite_found_only_on_a_deal_step_is_not_wired(setup, monkeypatch):
+    _, service, owner, _, _ = setup
+    synthetic_packages(monkeypatch, ["mandate", "structure"])
+    bid = make_business(service, owner, "undecided", route="acquire")["id"]
+    save_deal(service, owner, bid)
+    assert any(t["data"]["key"] == "mandate" for t in deal_steps(service, owner, bid).values())
+    structure = live_core(service, owner, bid)["structure"]["id"]
+    assert added_prerequisites(service, owner, bid, "SE") == [structure]
+
+
+def test_a_prerequisite_on_a_live_base_step_is_wired_to_that_step(setup, monkeypatch):
+    _, service, owner, _, _ = setup
+    synthetic_packages(monkeypatch, ["founders", "structure"])
+    bid = make_business(service, owner, "undecided")["id"]
+    core = live_core(service, owner, bid)
+    assert added_prerequisites(service, owner, bid, "SE") == [core["founders"]["id"], core["structure"]["id"]]
+    assert live_core(service, owner, bid)["se_local"]["blockers"] == [
+        "Complete: Record founder and IP arrangements",
+        "Complete: Decide the entity and ownership structure",
+    ]
+
+
+def test_package_steps_name_only_base_steps_as_prerequisites():
+    """A jurisdiction change wires an added step's prerequisites only to live base steps that remain, and
+    never between two steps of the package being added. A package step that names another package step
+    would therefore get no dependency after a change, though it would at creation. Wire that in
+    jurisdiction_plan before adding such a step."""
+    for jurisdiction, specs in catalog.JURISDICTIONS.items():
+        for spec in specs:
+            named = set(spec["depends_on_keys"]) - BASE_KEYS
+            assert not named, (
+                f"{jurisdiction} step {spec['key']} names {sorted(named)} as prerequisites. A jurisdiction "
+                "change resolves package prerequisites against base steps only, so these would be dropped."
+            )

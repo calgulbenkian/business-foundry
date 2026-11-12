@@ -56,6 +56,33 @@ def evidence_basis(history):
     return set().union(*(cited(entry) for entry in basis))
 
 
+# A saved deal analysis or forecast keeps the figures it was calculated with. When something it relied on
+# has changed since, the snapshot marks it stale and lists why. Each reason's message is the one sentence
+# that the snapshot, the interface and generated documents all show.
+ANALYSIS_NAMES = {"deal": "deal analysis", "financial_plan": "forecast"}
+ANALYSIS_REDO = {"deal": "run a revised analysis", "financial_plan": "save a revised forecast"}
+ANALYSIS_EVENTS = ("deal.created", "financial_plan.created")
+
+
+def evidence_changed_reason():
+    return {
+        "code": "evidence_changed",
+        "message": "Supporting evidence has changed since this deal analysis was saved. "
+        "Run a revised analysis before relying on these figures.",
+    }
+
+
+def jurisdiction_changed_reason(kind, saved, current):
+    return {
+        "code": "jurisdiction_changed",
+        "saved_jurisdiction": saved,
+        "current_jurisdiction": current,
+        "message": f"This {ANALYSIS_NAMES[kind]} was saved while the planning jurisdiction was {saved}. "
+        f"It is now {current}. Check its assumptions, the tax rate among them, and {ANALYSIS_REDO[kind]} "
+        "before relying on these figures.",
+    }
+
+
 def evaluate(model, *args):
     """Run a financial model; an arithmetic failure is a refusal of these inputs, not a server fault."""
     try:
@@ -694,6 +721,34 @@ class Service:
         with self.store.read() as con:
             return self._snapshot(con, bid)
 
+    def saved_jurisdictions(self, con, bid):
+        """The planning jurisdiction in force when each deal analysis and forecast was calculated, by id.
+
+        Read from the event sequence, never from clock time. A deal or forecast is calculated once, when it
+        is created, and nothing changes it afterwards. A record created before the first jurisdiction
+        change was saved under that change's "from"; a later one under the "to" of the latest change
+        before it. With no jurisdiction change in the history the result is empty: nothing to compare.
+        Nothing is stored, so records written before this existed are covered without a migration.
+        """
+        rows = con.execute(
+            "SELECT action, object_id, payload FROM events WHERE business_id=? AND action IN (?,?,?) "
+            "ORDER BY seq",
+            (bid, "business.jurisdiction_changed", *ANALYSIS_EVENTS),
+        )
+        in_force, before_first, saved = None, [], {}
+        for row in rows:
+            if row["action"] != "business.jurisdiction_changed":
+                if in_force is None:
+                    before_first.append(row["object_id"])
+                else:
+                    saved[row["object_id"]] = in_force
+                continue
+            change = json.loads(row["payload"])
+            if in_force is None:
+                saved.update(dict.fromkeys(before_first, change["from"]))
+            in_force = change["to"]
+        return saved
+
     def _snapshot(self, con, bid):
         business = self.store.business(con, bid)
         objects = self.store.objects(con, bid)
@@ -701,15 +756,23 @@ class Service:
         fingerprint = digest(
             canonical({"business": business, "objects": [o for o in objects if o["kind"] != "document"]})
         )
+        # Marks below are worked out on every read and added after the fingerprint; nothing is stored.
+        saved_under = self.saved_jurisdictions(con, bid)
+        jurisdiction = business["data"]["jurisdiction"]
         for obj in objects:
             if obj["kind"] == "task":
                 obj["blockers"] = self.blockers(con, bid, obj)
             if obj["kind"] == "document":
                 obj["stale"] = obj["data"]["source_fingerprint"] != fingerprint
-            if obj["kind"] == "deal":
-                obj["stale"] = any(
-                    by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()
-                )
+            if obj["kind"] in ANALYSIS_NAMES:
+                reasons = []
+                if any(by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()):
+                    reasons.append(evidence_changed_reason())
+                saved = saved_under.get(obj["id"])
+                if saved is not None and saved != jurisdiction:
+                    reasons.append(jurisdiction_changed_reason(obj["kind"], saved, jurisdiction))
+                obj["stale"] = bool(reasons)
+                obj["stale_reasons"] = reasons
             if obj["kind"] in {"invoice", "payment"}:
                 refs = [
                     obj["data"].get(k)

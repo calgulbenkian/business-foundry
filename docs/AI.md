@@ -47,7 +47,7 @@ The adapter registers three MCP prompts, each taking a `business_id`:
 
 - `founder_intake` — interview for starting from a concept: intended buyer, concrete problem, offer/pricing/acceptance, delivery assets and third-party rights, unit economics and cash timing (`build_forecast`), source evidence (`add_evidence`), and the operating footprint a human needs to select the planning jurisdiction.
 - `acquisition_intake` — target and thesis, reported revenue/EBITDA and replacement management, evidence-backed earnings adjustments, then valuation multiples, uses and debt or seller financing (`analyze_acquisition`).
-- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals or documents; summarizes gaps and asks before changing anything.
+- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals, forecasts or documents (each stale deal or forecast lists its reasons in `stale_reasons`); summarizes gaps and asks before changing anything.
 
 Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, use `prepare_task` only to prepare work, and leave the planning jurisdiction to a human. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
 
