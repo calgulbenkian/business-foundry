@@ -2883,6 +2883,136 @@ print(json.dumps({
         'no reason ran a script',
       );
     });
+    // Round 9, B. The backup command a desktop owner is shown. Only the desktop window's server adds
+    // `desktop` to an owner's /api/me, and this test's server is `foundry serve`, so the field is
+    // added on its way to the page. Without it, both places say what `foundry serve` always shows.
+    lateCase('round 9 B: the backup command, in the panel and in the integrity view', async () => {
+      const panel = race
+        .locator('#insp details')
+        .filter({ has: race.locator('summary', { hasText: 'Backup and restore' }) });
+      const backups = race
+        .locator('#insp .i-sec')
+        .filter({ has: race.locator('h3', { hasText: /^Backups$/ }) });
+      const paras = async (where) =>
+        (await where.locator('p').allTextContents()).map((t) => t.trim());
+      let field,
+        withField = false;
+      await race.route('**/api/me', async (route) => {
+        const response = await route.fetch();
+        const body = await response.json();
+        await route.fulfill({ response, json: withField ? { ...body, desktop: field } : body });
+      });
+      // both places, as the page shows them after loading again with the field as it is now
+      const shownWith = async (value, on = true) => {
+        field = value;
+        withField = on;
+        await race.reload();
+        await race.locator('#list .today-head').waitFor();
+        await onBusiness(bid, testName);
+        await raceSource('access');
+        await race.locator('#list .row[data-key="ai:overview"]').click();
+        await panel.waitFor({ state: 'attached' });
+        const shown = {
+          panel: await paras(panel),
+          panelHtml: await panel.innerHTML(),
+          panelCode: await panel.locator('code').allTextContents(),
+          panelMarkup: await panel.locator('img, b').count(),
+        };
+        await raceSource('history');
+        await race.locator('#list .row[data-key="integrity"]').click();
+        await backups.waitFor();
+        shown.integrity = await paras(backups);
+        shown.integrityCode = await backups.locator('code').allTextContents();
+        shown.integrityMarkup = await backups.locator('img, b').count();
+        assert(
+          ![...shown.panel, ...shown.integrity].some((t) => /\bundefined\b|\bnull\b/.test(t)),
+          'neither place prints undefined or null',
+        );
+        return shown;
+      };
+      const PLAIN_PANEL =
+        '<summary>Backup and restore</summary><p class="fine">Run <code>uv run foundry backup /private/path/backup.db</code>. Restore into a new database path with <code>uv run foundry --db /private/path/restored.db restore /private/path/backup.db</code>. Backups contain credential hashes and all businesses; protect them.</p>';
+      const PLAIN_INTEGRITY = [
+        'Run uv run foundry backup /private/path/backup.db. Backups hold every business and the credential hashes; keep them private.',
+      ];
+      const plain = async (what, value, on) => {
+        const shown = await shownWith(value, on);
+        assert.equal(shown.panelHtml, PLAIN_PANEL, `${what}: the panel, to the letter`);
+        assert.deepEqual(shown.integrity, PLAIN_INTEGRITY, `${what}: the integrity view`);
+      };
+      // the ordinary server
+      await plain('no field', undefined, false);
+      const restoreText =
+        'To restore, put the backup in a new folder: uv run foundry --db /private/path/restored/foundry.db restore /private/path/backup.db. Then open that folder in the app: uv run foundry-desktop --data-dir /private/path/restored.';
+      const protectText = 'Backups contain credential hashes and all businesses; protect them.';
+      const holdText = 'Backups hold every business and the credential hashes; keep them private.';
+      const database = '/Users/founder/Library/Application Support/Business Foundry/foundry.db';
+      const command = `uv run foundry --db '${database}' backup /private/path/backup.db`;
+      const runText = (c) =>
+        `To back them up, open a terminal in the folder you start Business Foundry from. Then run ${c}. Change /private/path/backup.db to where you want the backup saved.`;
+      let shown = await shownWith({ database, backup_command: command });
+      assert.deepEqual(shown.panel, [
+        `Business Foundry keeps your records in ${database}.`,
+        runText(command),
+        restoreText,
+        protectText,
+      ]);
+      assert.equal(shown.panelCode[1], command, 'the second code is the command');
+      assert.deepEqual(shown.integrity, [
+        `Business Foundry keeps your records in ${database}.`,
+        runText(command),
+        holdText,
+      ]);
+      assert.equal(shown.integrityCode[1], command, 'the integrity view gives the same command');
+      // a path and a command that hold markup and both kinds of quote are shown as text
+      const hostile =
+        '/Users/a&b/"q" \'x\'/<img src=x onerror="window.injectedBackup=true"><b>bold</b>/foundry.db';
+      const hostileCommand = `uv run foundry --db ${hostile} backup &amp; done`;
+      shown = await shownWith({ database: hostile, backup_command: hostileCommand });
+      assert.deepEqual(shown.panelCode.slice(0, 2), [hostile, hostileCommand]);
+      assert.deepEqual(shown.integrityCode.slice(0, 2), [hostile, hostileCommand]);
+      assert.equal(shown.panelMarkup, 0, 'no img or b element in the panel');
+      assert.equal(shown.integrityMarkup, 0, 'none in the integrity view');
+      // no ready command: null, the key missing, an empty string, or not a string
+      const noCommand =
+        'To back them up, open a terminal in the folder you start Business Foundry from. Then run uv run foundry --db DATABASE_PATH backup /private/path/backup.db. Put the path above, quoted for your shell, in place of DATABASE_PATH. Change /private/path/backup.db to where you want the backup saved.';
+      for (const [what, value] of [
+        ['a null command', { database, backup_command: null }],
+        ['no command key', { database }],
+        ['an empty command', { database, backup_command: '' }],
+        ['a command that is not a string', { database, backup_command: 7 }],
+      ]) {
+        shown = await shownWith(value);
+        assert.deepEqual(
+          shown.panel,
+          [
+            `Business Foundry keeps your records in ${database}.`,
+            noCommand,
+            restoreText,
+            protectText,
+          ],
+          `${what}: the panel`,
+        );
+        assert.deepEqual(
+          shown.integrity,
+          [`Business Foundry keeps your records in ${database}.`, noCommand, holdText],
+          `${what}: the integrity view`,
+        );
+      }
+      // a field that cannot be read is read as no field
+      for (const [what, value] of [
+        ['a field that is null', null],
+        ['a field that is a string', 'a string'],
+        ['a field that is a list', [database, command]],
+        ['a database that is not a string', { database: 7, backup_command: command }],
+        ['no database', { backup_command: command }],
+      ])
+        await plain(what, value, true);
+      // the route let go: the ordinary panel again
+      await race.unroute('**/api/me');
+      await plain('the route removed', undefined, false);
+      assert.equal(await race.evaluate(() => Boolean(window.injectedBackup)), false);
+    });
     // Round 8, N2. A view of one item open across a reload of its own business.
     // that a request a hold() is holding reached the server; a page that never sends it fails here,
     // after the page's usual time limit, rather than leaving the test waiting
@@ -4214,7 +4344,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

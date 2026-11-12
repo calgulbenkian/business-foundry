@@ -2856,10 +2856,7 @@ function fillHistory(seq) {
             'What this checks',
             `<p class="prose">Every change is recorded with its actor, sequence and the version it produced, in a hash chain. This check recomputes the chain and compares each current record and revision with its history.</p><p class="fine">${h(a.integrity.limitation)}</p>`,
           ) +
-          sec(
-            'Backups',
-            `<p class="prose">Run <code>uv run foundry backup /private/path/backup.db</code>. Backups hold every business and the credential hashes; keep them private.</p>`,
-          );
+          sec('Backups', backupHelp().integrity);
       }
       el.innerHTML = out;
     },
@@ -2867,6 +2864,45 @@ function fillHistory(seq) {
       el.innerHTML = `<p class="empty">The history could not be loaded: ${h(messageFor(e))}</p>`;
     },
   );
+}
+/* What the page says about backups, in the "Backup and restore" panel and in the integrity view.
+   The desktop window's server tells an owner where the database is and the command that backs it
+   up (`desktop` in /api/me), because there the database is not in the folder a terminal opens in
+   and the plain command would back up some other one. Both places print that command, so they
+   cannot disagree. A field that cannot be read (not an object, or a database that is not a
+   non-empty string) counts as no field; a command that is missing, null, empty or not a string
+   counts as no ready command, and the reader is told what to put in its place. */
+function backupHelp() {
+  const d = state.actor?.desktop;
+  if (!isEntry(d) || typeof d.database !== 'string' || !d.database)
+    return {
+      panel:
+        '<p class="fine">Run <code>uv run foundry backup /private/path/backup.db</code>. Restore into a new database path with <code>uv run foundry --db /private/path/restored.db restore /private/path/backup.db</code>. Backups contain credential hashes and all businesses; protect them.</p>',
+      integrity:
+        '<p class="prose">Run <code>uv run foundry backup /private/path/backup.db</code>. Backups hold every business and the credential hashes; keep them private.</p>',
+    };
+  const ready = typeof d.backup_command === 'string' && d.backup_command !== '';
+  const command = ready
+    ? d.backup_command
+    : 'uv run foundry --db DATABASE_PATH backup /private/path/backup.db';
+  const where = `Business Foundry keeps your records in <code>${h(d.database)}</code>.`,
+    run = `To back them up, open a terminal in the folder you start Business Foundry from. Then run <code>${h(command)}</code>.${ready ? '' : ' Put the path above, quoted for your shell, in place of <code>DATABASE_PATH</code>.'} Change <code>/private/path/backup.db</code> to where you want the backup saved.`,
+    restore =
+      'To restore, put the backup in a new folder: <code>uv run foundry --db /private/path/restored/foundry.db restore /private/path/backup.db</code>. Then open that folder in the app: <code>uv run foundry-desktop --data-dir /private/path/restored</code>.';
+  const paras = (cls, list) => list.map((p) => `<p class="${cls}">${p}</p>`).join('');
+  return {
+    panel: paras('fine', [
+      where,
+      run,
+      restore,
+      'Backups contain credential hashes and all businesses; protect them.',
+    ]),
+    integrity: paras('prose', [
+      where,
+      run,
+      'Backups hold every business and the credential hashes; keep them private.',
+    ]),
+  };
 }
 function inspAccess(kind, id) {
   const authority = flag(
@@ -2973,7 +3009,7 @@ function inspAccess(kind, id) {
     ) +
     sec(
       'Your business records',
-      `<p class="prose">Download a portable snapshot of records, evidence, documents and history. Keep exports private.</p><div class="i-actions"><a class="btn" href="/api/businesses/${h(state.bid)}/export">Export this business</a></div><details class="spaced"><summary>Backup and restore</summary><p class="fine">Run <code>uv run foundry backup /private/path/backup.db</code>. Restore into a new database path with <code>uv run foundry --db /private/path/restored.db restore /private/path/backup.db</code>. Backups contain credential hashes and all businesses; protect them.</p></details>`,
+      `<p class="prose">Download a portable snapshot of records, evidence, documents and history. Keep exports private.</p><div class="i-actions"><a class="btn" href="/api/businesses/${h(state.bid)}/export">Export this business</a></div><details class="spaced"><summary>Backup and restore</summary>${backupHelp().panel}</details>`,
     ) +
     (isOwner()
       ? sec(
