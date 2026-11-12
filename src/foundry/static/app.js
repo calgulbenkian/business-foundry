@@ -65,8 +65,8 @@ let sessionSeq = 0;
 let startSeq = 0;
 /* The sentence about a change of sign-in in another tab that the latest start has still to say,
    and whether this tab showed a workspace when it was told. A start that replaces it after
-   another signal says it in its place (signInChanged); a person's own sign-in does not, because
-   the page then changes for that reason and no other. */
+   another signal says it in its place (signInChanged); a person's own sign-in or sign-out in this
+   tab does not, because the page then changes for that reason and no other. */
 let toldPending = null;
 const state = {
   actor: null,
@@ -4479,6 +4479,8 @@ async function handle(a, el) {
     if (document.activeElement === document.body || !visible(document.activeElement))
       focusFirst(RESTING_FOCUS);
   } else if (a === 'logout') {
+    // a sign-out of this tab's own: a sentence about another tab not yet said is not said now
+    toldPending = null;
     const session = sessionSeq,
       cancel = new AbortController();
     signingOut.add(cancel);
