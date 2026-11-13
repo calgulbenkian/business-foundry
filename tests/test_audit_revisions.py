@@ -3569,6 +3569,226 @@ def test_ai_review_numbers_at_the_edges_of_precision_are_checked_and_exported_ex
     )
 
 
+# Whole review data that is empty or false: null, false, 0, the empty string, the empty list and the
+# empty object. Each case gives the text stored, the value the export carries and that value written
+# as JSON. Python compares False equal to 0, so the exported data is also compared as JSON text.
+EMPTY_OR_FALSE_AI_DATA = [
+    pytest.param("null", None, "null", id="null"),
+    pytest.param("false", False, "false", id="false"),
+    pytest.param("0", 0, "0", id="zero"),
+    pytest.param('""', "", '""', id="empty-string"),
+    pytest.param("[]", [], "[]", id="empty-list"),
+    pytest.param("{}", {}, "{}", id="empty-object"),
+]
+
+
+# Rule: a review whose whole data is changed by SQL to a value that is empty or false is reported,
+# and the export carries that value exactly as stored. Neither the audit nor the export reads it as
+# an empty object, null, an empty list or a string.
+@pytest.mark.parametrize(("stored", "value", "as_json"), EMPTY_OR_FALSE_AI_DATA)
+def test_ai_review_data_changed_to_an_empty_or_false_value_is_reported_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    with store.write() as con:
+        assert con.execute("UPDATE ai_calls SET data=? WHERE id='review_synthetic'", (stored,)).rowcount == 1
+    plain = audited(service, actor, bid)
+    assert plain["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert plain["valid"] is False
+    archive = exported_archive(service, actor, bid)
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+    runs = archive["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is false, 0, the empty string, the empty list or the empty object,
+# with a matching event, is clean, and the export carries that value exactly as stored.
+@pytest.mark.parametrize(
+    ("stored", "value", "as_json"), [p for p in EMPTY_OR_FALSE_AI_DATA if p.id != "null"]
+)
+def test_ai_review_data_that_is_empty_or_false_with_matching_history_is_clean_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, data=value)
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == stored
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is null, with a matching event, is clean, and the export carries
+# null. The application never writes null data; this case pins that the audit compares the data it
+# reads exactly, and does not read null as an empty object. add_ai_review reads data=None as "use
+# the default", so the row and its event are written here the same way that helper writes them.
+def test_ai_review_data_that_is_null_with_matching_history_is_clean_and_exported_as_null(setup):
+    store, service, actor, bid, _ = setup
+    with store.write() as con:
+        con.execute(
+            "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
+            ("review_synthetic", bid, actor["id"], key(), "0" * 64, canonical(None), "unknown", APPENDED_AT),
+        )
+        store.event(
+            con,
+            bid,
+            actor,
+            "ai.unknown",
+            "review_synthetic",
+            {"run_id": "review_synthetic", "state": "unknown", "data_sha256": digest(canonical(None))},
+        )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == "null"
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": None,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == "null"
+
+
+# Known limit, not wanted behaviour: the export orders reviews by created_at as binary text. The
+# application writes every date in one form, so pairs like these only arise from rows written by
+# SQL; this pins what the export does with them. Each case stores review_stored_first, then
+# review_stored_second, and gives the list the export carries. In binary text order T sorts before
+# t, a date sorts before the same date with a trailing space, a trailing tab sorts before a trailing
+# space, a leading space sorts before any digit, and a space sorts before T. The export does not
+# order the dates ignoring case, ignoring surrounding space, or reading T as a space. Ignoring
+# trailing space, the trailing-space pair ties, so an order that broke ties newest first would list
+# it as binary order does; the tab pair does not tie, and that order lists the space first there.
+BINARY_TEXT_DATE_ORDER_CASES = [
+    pytest.param(
+        "2026-02-01t00:00:00+00:00",
+        "2026-02-01T23:00:00+00:00",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T23:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01t00:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="capital-t-before-small-t",
+    ),
+    pytest.param(
+        "2026-02-01T09:00:00+00:00 ",
+        "2026-02-01T09:00:00+00:00",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00 ",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="date-before-the-same-date-with-a-trailing-space",
+    ),
+    pytest.param(
+        "2026-02-01T09:00:00+00:00 ",
+        "2026-02-01T09:00:00+00:00\t",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00\t",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00 ",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="trailing-tab-before-trailing-space",
+    ),
+    pytest.param(
+        " 2026-03-01T00:00:00+00:00",
+        "2026-02-01T00:00:00+00:00",
+        [
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": " 2026-03-01T00:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T00:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="leading-space-before-an-earlier-date",
+    ),
+    pytest.param(
+        "2026-02-01T09:00:00+00:00",
+        "2026-02-01 23:00:00+00:00",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01 23:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="space-before-t",
+    ),
+]
+
+
+@pytest.mark.parametrize(("first_date", "second_date", "expected"), BINARY_TEXT_DATE_ORDER_CASES)
+def test_known_limit_export_orders_ai_review_dates_as_binary_text(setup, first_date, second_date, expected):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, run_id="review_stored_first", created_at=first_date)
+    add_ai_review(store, actor, bid, run_id="review_stored_second", created_at=second_date)
+    assert ai_call_ids_in_insertion_order(store) == ["review_stored_first", "review_stored_second"]
+    # The audit does not check created_at.
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == expected
+
+
 def test_export_digest_covers_the_archive_with_its_ai_review(setup):
     store, service, actor, bid, _ = setup
     add_ai_review(store, actor, bid)
