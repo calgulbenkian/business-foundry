@@ -22,7 +22,7 @@ D = Decimal
 ZERO = D(0)
 ONE = D(1)
 CENT, BASIS = D("0.01"), D("0.0001")
-FORECAST_VERSION, ACQUISITION_VERSION = "1.1.1", "1.0.1"
+FORECAST_VERSION, ACQUISITION_VERSION = "1.1.1", "1.1.0"
 
 
 def _fixed(value: Decimal, places: Decimal) -> str:
@@ -388,35 +388,83 @@ def _accepted(item, verified_evidence: set[str]) -> bool:
 SCENARIOS = (("base", ZERO, ZERO), ("downside", D("0.10"), ZERO), ("upside", ZERO, D("0.05")))
 
 
+def _growth(rate: Decimal, years: int) -> Decimal:
+    """(1 + rate)^years, exactly: one year's interest compounds into the next once a year."""
+    factor, result = _add(ONE, rate), ONE
+    for _ in range(years):
+        result = _mul(result, factor)
+    return result
+
+
+def _seller_payments(a: DealInputs) -> list[Decimal | tuple[Decimal, Decimal]]:
+    """What the seller is due in each year of the note's term, years 1 to seller_years (docs/FINANCE.md).
+
+    An amortizing note is due its level annual payment every year, kept as the exact fraction
+    (numerator, denominator) of _payment. An interest-only note is due principal × rate each year and the
+    principal as well in the last. A deferred note is due nothing until the last year, when the principal
+    and the interest accrued on it, compounded once a year, are due: principal × (1 + rate)^years.
+    """
+    n, principal, rate = a.seller_years, a.seller_note, a.seller_rate
+    if a.seller_schedule == "amortizing":
+        return [_payment(principal, rate, n)] * n
+    if a.seller_schedule == "interest_only":
+        interest = _mul(principal, rate)
+        return [interest] * (n - 1) + [_add(interest, principal)]
+    return [ZERO] * (n - 1) + [_mul(principal, _growth(rate, n))]
+
+
 def _deal_values(a: DealInputs, verified_evidence: set[str]) -> dict:
     """The exact value of every acquisition figure and of each step that forms it (docs/FINANCE.md).
 
     Nothing here is rounded. Each figure that depends on debt service is kept over the exact debt-service
     denominator: cash after debt service is after_numerator / denominator and coverage is
-    scaled_available / numerator, where scaled_available = available × denominator.
+    scaled_available / numerator, where scaled_available = available × denominator. The debt service is
+    what is due in the screened year, year 1: the senior and property loans' level payments and the seller
+    note's year-1 payment under its schedule. The amortizing figures (amortizing_numerator over
+    amortizing_denominator) count the seller note as if it amortized over its term, as a lender may.
 
     A loan of zero adds no payment (_debt_service_fraction skips it) and no interest (_mul of a zero is
-    zero), so its rate and term enter no figure. DealInputs.assumed_inputs relies on this: it lists a rate
-    or term the caller did not give only when its loan is above zero.
+    zero), so its rate, term and schedule enter no figure. DealInputs.assumed_inputs relies on this: it
+    lists one the caller did not give only when its loan is above zero. A zero real estate price, rent or
+    investor equity adds no operation (_add and _sub skip a zero), so a deal that gives none of the inputs
+    added in 1.1.0 is calculated by exactly the steps of 1.0.1.
     """
     normalized = _sub(a.reported_ebitda, a.replacement_management)
     for item in a.adjustments:
         if _accepted(item, verified_evidence):
             normalized = _add(normalized, item.amount)
+    normalized = _sub(normalized, a.annual_rent)
     uses = _add(_add(_add(a.purchase_price, a.fees), a.working_capital), a.integration_cost)
-    numerator, denominator = _debt_service_fraction(
-        (a.senior_debt, a.debt_rate, a.debt_years), (a.seller_note, a.seller_rate, a.seller_years)
-    )
+    uses = _add(uses, a.real_estate_price)
+    senior = (a.senior_debt, a.debt_rate, a.debt_years)
+    seller = (a.seller_note, a.seller_rate, a.seller_years)
+    building = (a.property_debt, a.property_rate, a.property_years)
+    amortizing_numerator, amortizing_denominator = _debt_service_fraction(senior, seller, building)
+    payments = _seller_payments(a) if a.seller_note else []
+    if not payments or a.seller_schedule == "amortizing":
+        numerator, denominator = amortizing_numerator, amortizing_denominator
+    else:
+        numerator, denominator = _debt_service_fraction(senior, building)
+        numerator = _add(numerator, _mul(payments[0], denominator))
     interest = _add(_mul(a.senior_debt, a.debt_rate), _mul(a.seller_note, a.seller_rate))
+    interest = _add(interest, _mul(a.property_debt, a.property_rate))
+    buyer_equity = _sub(_sub(_sub(uses, a.senior_debt), a.seller_note), a.property_debt)
     values = {
         "normalized": normalized,
         "uses": uses,
-        "buyer_equity": _sub(_sub(uses, a.senior_debt), a.seller_note),
+        "buyer_equity": buyer_equity,
+        "buyer_cash": _sub(buyer_equity, a.investor_equity),
         "interest": interest,
         "numerator": numerator,
         "denominator": denominator,
+        "amortizing_numerator": amortizing_numerator,
+        "amortizing_denominator": amortizing_denominator,
+        "seller_payments": payments,
         "scenarios": {},
     }
+    if payments and a.seller_schedule != "amortizing":
+        # The principal is due at the end of the term; a deferred note's last payment adds the accrued interest.
+        values["balloon"] = payments[-1] if a.seller_schedule == "deferred" else a.seller_note
     for name, cut, lift in SCENARIOS:
         earnings = _add(_sub(normalized, _mul(a.annual_revenue, cut)), _mul(a.annual_revenue, lift))
         taxable = _sub(earnings, interest)
@@ -430,6 +478,7 @@ def _deal_values(a: DealInputs, verified_evidence: set[str]) -> dict:
             "available": available,
             "scaled_available": scaled,
             "after_numerator": _sub(scaled, numerator),
+            "amortizing_scaled_available": _mul(available, amortizing_denominator),
         }
     if normalized > 0:
         low, high = _mul(normalized, a.multiple_low), _mul(normalized, a.multiple_high)
@@ -437,6 +486,33 @@ def _deal_values(a: DealInputs, verified_evidence: set[str]) -> dict:
         values["value_range"] = (low, high)
         values["equity_range"] = (_add(low, bridge), _add(high, bridge))
     return values
+
+
+def _payment_money(payment: Decimal | tuple[Decimal, Decimal]) -> str:
+    """A seller payment shown in cents: an exact Decimal, or an amortizing payment's exact fraction rounded once."""
+    return money(_rounded(*payment)) if isinstance(payment, tuple) else money(payment)
+
+
+def _seller_schedule(a: DealInputs, v: dict) -> dict | None:
+    if not a.seller_note:
+        return None
+    balloon = None
+    if "balloon" in v:
+        amount = v["balloon"]
+        balloon = {
+            "year": a.seller_years,
+            "amount": money(amount),
+            "principal": money(a.seller_note),
+            "accrued_interest": money(_sub(amount, a.seller_note)),
+        }
+    return {
+        "schedule": a.seller_schedule,
+        "years": a.seller_years,
+        "payments": [
+            {"year": year, "payment": _payment_money(p)} for year, p in enumerate(v["seller_payments"], 1)
+        ],
+        "balloon": balloon,
+    }
 
 
 def acquisition(inputs: DealInputs, verified_evidence: set[str]):
@@ -461,6 +537,11 @@ def acquisition(inputs: DealInputs, verified_evidence: set[str]):
             else None,
             # The denominator is positive, so the numerator's sign is the sign of the exact cash after debt service.
             "cash_shortfall": s["after_numerator"] < 0,
+            "amortizing_coverage_ratio": ratio(
+                _quotient(s["amortizing_scaled_available"], v["amortizing_numerator"], BASIS)
+            )
+            if not v["amortizing_numerator"].is_zero()
+            else None,
         }
     return {
         "model_version": ACQUISITION_VERSION,
@@ -479,14 +560,25 @@ def acquisition(inputs: DealInputs, verified_evidence: set[str]):
             "senior_debt": money(a.senior_debt),
             "seller_note": money(a.seller_note),
             "buyer_equity_required": money(v["buyer_equity"]),
+            "real_estate_price": money(a.real_estate_price),
+            "property_debt": money(a.property_debt),
+            "investor_equity": money(a.investor_equity),
+            "buyer_cash_at_closing": money(max(v["buyer_cash"], ZERO)),
+            "funding_beyond_uses": money(max(v["buyer_cash"].copy_negate(), ZERO)),
         },
         # Displayed only: the exact fraction rounded once to cents, as total_annual_debt_service rounds it.
         "annual_debt_service": money(_rounded(numerator, denominator)),
+        "debt_service_year": 1,
+        "amortizing_annual_debt_service": money(
+            _rounded(v["amortizing_numerator"], v["amortizing_denominator"])
+        ),
+        "seller_note_schedule": _seller_schedule(a, v),
         "scenarios": scenarios,
         "limitations": [
-            "Multiples are user assumptions, not licensed transaction comparables.",
+            "Multiples are user assumptions, not licensed transaction comparables. They value the business only; real estate is shown at its entered price and is not valued.",
             "Purchase price is the negotiated cash-equivalent consideration; existing claims must be explicitly included in transaction uses.",
-            "Debt service is level monthly amortization, annualized. Tax uses an approximate first-year interest estimate and excludes depreciation.",
+            "Senior and property debt service is level monthly amortization, annualized. The seller note follows its schedule, and coverage uses what is due in year 1; the amortizing coverage counts the seller note as if it amortized over its term. Tax uses an approximate first-year interest estimate, paid or accrued, and excludes depreciation.",
+            "Rent is deducted from normalized EBITDA; enter only rent the reported EBITDA does not already bear. Investor equity is a source of funds; investor returns are not modeled.",
             "Downside subtracts 10% of revenue from EBITDA with no cost relief. Upside adds 5% of revenue; synergies are excluded.",
             "Evidence review records a human attestation; it is not an audit or a quality-of-earnings opinion.",
         ],

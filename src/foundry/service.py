@@ -763,10 +763,12 @@ class Service:
         every value the model used. The request the idempotency key guards is the full inputs, plus the
         assumed list when it is not empty, so a request that gives every figure has the same fingerprint
         as before assumed_inputs existed, and the same values given and left out are different requests.
+        An input added in acquisition 1.1.0 that the caller did not give is left out of that request
+        (DealInputs.request), so a request that gives none of them keeps its earlier fingerprint.
         """
         deal = DealInputs.model_validate(payload)
         inputs, assumed = deal.model_dump(mode="json"), deal.assumed_inputs()
-        request = {**inputs, "assumed_inputs": assumed} if assumed else inputs
+        request = deal.request()
 
         def run(con):
             ids = inputs["evidence_ids"] + [
