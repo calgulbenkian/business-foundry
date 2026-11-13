@@ -787,7 +787,19 @@ def test_maximum_bound_forecast_generates_business_plan(setup):
 def test_long_forecast_renders_yearly_dcf_columns(setup):
     _, s, a, bid, _ = setup
     s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Default plan"))
-    s.save_deal(a, bid, key(), dump(models.DealInputs, target="Debt case", thesis="A financed target."))
+    s.save_deal(
+        a,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target="Debt case",
+            thesis="A financed target.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+        ),
+    )
     snapshot = s.snapshot(a, bid)
     _, plan = render_document("business_plan", snapshot)
     assert table_rows(plan, "| Line item ") == ["Line item", "Year 1", "Year 2", "Year 3"]

@@ -388,10 +388,30 @@ def test_investment_memo_covers_only_its_own_deal(harbor):
     _, s, a, _, _ = harbor["setup"]
     bid = harbor["bid"]
     first = s.save_deal(
-        a, bid, key(), dump(models.DealInputs, target="First shop", thesis="A first synthetic target.")
+        a,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target="First shop",
+            thesis="A first synthetic target.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+        ),
     )
     s.save_deal(
-        a, bid, key(), dump(models.DealInputs, target="Second shop", thesis="A second synthetic target.")
+        a,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target="Second shop",
+            thesis="A second synthetic target.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+        ),
     )
     memo = generate(harbor, "investment_memo", first["id"])
     work = section(memo, "## Open work on this acquisition")
@@ -467,6 +487,9 @@ def test_memo_ids_appear_only_in_the_reference_index(harbor):
             models.DealInputs,
             target="Corner shop",
             thesis="A synthetic target with one supported adjustment.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
             adjustments=[{"label": "Owner salary", "amount": 1000, "evidence_id": interview["id"]}],
         ),
     )
@@ -989,6 +1012,9 @@ def renamed(harbor):
             models.DealInputs,
             target="Corner shop",
             thesis="A synthetic target.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
             adjustments=[
                 {"label": "Owner salary", "amount": 1000, "evidence_id": interview},
                 {"label": "Unsupported add-back", "amount": 500},

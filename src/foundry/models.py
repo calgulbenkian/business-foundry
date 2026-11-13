@@ -183,15 +183,22 @@ class Adjustment(Model):
 
 
 class DealInputs(Model):
+    """The inputs of an acquisition screen.
+
+    The target's revenue and reported EBITDA and the purchase price have no default: nothing stands in
+    for the figures that describe the business and its price. Every other figure has an example value
+    that the model uses when the caller leaves it out; assumed_inputs names those (docs/FINANCE.md).
+    """
+
     target: Short
     thesis: Annotated[str, Field(min_length=10, max_length=8000)]
-    annual_revenue: Money = Decimal("1000000")
-    reported_ebitda: Earnings = Decimal("200000")
+    annual_revenue: Money
+    reported_ebitda: Earnings
     adjustments: list[Adjustment] = Field(default_factory=list, max_length=50)
     replacement_management: Money = Decimal("0")
     multiple_low: Multiple = Decimal("3")
     multiple_high: Multiple = Decimal("5")
-    purchase_price: Money = Decimal("800000")
+    purchase_price: Money
     fees: Money = Decimal("30000")
     working_capital: Money = Decimal("50000")
     integration_cost: Money = Decimal("0")
@@ -218,6 +225,23 @@ class DealInputs(Model):
         if self.reported_ebitda > self.annual_revenue:
             raise ValueError("Reported EBITDA exceeds revenue; review the inputs.")
         return self
+
+    def assumed_inputs(self) -> list[str]:
+        """The figures the caller did not give, in field order, so the model used its example value.
+
+        Read from the fields the caller set, not from the values: a figure sent with the same value as its
+        example is the caller's own and is not listed. Adjustments and evidence are lists of what the
+        caller claims, not figures with an example value, so they are never listed.
+        """
+        return [name for name in DEAL_EXAMPLE_FIGURES if name not in self.model_fields_set]
+
+
+# The figures of DealInputs that have an example value, in field order.
+DEAL_EXAMPLE_FIGURES = tuple(
+    name
+    for name, field in DealInputs.model_fields.items()
+    if not field.is_required() and name not in {"adjustments", "evidence_ids"}
+)
 
 
 class InvoiceCreate(Model):

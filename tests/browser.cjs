@@ -855,7 +855,104 @@ async function main() {
     await page
       .getByLabel('Investment thesis', { exact: true })
       .fill('Acquire repeatable delivery capacity subject to independent diligence.');
+    // The three figures that describe the target and its price start empty, with the model's
+    // example only as placeholder text, and the browser refuses the form until they are filled.
+    // Every other figure starts empty too.
+    const dealField = (name) => page.locator(`#dialog [name="${name}"]`);
+    for (const [name, example] of [
+      ['annual_revenue', '1000000'],
+      ['reported_ebitda', '200000'],
+      ['purchase_price', '800000'],
+      ['fees', '30000'],
+      ['debt_years', '7'],
+    ]) {
+      assert.equal(await dealField(name).inputValue(), '', name + ' starts empty');
+      assert.equal(await dealField(name).getAttribute('placeholder'), 'Example: ' + example);
+    }
+    const dealPosts = [];
+    const onDealPost = (r) => {
+      if (r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'))
+        dealPosts.push(r.postDataJSON());
+    };
+    page.on('request', onDealPost);
+    await dealField('annual_revenue').fill('900000');
+    await dealField('reported_ebitda').fill('180000');
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    assert.equal(await dealField('purchase_price').evaluate((e) => e.matches(':invalid')), true);
+    assert(
+      await page.locator('#dialog').isVisible(),
+      'the form stays open without a purchase price',
+    );
+    assert.equal(dealPosts.length, 0, 'nothing is sent while a required figure is empty');
+    await dealField('purchase_price').fill('700000');
+    await dealField('debt_years').fill('6');
     await submit('Calculate and create diligence work');
+    page.off('request', onDealPost);
+    assert.equal(dealPosts.length, 1);
+    const sentDeal = dealPosts[0];
+    assert.deepEqual(
+      [sentDeal.annual_revenue, sentDeal.reported_ebitda, sentDeal.purchase_price],
+      ['900000', '180000', '700000'],
+    );
+    assert.equal(sentDeal.debt_years, 6, 'a filled term is sent as a number');
+    for (const name of ['fees', 'seller_years', 'tax_rate'])
+      assert(!(name in sentDeal), name + ' was left empty and is not sent');
+    const browserDeal = (
+      await (await context.request.get(origin + '/api/businesses/' + bid)).json()
+    ).objects.find((o) => o.kind === 'deal' && o.title === 'Browser synthetic target');
+    assert(browserDeal.data.assumed_inputs.includes('fees'));
+    assert(!browserDeal.data.assumed_inputs.includes('debt_years'));
+    const assumedLine = await page.locator('#insp .assumed-inputs').innerText();
+    assert(
+      assumedLine.startsWith("Not given, so the model's example value was used: "),
+      assumedLine,
+    );
+    assert.match(assumedLine, /Transaction fees \$30,000\.00/);
+    assert.match(assumedLine, /Seller term 5 years/);
+    assert(!assumedLine.includes('Senior term'), 'the term that was given is not listed');
+    // Opened again from this analysis, the form fills only what the analysis gave.
+    await page.getByRole('button', { name: 'Revise assumptions', exact: true }).click();
+    assert.equal(await dealField('annual_revenue').inputValue(), '900000');
+    assert.equal(await dealField('debt_years').inputValue(), '6');
+    assert.equal(await dealField('fees').inputValue(), '');
+    assert.equal(await dealField('tax_rate').inputValue(), '');
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.locator('#dialog').waitFor({ state: 'hidden' });
+    // An analysis saved before the list was recorded, served as such: the page says "not
+    // recorded", and the reopened form fills only figures that differ from the model's example.
+    const snapshotPath = (url) => url.pathname === '/api/businesses/' + bid;
+    const withoutList = async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await route.fetch();
+      const body = await response.json();
+      for (const o of body.objects) if (o.kind === 'deal') delete o.data.assumed_inputs;
+      await route.fulfill({ response, json: body });
+    };
+    await page.route(snapshotPath, withoutList);
+    await page.reload();
+    await source('deals');
+    await page.locator(`#list .row[data-key="deal:${browserDeal.id}"]`).click();
+    await page.locator('#insp-title', { hasText: 'Browser synthetic target' }).waitFor();
+    assert.equal(
+      await page.locator('#insp .assumed-inputs').innerText(),
+      "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.",
+    );
+    await page.getByRole('button', { name: 'Revise assumptions', exact: true }).click();
+    assert.deepEqual(
+      await Promise.all(
+        ['annual_revenue', 'debt_years', 'fees', 'seller_years'].map((n) =>
+          dealField(n).inputValue(),
+        ),
+      ),
+      ['900000', '6', '', ''],
+    );
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.locator('#dialog').waitFor({ state: 'hidden' });
+    await page.unroute(snapshotPath, withoutList);
+    await page.reload();
     await source('documents');
     await page.getByRole('button', { name: '+ Generate document', exact: true }).click();
     await submit('Generate draft');
@@ -5601,7 +5698,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition (refused without its three required figures, figures left empty not sent and listed as not given, and a reopened form filling only what was given), after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

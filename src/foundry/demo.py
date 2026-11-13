@@ -193,16 +193,19 @@ def seed(service: Service, actor):
         actor,
         bid,
         "demo:deal:v1",
-        data(
-            models.DealInputs,
+        # Only the fields given here are sent, so the deal lists every other figure as assumed.
+        models.DealInputs(
             target="Example Mapping Studio · synthetic",
             thesis="Compare buying a small mapping-services operation with building delivery capacity. All figures are illustrative.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
             adjustments=[
                 models.Adjustment(label="Illustrative one-time expense", amount=10000, evidence_id=eid),
                 models.Adjustment(label="Unsupported seller add-back", amount=25000),
             ],
             replacement_management=60000,
-        ),
+        ).model_dump(mode="json", exclude_unset=True),
     )
     service.generate_document(
         actor, bid, "demo:document:v1", data(models.DocumentCreate, template="business_plan")

@@ -43,6 +43,10 @@ The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote U
 
 `update_record` replaces an existing record at its current `expected_version`. It is a full replacement, not a patch: every field (`kind`, `title`, `details`, `certainty`, `owner`, `evidence_ids`, `related_ids`, `due_date`, `properties`) is required, so read the record with `get_business` and resend unchanged values. `kind` must match the existing record. A stale version is rejected rather than merged; refresh and retry deliberately. Agents cannot set `certainty="verified"`, and the service rejects any agent or operator change to a record a human has already verified. Updating a record reopens affected completed work for human review. Prefer `update_record` over adding a duplicate record when refining an answer.
 
+### Acquisition analyses
+
+`analyze_acquisition` needs `target`, `thesis`, `annual_revenue`, `reported_ebitda` and `purchase_price`. Use the figures the human gave you; never invent them. A request without one of them is refused with the API's message, which names each missing field, and nothing is saved. Every other figure left out takes the model's example value, and the result lists it in `data.assumed_inputs`. Tell the human which inputs were assumed, and send the figures they give in a new analysis.
+
 ### Guided prompts
 
 The adapter registers three MCP prompts, each taking a `business_id`:

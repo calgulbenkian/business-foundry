@@ -154,7 +154,7 @@ def build_server():
 
     @server.tool()
     def analyze_acquisition(business_id: str, command_key: str, inputs: dict) -> dict:
-        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work."""
+        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work. target, thesis, annual_revenue, reported_ebitda and purchase_price are required: use only figures the human gave you, and never invent them. A request without one is refused and nothing is saved. Every other figure you leave out takes the model's example value, and the result lists it in data.assumed_inputs. Tell the human which inputs were assumed."""
         return request("POST", path(business_id) + "/deals", inputs, command_key)
 
     @server.tool()
