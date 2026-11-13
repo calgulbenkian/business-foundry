@@ -6,7 +6,7 @@ The MCP path needs `foundry serve`: the desktop app picks a new port at every la
 
 ## 1. Compatible AI client through MCP
 
-Run the Foundry server. In **Access & AI**, create a key with the **agent** role and explicitly select its businesses. Alternatively:
+Run the Foundry server. In **Access & assistants**, create a key with the **agent** role and explicitly select its businesses. Alternatively:
 
 ```sh
 uv run foundry key --name "Planning assistant" --role agent --business BUSINESS_ID
@@ -72,7 +72,7 @@ uv run foundry serve
 
 The `.env.example` file documents settings. The application does not automatically load arbitrary `.env` files; use your shell, process manager or container secret configuration.
 
-From **Access & AI**, request a review and explicitly agree to sharing. Each request sends the business profile, up to 200 record summaries (titles, states, details limited to 2,000 characters, evidence-reference IDs), workspace totals and the question. Original evidence bodies, generated documents, full financial tables, access keys and credentials are omitted. Titles, details and totals may still be confidential. Review the workspace before sharing.
+From **Access & assistants**, request a review and explicitly agree to sharing. Each request sends the business profile, up to 200 record summaries (titles, states, details limited to 2,000 characters, evidence-reference IDs), workspace totals and the question. Original evidence bodies, generated documents, full financial tables, access keys and credentials are omitted. Titles, details and totals may still be confidential. Review the workspace before sharing.
 
 The request uses the [Responses API Structured Outputs format](https://developers.openai.com/api/docs/guides/structured-outputs), `store: false`, a bounded output-token budget and no execution tools. `store: false` is a provider setting, not a claim of zero provider retention; applicable account terms and controls still govern processing. The server-wide request limit counts reservations, including failures and unknown outcomes. It is a call limit, not a currency-denominated spending cap; set provider-side budgets as appropriate. `FOUNDRY_AI_DAILY_CALLS` must be a whole number of 0 or greater and at most 100000 (default 20 when unset; 0 blocks all reviews). After surrounding whitespace is removed, it must be written in plain ASCII digits with no sign, separator, exponent or leading zero: `0`, `20` and `100000` are accepted; `020`, `00`, `+5`, `5_0`, `1e3`, an empty value and anything above 100000 are refused. Any other value, such as a negative, decimal, padded or oversized number, fails closed: review requests are refused with HTTP 503, the same status used when the provider is not configured, and no provider request is made or reserved, and no event is recorded. A review refused this way can be retried with the same idempotency key once the setting is corrected. The automated tests check this with a mocked transport only; they make no live provider call.
 

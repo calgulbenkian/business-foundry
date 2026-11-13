@@ -5,7 +5,8 @@
   "description": "Browser verification for Business Foundry; no frontend runtime dependencies",
   "scripts": {
     "test:browser": "node tests/browser.cjs",
-    "check": "node --check src/foundry/static/app.js && prettier --check \"src/foundry/static/*.{js,css,html}\" tests/browser.cjs"
+    "check": "node --check src/foundry/static/app.js && node tests/palette.cjs && prettier --check \"src/foundry/static/*.{js,css,html}\" tests/browser.cjs tests/palette.cjs",
+    "palette": "node tests/palette.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1",
