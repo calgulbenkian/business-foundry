@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
+import shlex
+import signal
+import socket
 import sqlite3
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import get_args
 from uuid import uuid4
@@ -67,6 +73,291 @@ def backup_database(source: Path, destination: Path) -> int:
         raise
 
 
+START_HOST = "127.0.0.1"
+
+
+def port_number(text):
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if not 1 <= value <= 65535:
+        raise argparse.ArgumentTypeError("must be a whole number from 1 to 65535")
+    return value
+
+
+def open_browser(url):
+    """Open url in the default graphical browser, never in this terminal.
+
+    Python's webbrowser module is deliberately not used: it obeys $BROWSER and, where no
+    graphical session exists, falls back to text-mode browsers (lynx, w3m, links) that would
+    take over the terminal. Only the platform's desktop opener is used, and on Linux and
+    other Unix systems only when a graphical session is present. The opener runs in its own
+    session with no access to this terminal's input or output, so whatever it launches
+    cannot read from or draw on the terminal.
+    """
+    if sys.platform == "win32":
+        os.startfile(url)  # The registered handler for http links: a desktop browser.
+        return
+    if sys.platform == "darwin":
+        command = ["open", url]
+    elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        command = ["xdg-open", url]
+    else:
+        return
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    ).wait()
+
+
+def _open_quietly(opener, url):
+    try:
+        opener(url)
+    except Exception:
+        pass  # The address is already on screen; the person can open it by hand.
+
+
+def _say(text, stream):
+    # A closed or broken output (for example, piped into a program that has exited) must
+    # not stop the server. The text that could not be written stays in the stream's buffer,
+    # and Python flushes that buffer again at exit; on a broken pipe that flush fails, prints
+    # a warning and changes the exit status to 120. So once a write fails, the stream's file
+    # is pointed at the null device, and the rest of the output, and that last flush, go nowhere.
+    try:
+        print(text, file=stream, flush=True)
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            fd = stream.fileno()
+            null = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null, fd)
+            finally:
+                os.close(null)
+
+
+def _is_terminal(stream):
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+class _HoldStops:
+    """Hold Ctrl+C and SIGTERM while the workspace is set up, so setup is never cut short.
+
+    The example business is added by many commands with fixed command keys, and a later start
+    never adds it again, so an interrupted setup would leave half an example for good. A stop
+    asked for during setup is recorded and acted on once setup has finished. A signal that was
+    being ignored stays ignored. Signal handlers can only be set in the main thread; elsewhere
+    nothing is held.
+    """
+
+    def __init__(self):
+        self.asked = False
+        self._previous = {}
+
+    def _hold(self, signum, frame):
+        self.asked = True
+
+    def __enter__(self):
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                if signal.getsignal(signum) is not signal.SIG_IGN:
+                    self._previous[signum] = signal.signal(signum, self._hold)
+        return self
+
+    def __exit__(self, *exc):
+        for signum, handler in self._previous.items():
+            signal.signal(signum, handler)
+
+
+def _stop_as_ctrl_c(signum, frame):
+    raise KeyboardInterrupt
+
+
+def foundry_command():
+    """The command a person types, in the current folder, to run Foundry as this process was started.
+
+    uv sets UV (and UV_RUN_RECURSION_DEPTH) for the programs `uv run` starts. `uv run foundry`
+    finds Foundry's project by looking for pyproject.toml in the current folder and the folders
+    above it. Someone who started Foundry from another folder with `uv run --project <folder>`
+    needs that option too, so it is named when the project that holds this Python environment
+    (the folder above its .venv) is not the one uv would find from here.
+    """
+    if not (os.environ.get("UV") or os.environ.get("UV_RUN_RECURSION_DEPTH")):
+        return "foundry"
+    project = Path(sys.prefix).resolve().parent
+    if not (project / "pyproject.toml").is_file():
+        return "uv run foundry"  # an environment kept elsewhere: its project is not known
+    here = Path.cwd().resolve()
+    found = next((folder for folder in (here, *here.parents) if (folder / "pyproject.toml").is_file()), None)
+    if found == project:
+        return "uv run foundry"
+    return f"uv run --project {shlex.quote(str(project))} foundry"
+
+
+def bind_local(port):
+    """Return (socket, None) listening on 127.0.0.1:port, or (None, message) if that fails.
+
+    A program already answering on the address counts as taken even where the operating
+    system would let a second socket bind (on macOS, beside a wildcard listener), so Foundry
+    never reports itself running at an address that serves another program.
+    """
+    taken = (
+        f"Port {port} is already in use. Foundry may already be running at "
+        f"http://{START_HOST}:{port}; open that address, or choose another port with --port."
+    )
+    try:
+        with socket.create_connection((START_HOST, port), timeout=0.5):
+            return None, taken
+    except OSError:
+        pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name != "nt":
+            # Lets a restart reuse the port while connections from the last run linger in
+            # TIME_WAIT. It does not allow sharing a port another socket is listening on.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((START_HOST, port))
+        sock.listen(2048)
+    except OSError as exc:
+        sock.close()
+        if exc.errno in {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)}:
+            return None, taken
+        return None, f"Could not use port {port}: {exc.strerror or exc}. Choose another port with --port."
+    return sock, None
+
+
+def start_foundry(
+    db_path,
+    *,
+    port=8765,
+    empty=False,
+    browser=True,
+    token_command="foundry token",
+    out=None,
+    err=None,
+    opener=None,
+    on_started=None,
+):
+    """Set up a workspace on first run, serve it on 127.0.0.1, and say how to sign in.
+
+    Returns the exit status. `opener` and `on_started` are for tests: the first replaces the
+    browser launcher, the second receives the running server once the sign-in block is shown.
+    """
+    out = out or sys.stdout
+    err = err or sys.stderr
+    opener = opener or open_browser
+    db_path = Path(db_path)
+    token_path = db_path.parent / "owner.key"
+    sock, problem = bind_local(port)
+    if sock is None:
+        print(problem, file=err)
+        return 1
+    # SIGTERM (for example `kill`, or a service manager stopping Foundry) stops it the way
+    # Ctrl+C does: the same message and the same exit status. uvicorn catches SIGTERM while it
+    # serves, shuts down, then raises it again, which reaches this handler.
+    sigterm = None
+    try:
+        if threading.current_thread() is threading.main_thread():
+            if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+                sigterm = signal.signal(signal.SIGTERM, _stop_as_ctrl_c)
+        with _HoldStops() as held:
+            store = Store(db_path)
+            created = store.bootstrap("Local owner", token_path)
+            if created:
+                _say(f"Created a new private workspace. Its sign-in key is saved in {token_path}", out)
+                if not empty:
+                    from .demo import seed
+
+                    seed(Service(store), store.authenticate(token_path.read_text().strip()))
+                    _say(
+                        "Added the example business 'Polymer Geospatial · demo'. It is synthetic: "
+                        "its customers, figures and receipts are made up.",
+                        out,
+                    )
+        if held.asked:
+            _say(
+                "\nFoundry has stopped. It finished setting up first, so your workspace in "
+                f"{db_path.parent} is complete. Run the same command again to start Foundry.",
+                out,
+            )
+            return 0
+
+        terminal = _is_terminal(out)
+        url = f"http://{START_HOST}:{sock.getsockname()[1]}"
+        try:
+            key = token_path.read_text().strip()
+        except FileNotFoundError:
+            key_line = f"Sign-in key: the key file was not found. It was expected at {token_path}"
+        except OSError as exc:
+            key_line = f"Sign-in key: the key file at {token_path} could not be read ({exc.strerror})."
+        else:
+            if not key:
+                key_line = f"Sign-in key: the key file at {token_path} is empty."
+            elif terminal:
+                key_line = f"Sign-in key: {key}"
+            else:
+                key_line = (
+                    "Sign-in key: not shown, because this output is not going to a terminal. "
+                    f"To show it, run '{token_command}' in a terminal, in {Path.cwd()}"
+                )
+        block = "\n".join(
+            [
+                "",
+                "Business Foundry is running.",
+                "",
+                f"  Open this address in your web browser: {url}",
+                f"  {key_line}",
+                "",
+                "Keep the key private. Anyone who has it can sign in as the owner of this workspace.",
+                "To stop Foundry, press Ctrl+C in this window.",
+                "",
+            ]
+        )
+
+        import uvicorn
+
+        from .api import create_app
+
+        class StartServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets=sockets)
+                # The event loop is now serving the bound socket.
+                if self.started and not self.should_exit:
+                    _say(block, out)
+                    if browser and terminal:
+                        threading.Thread(target=_open_quietly, args=(opener, url), daemon=True).start()
+                    if on_started:
+                        on_started(self)
+
+        config = uvicorn.Config(
+            create_app(db_path),
+            host=START_HOST,
+            port=sock.getsockname()[1],
+            log_level="warning",
+            access_log=False,
+        )
+        server = StartServer(config)
+        try:
+            server.run(sockets=[sock])
+        except KeyboardInterrupt:
+            pass
+        if server.started:
+            _say(f"\nFoundry has stopped. Your workspace is saved in {db_path.parent}", out)
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        sock.close()
+        if sigterm is not None:
+            signal.signal(signal.SIGTERM, sigterm)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Business Foundry: start, acquire and operate with evidence."
@@ -79,6 +370,15 @@ def main(argv=None):
     init.add_argument("--name", default="Local owner")
     commands.add_parser("token", help="Print the local owner key for sign-in (keep it private)")
     commands.add_parser("demo", help="Load the explicitly synthetic Polymer demonstration")
+    start = commands.add_parser(
+        "start",
+        help="Set up on first run, then start the web application on 127.0.0.1 and open it in a browser",
+    )
+    start.add_argument(
+        "--port", type=port_number, default=8765, help="Port to listen on at 127.0.0.1 (default: 8765)"
+    )
+    start.add_argument("--empty", action="store_true", help="On first run, do not add the example business")
+    start.add_argument("--no-browser", action="store_true", help="Do not open a web browser")
     serve = commands.add_parser("serve", help="Start the local web application")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
@@ -144,6 +444,24 @@ def main(argv=None):
             from .mcp_server import main as mcp_main
 
             mcp_main()
+            return
+        if args.command == "start":
+            # Printed for a person to type in another terminal, which may not share this
+            # process's FOUNDRY_DB, so the database is named unless it is the built-in default.
+            # The path is joined to --db with "=", so a path that starts with "-" is still
+            # read as the path and not as another option.
+            token_command = f"{foundry_command()} token"
+            if args.db != ".foundry/foundry.db":
+                token_command = f"{foundry_command()} --db={shlex.quote(args.db)} token"
+            code = start_foundry(
+                db_path,
+                port=args.port,
+                empty=args.empty,
+                browser=not args.no_browser,
+                token_command=token_command,
+            )
+            if code:
+                raise SystemExit(code)
             return
         if args.command == "restore":
             backup_database(args.source, db_path)

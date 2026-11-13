@@ -10,31 +10,44 @@ Turn a concept into a connected business workspace: customers, offers, assets an
 
 ## Run it
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+**New to the terminal? Follow [your first hour with Foundry](docs/FIRST_HOUR.md).**
+
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/). It also provides Python 3.11 or newer if your computer does not have it.
 
 ```sh
 git clone https://github.com/calgulbenkian/business-foundry.git
 cd business-foundry
-uv sync --locked
-uv run foundry init
-uv run foundry demo
-uv run foundry serve
+uv run foundry start
 ```
 
-Open **http://127.0.0.1:8765**, retrieve your private sign-in key with `uv run foundry token`, and paste it into the sign-in screen. The application works without an AI subscription or API key. Skip `demo` for an empty workspace.
+On the first run, uv installs Foundry's dependencies into `.venv` in that folder (downloading them if needed), then Foundry creates a private workspace and owner key in `.foundry/`. When the server is ready, the terminal shows the address to open, **http://127.0.0.1:8765**, your private sign-in key and how to stop (Ctrl+C), and your default browser opens at that address (on Linux, only when a desktop session is running). Paste the key into the sign-in screen. The application works without an AI subscription or API key.
+
+The first run also adds the synthetic example business described below; use `uv run foundry start --empty` for an empty workspace instead. Later runs reuse the same workspace and key and never add the example again. `start` listens on 127.0.0.1 only. `--port` chooses another port and `--no-browser` skips the browser. If the output is not a terminal (for example, piped or captured by a service), the key is not printed. The output names the command that shows it instead, for example `uv run foundry token`.
 
 The Polymer Geospatial example is **explicitly synthetic**. Its concept, customers, figures, receipts and completed steps are demonstration fixtures. They do not describe or certify Polymer's actual business.
+
+The same setup is also available as separate commands:
+
+```sh
+uv sync --locked
+uv run foundry init    # create the private database and owner key
+uv run foundry demo    # optional: add the synthetic example
+uv run foundry serve   # serve on 127.0.0.1:8765; --host and --port change the address
+uv run foundry token   # print the sign-in key to paste into the sign-in screen
+```
 
 Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `foundry` directly.
 
 ### Desktop window (preview)
+
+Use `foundry start` to work in your web browser, or when an AI client must reach Foundry at a fixed address ([AI setup](docs/AI.md)). Use the desktop window if you would rather have Foundry in a window of its own.
 
 ```sh
 uv sync --locked --extra desktop
 uv run foundry-desktop
 ```
 
-This opens the same interface in a native window and signs you in automatically: there is no key to paste. Records are kept in your per-user application data folder (`~/Library/Application Support/Business Foundry` on macOS, `%LOCALAPPDATA%\Business Foundry` on Windows, `~/.local/share/Business Foundry` on Linux unless `XDG_DATA_HOME` names another folder), not in the folder you launched from. The command-line tools can use that database with `--db`. To back it up on macOS, run `uv run foundry --db "$HOME/Library/Application Support/Business Foundry/foundry.db" backup /private/path/backup.db` from the folder you start the app from, with `/private/path/backup.db` changed to a private place for the backup. The window shows the backup command for the database it has open, including one chosen with `--data-dir`, on its **Access & assistants** page, in **Your business records**, under **Backup and restore**; on Windows it shows the path but no ready command. Windows needs the Microsoft Edge WebView2 Runtime. Only one copy of the app can be open at a time for each data folder. If you choose **Sign out** inside the window, the sign-in screen appears; quit and reopen the app to sign in again. There is no installer, code signing or automatic update yet, and the app has been run on macOS only, not yet on Windows. See [security](SECURITY.md#desktop-app) for how the window signs in.
+This opens the same interface in a native window and signs you in automatically: there is no key to paste. Records are kept in your per-user application data folder (`~/Library/Application Support/Business Foundry` on macOS, `%LOCALAPPDATA%\Business Foundry` on Windows, `~/.local/share/Business Foundry` on Linux unless `XDG_DATA_HOME` names another folder), not in the folder you launched from. So the window and `foundry start` keep different databases: a business made in one is not in the other. On its first run the window creates an empty workspace, without the example business. The command-line tools can use that database with `--db`. To back it up on macOS, run `uv run foundry --db "$HOME/Library/Application Support/Business Foundry/foundry.db" backup /private/path/backup.db` from the folder you start the app from, with `/private/path/backup.db` changed to a private place for the backup. The window shows the backup command for the database it has open, including one chosen with `--data-dir`, on its **Access & assistants** page, in **Your business records**, under **Backup and restore**; on Windows it shows the path but no ready command. Windows needs the Microsoft Edge WebView2 Runtime. Only one copy of the app can be open at a time for each data folder. If you choose **Sign out** inside the window, the sign-in screen appears; quit and reopen the app to sign in again. There is no installer, code signing or automatic update yet, and the app has been run on macOS only, not yet on Windows. See [security](SECURITY.md#desktop-app) for how the window signs in.
 
 ## What works
 
@@ -50,7 +63,7 @@ This opens the same interface in a native window and signs you in automatically:
 - A reviewable event history, local integrity checks, portable JSON exports and consistent database backups/restores.
 - Optional OpenAI reviews with explicit sharing, recorded prompts/results, limits and validated citations; an MCP adapter for compatible AI clients.
 
-See [the walkthrough](docs/WALKTHROUGH.md), [architecture](docs/ARCHITECTURE.md), [financial methodology](docs/FINANCE.md), [AI setup](docs/AI.md), [security and deployment](SECURITY.md), and [the research and roadmap](docs/RESEARCH.md).
+See [your first hour](docs/FIRST_HOUR.md), [the walkthrough](docs/WALKTHROUGH.md), [architecture](docs/ARCHITECTURE.md), [financial methodology](docs/FINANCE.md), [AI setup](docs/AI.md), [security and deployment](SECURITY.md), and [the research and roadmap](docs/RESEARCH.md).
 
 ## Development
 
@@ -61,7 +74,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-The OpenAPI schema is served at `/api/openapi.json`; load it into any OpenAPI viewer you run yourself. No interactive documentation page is served, because one would need third-party scripts that the content security policy forbids. Authenticated requests use `Authorization: Bearer <access-key>`; such requests need no `Origin` header. Business writes require an `Idempotency-Key`; reuse it only when retrying the identical request. Access-key creation returns a new key once and is intentionally not cached.
+The OpenAPI schema is served at `/api/openapi.json`; load it into any OpenAPI viewer you run yourself. FastAPI's built-in documentation pages (Swagger UI at `/docs` and ReDoc at `/redoc`) are switched off, because they load scripts from a third-party host and run inline scripts, which the content security policy forbids. Authenticated requests use `Authorization: Bearer <access-key>`; such requests need no `Origin` header. Business writes require an `Idempotency-Key`; reuse it only when retrying the identical request. Access-key creation returns a new key once and is intentionally not cached.
 
 The command line keeps private state in `.foundry/` (relative to where you run it), which is ignored by Git. The desktop app uses the per-user application data folder instead. No telemetry, remote databases, third-party fonts or analytics are required. Software is MIT licensed; your business data stays yours.
 
