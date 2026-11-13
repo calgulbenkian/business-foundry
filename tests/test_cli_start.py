@@ -8,6 +8,7 @@ beyond 127.0.0.1.
 import io
 import json
 import os
+import shlex
 import signal
 import socket
 import sqlite3
@@ -382,3 +383,226 @@ def test_existing_commands_keep_their_output(tmp_path, capsys, monkeypatch):
     assert captured.err == "Open http://127.0.0.1:9999. Retrieve the sign-in key with 'foundry token'.\n"
     assert captured.out == ""
     assert calls == [{"host": "127.0.0.1", "port": 9999, "log_level": "info"}]
+
+
+def test_port_option_says_what_it_does(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["start", "--help"])
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--port PORT Port to listen on at 127.0.0.1 (default: 8765)" in help_text
+
+
+def wait_for_health(process, origin, chunks):
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            if get(origin + "/api/health")[0] == 200:
+                return
+        except OSError:
+            pass
+        assert time.monotonic() < deadline and process.poll() is None, b"".join(chunks).decode()
+        time.sleep(0.1)
+
+
+def spawn_start(arguments, *, cwd, env=None):
+    """Run `foundry start` as a separate process with its output in a pipe, not a terminal."""
+    port = free_port()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "foundry.cli", *arguments, "start", "--port", str(port), "--no-browser"],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        # As a terminal leaves them: a test runner may have Ctrl+C ignored, which the child
+        # would otherwise inherit.
+        preexec_fn=None if os.name == "nt" else lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+    )
+    chunks = []
+    reader = threading.Thread(target=lambda: chunks.extend(iter(process.stdout.readline, b"")), daemon=True)
+    reader.start()
+    return process, f"http://127.0.0.1:{port}", chunks, reader
+
+
+def stop(process, reader, chunks, signum=signal.SIGINT):
+    try:
+        process.send_signal(signum)
+        code = process.wait(timeout=8)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    reader.join(5)
+    return code, b"".join(chunks).decode()
+
+
+def child_env(**changes):
+    env = {k: v for k, v in os.environ.items() if k not in {"FOUNDRY_DB", "UV", "UV_RUN_RECURSION_DEPTH"}}
+    env.update(changes)
+    return env
+
+
+@pytest.mark.parametrize(
+    ("uv", "program"), [(None, "foundry"), ("/synthetic/bin/uv", "uv run foundry")], ids=["plain", "uv-run"]
+)
+def test_foundry_command_names_uv_run_only_under_uv(monkeypatch, uv, program):
+    monkeypatch.delenv("UV", raising=False)
+    monkeypatch.delenv("UV_RUN_RECURSION_DEPTH", raising=False)
+    if uv:
+        monkeypatch.setenv("UV", uv)
+    assert cli.foundry_command() == program
+
+
+@pytest.mark.skipif(os.name == "nt", reason="stops the server with SIGINT")
+@pytest.mark.parametrize(
+    ("arguments", "env", "program"),
+    [
+        ([], {}, "foundry"),
+        (["--db", "work space/foundry.db"], {"UV": "/synthetic/bin/uv"}, "uv run foundry"),
+        ([], {"FOUNDRY_DB": "from-env/foundry.db", "UV_RUN_RECURSION_DEPTH": "1"}, "uv run foundry"),
+    ],
+    ids=["default", "relative-db-under-uv", "db-from-environment"],
+)
+def test_piped_output_prints_a_token_command_that_works_as_printed(tmp_path, arguments, env, program):
+    folder = tmp_path / "started here"
+    folder.mkdir()
+    process, origin, chunks, reader = spawn_start(arguments, cwd=folder, env=child_env(**env))
+    try:
+        wait_for_health(process, origin, chunks)
+    finally:
+        code, output = stop(process, reader, chunks)
+    assert code == 0
+    lines = [line for line in output.splitlines() if "Sign-in key:" in line]
+    assert len(lines) == 1, output
+    prefix = "  Sign-in key: not shown, because this output is not going to a terminal. To show it, run '"
+    assert lines[0].startswith(prefix), lines[0]
+    command, _, rest = lines[0][len(prefix) :].partition("' in a terminal, in ")
+    assert rest == str(folder)
+    assert command.startswith(program + " ")
+    # Run it as printed, in the folder it names, from a terminal that has none of the starting
+    # process's settings. Only the program words are replaced, by this checkout's Foundry.
+    words = shlex.split(command)[len(program.split()) :]
+    shown = subprocess.run(
+        [sys.executable, "-m", "foundry.cli", *words],
+        cwd=rest,
+        env=child_env(),
+        capture_output=True,
+        text=True,
+    )
+    assert shown.returncode == 0, shown.stderr
+    key_files = list(tmp_path.rglob("owner.key"))
+    assert len(key_files) == 1
+    assert shown.stdout == key_files[0].read_text()
+    assert key_files[0].read_text().strip() not in output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM ends a Windows process without running handlers")
+def test_sigterm_stops_start_as_ctrl_c_does(tmp_path):
+    results = {}
+    for name, signum in (("Ctrl+C", signal.SIGINT), ("SIGTERM", signal.SIGTERM)):
+        db = tmp_path / name / "foundry.db"
+        process, origin, chunks, reader = spawn_start(["--db", str(db)], cwd=tmp_path, env=child_env())
+        try:
+            wait_for_health(process, origin, chunks)
+        finally:
+            results[name] = stop(process, reader, chunks, signum)
+    for name, (code, output) in results.items():
+        assert code == 0, (name, output)
+        last = output.rstrip().splitlines()[-1]
+        assert last == f"Foundry has stopped. Your workspace is saved in {tmp_path / name}", (name, output)
+        assert "Traceback" not in output and "KeyboardInterrupt" not in output, (name, output)
+
+
+def workspace_summary(db):
+    """What the example consists of, without its random ids and times."""
+    with sqlite3.connect(db) as con:
+        objects = sorted(con.execute("SELECT kind, title, state, version FROM objects").fetchall())
+        events = sorted(row[0] for row in con.execute("SELECT action FROM events"))
+        commands = sorted(row[0] for row in con.execute("SELECT command_key FROM commands"))
+    commands = [key for key in commands if not key.startswith("demo:task:")]  # these name task ids
+    return business_names(db), objects, events, commands
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+@pytest.mark.skipif(os.name == "nt", reason="raises SIGTERM, which Windows does not deliver to handlers")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["Ctrl+C", "SIGTERM"])
+def test_a_stop_during_first_setup_waits_for_the_whole_example(tmp_path, monkeypatch, signum):
+    from foundry.demo import seed
+    from foundry.service import Service
+
+    reference = Store(tmp_path / "reference" / "foundry.db")
+    reference.bootstrap("Local owner", tmp_path / "reference" / "owner.key")
+    seed(
+        Service(reference), reference.authenticate((tmp_path / "reference" / "owner.key").read_text().strip())
+    )
+
+    # The stop arrives part-way through the example, from inside setup itself, so the test
+    # does not depend on when a signal from outside would land.
+    original, raised = Service.save_forecast, []
+
+    def interrupted(self, *args, **kwargs):
+        raised.append(signum)
+        signal.raise_signal(signum)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Service, "save_forecast", interrupted)
+    # Both signals interrupt here, as Ctrl+C does in a terminal, whatever the test runner set.
+    previous = {s: signal.signal(s, _interrupt) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        out = Terminal()
+        db = tmp_path / "ws" / "foundry.db"
+        code = cli.start_foundry(db, port=free_port(), out=out, err=io.StringIO(), opener=lambda url: None)
+        after = {s: signal.getsignal(s) for s in previous}
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+    assert raised == [signum]
+    assert code == 0
+    assert after == {signal.SIGINT: _interrupt, signal.SIGTERM: _interrupt}  # put back as they were
+    assert workspace_summary(db) == workspace_summary(reference.path)
+    text = out.getvalue()
+    assert "Added the example business 'Polymer Geospatial · demo'." in text
+    assert "Business Foundry is running." not in text
+    assert text.rstrip().endswith(
+        f"Foundry has stopped. It finished setting up first, so your workspace in {db.parent} is complete. "
+        "Run the same command again to start Foundry."
+    )
+    monkeypatch.setattr(Service, "save_forecast", original)
+    with Running(db, opener=lambda url: None) as second:
+        assert business_names(db) == [EXAMPLE_NAME]
+    assert "Added the example business" not in second.out.getvalue()
+    assert workspace_summary(db) == workspace_summary(reference.path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ignores SIGINT through POSIX signal dispositions")
+def test_an_ignored_ctrl_c_during_setup_stays_ignored(tmp_path, monkeypatch):
+    from foundry.service import Service
+
+    original = Service.save_forecast
+
+    def interrupted(self, *args, **kwargs):
+        signal.raise_signal(signal.SIGINT)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Service, "save_forecast", interrupted)
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    served = []
+    try:
+        out = Terminal()
+
+        def started(server):
+            served.append(True)
+            server.should_exit = True
+
+        code = cli.start_foundry(
+            tmp_path / "foundry.db", port=free_port(), out=out, opener=lambda url: None, on_started=started
+        )
+        after = signal.getsignal(signal.SIGINT)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    assert code == 0 and served == [True]
+    assert after is signal.SIG_IGN
+    assert "Business Foundry is running." in out.getvalue()

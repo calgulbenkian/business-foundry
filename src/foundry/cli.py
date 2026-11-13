@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import shlex
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -136,6 +137,47 @@ def _is_terminal(stream):
         return False
 
 
+class _HoldStops:
+    """Hold Ctrl+C and SIGTERM while the workspace is set up, so setup is never cut short.
+
+    The example business is added by many commands with fixed command keys, and a later start
+    never adds it again, so an interrupted setup would leave half an example for good. A stop
+    asked for during setup is recorded and acted on once setup has finished. A signal that was
+    being ignored stays ignored. Signal handlers can only be set in the main thread; elsewhere
+    nothing is held.
+    """
+
+    def __init__(self):
+        self.asked = False
+        self._previous = {}
+
+    def _hold(self, signum, frame):
+        self.asked = True
+
+    def __enter__(self):
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                if signal.getsignal(signum) is not signal.SIG_IGN:
+                    self._previous[signum] = signal.signal(signum, self._hold)
+        return self
+
+    def __exit__(self, *exc):
+        for signum, handler in self._previous.items():
+            signal.signal(signum, handler)
+
+
+def _stop_as_ctrl_c(signum, frame):
+    raise KeyboardInterrupt
+
+
+def foundry_command():
+    """The command a person types to run Foundry the way this process was started."""
+    # uv sets UV (and UV_RUN_RECURSION_DEPTH) for the programs `uv run` starts.
+    if os.environ.get("UV") or os.environ.get("UV_RUN_RECURSION_DEPTH"):
+        return "uv run foundry"
+    return "foundry"
+
+
 def bind_local(port):
     """Return (socket, None) listening on 127.0.0.1:port, or (None, message) if that fails.
 
@@ -194,20 +236,35 @@ def start_foundry(
     if sock is None:
         print(problem, file=err)
         return 1
+    # SIGTERM (for example `kill`, or a service manager stopping Foundry) stops it the way
+    # Ctrl+C does: the same message and the same exit status. uvicorn catches SIGTERM while it
+    # serves, shuts down, then raises it again, which reaches this handler.
+    sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            sigterm = signal.signal(signal.SIGTERM, _stop_as_ctrl_c)
     try:
-        store = Store(db_path)
-        created = store.bootstrap("Local owner", token_path)
-        if created:
-            print(f"Created a new private workspace. Its sign-in key is saved in {token_path}", file=out)
-            if not empty:
-                from .demo import seed
+        with _HoldStops() as held:
+            store = Store(db_path)
+            created = store.bootstrap("Local owner", token_path)
+            if created:
+                _say(f"Created a new private workspace. Its sign-in key is saved in {token_path}", out)
+                if not empty:
+                    from .demo import seed
 
-                seed(Service(store), store.authenticate(token_path.read_text().strip()))
-                print(
-                    "Added the example business 'Polymer Geospatial · demo'. It is synthetic: "
-                    "its customers, figures and receipts are made up.",
-                    file=out,
-                )
+                    seed(Service(store), store.authenticate(token_path.read_text().strip()))
+                    _say(
+                        "Added the example business 'Polymer Geospatial · demo'. It is synthetic: "
+                        "its customers, figures and receipts are made up.",
+                        out,
+                    )
+        if held.asked:
+            _say(
+                "\nFoundry has stopped. It finished setting up first, so your workspace in "
+                f"{db_path.parent} is complete. Run the same command again to start Foundry.",
+                out,
+            )
+            return 0
 
         terminal = _is_terminal(out)
         url = f"http://{START_HOST}:{sock.getsockname()[1]}"
@@ -225,7 +282,7 @@ def start_foundry(
             else:
                 key_line = (
                     "Sign-in key: not shown, because this output is not going to a terminal. "
-                    f"Run '{token_command}' in a terminal to show it."
+                    f"To show it, run '{token_command}' in a terminal, in {Path.cwd()}"
                 )
         block = "\n".join(
             [
@@ -275,6 +332,8 @@ def start_foundry(
         return 0
     finally:
         sock.close()
+        if sigterm is not None:
+            signal.signal(signal.SIGTERM, sigterm)
 
 
 def main(argv=None):
@@ -293,7 +352,9 @@ def main(argv=None):
         "start",
         help="Set up on first run, then start the web application on 127.0.0.1 and open it in a browser",
     )
-    start.add_argument("--port", type=port_number, default=8765)
+    start.add_argument(
+        "--port", type=port_number, default=8765, help="Port to listen on at 127.0.0.1 (default: 8765)"
+    )
     start.add_argument("--empty", action="store_true", help="On first run, do not add the example business")
     start.add_argument("--no-browser", action="store_true", help="Do not open a web browser")
     serve = commands.add_parser("serve", help="Start the local web application")
@@ -363,9 +424,11 @@ def main(argv=None):
             mcp_main()
             return
         if args.command == "start":
-            token_command = "foundry token"
-            if args.db != os.getenv("FOUNDRY_DB", ".foundry/foundry.db"):
-                token_command = f"foundry --db {shlex.quote(args.db)} token"
+            # Printed for a person to type in another terminal, which may not share this
+            # process's FOUNDRY_DB, so the database is named unless it is the built-in default.
+            token_command = f"{foundry_command()} token"
+            if args.db != ".foundry/foundry.db":
+                token_command = f"{foundry_command()} --db {shlex.quote(args.db)} token"
             code = start_foundry(
                 db_path,
                 port=args.port,
