@@ -377,6 +377,8 @@ def read_configuration(model, path: Path, only_set=False) -> dict:
                 problem = f"{where} is required"
             else:
                 problem = f"{where}: {error['msg']}" if where else error["msg"]
+            # The line ends with one full stop, so a message that ends with its own loses it here.
+            problem = problem.rstrip(".")
             if problem not in problems:
                 problems.append(problem)
         raise ValueError(f"{path.name} was not accepted: " + "; ".join(problems) + ".") from None

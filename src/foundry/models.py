@@ -188,6 +188,8 @@ class DealInputs(Model):
     The target's revenue and reported EBITDA and the purchase price have no default: nothing stands in
     for the figures that describe the business and its price. Every other figure has an example value
     that the model uses when the caller leaves it out; assumed_inputs names those (docs/FINANCE.md).
+    Financing is the buyer's choice, not a fact about the target, so the example senior debt and seller
+    note are zero: a deal given no financing is screened as bought without debt.
     """
 
     target: Short
@@ -202,7 +204,7 @@ class DealInputs(Model):
     fees: Money = Decimal("30000")
     working_capital: Money = Decimal("50000")
     integration_cost: Money = Decimal("0")
-    senior_debt: Money = Decimal("400000")
+    senior_debt: Money = Decimal("0")
     debt_rate: Rate = Decimal("0.09")
     debt_years: Annotated[int, Field(ge=1, le=30)] = 7
     seller_note: Money = Decimal("0")
@@ -217,23 +219,84 @@ class DealInputs(Model):
 
     @model_validator(mode="after")
     def valid_deal(self):
+        """Refuse inputs that contradict each other.
+
+        A check that counted a figure the caller did not give names that figure and its example value,
+        and asks for it, so a refusal is never blamed on a figure the caller never entered. The debt
+        check names only figures whose example value is not zero: a zero adds nothing to either side.
+        A check that counted only given figures keeps its plain words.
+        """
         if self.multiple_high < self.multiple_low:
-            raise ValueError("High multiple must not be below low multiple.")
+            raise ValueError(
+                self._refusal(
+                    "High multiple must not be below low multiple.", ("multiple_low", "multiple_high")
+                )
+            )
         uses = self.purchase_price + self.fees + self.working_capital + self.integration_cost
         if self.senior_debt + self.seller_note > uses:
-            raise ValueError("Debt funding exceeds transaction uses.")
+            counted = ("fees", "working_capital", "integration_cost", "senior_debt", "seller_note")
+            raise ValueError(
+                self._refusal(
+                    "Debt funding exceeds transaction uses.",
+                    tuple(name for name in counted if getattr(self, name)),
+                )
+            )
         if self.reported_ebitda > self.annual_revenue:
             raise ValueError("Reported EBITDA exceeds revenue; review the inputs.")
         return self
 
+    def _refusal(self, message: str, involved: tuple[str, ...]) -> str:
+        """The message, followed by a sentence naming each involved figure the caller did not give."""
+        assumed = [name for name in involved if name not in self.model_fields_set]
+        if not assumed:
+            return message
+        names = [DEAL_REFUSAL_NAMES[name] for name in assumed]
+        values = [f"{getattr(self, name):,}" for name in assumed]
+        if len(assumed) == 1:
+            (subject, ask, plural), value = names[0], values[0]
+            verb, whose = ("were", "their") if plural else ("was", "its")
+            note = f"{subject} {verb} not given, so {whose} example value {value} was used; give {ask}."
+        else:
+            subjects = _listed([subject for subject, _, _ in names])
+            ask = "both" if len(assumed) == 2 else "them"
+            note = (
+                f"{subjects} were not given, so their example values {_listed(values)} were used; give {ask}."
+            )
+        return f"{message} {note[0].upper()}{note[1:]}"
+
     def assumed_inputs(self) -> list[str]:
-        """The figures the caller did not give, in field order, so the model used its example value.
+        """The figures the caller did not give that the model used, in field order.
 
         Read from the fields the caller set, not from the values: a figure sent with the same value as its
-        example is the caller's own and is not listed. Adjustments and evidence are lists of what the
-        caller claims, not figures with an example value, so they are never listed.
+        example is the caller's own and is not listed. A loan's rate and term enter the arithmetic only
+        when the loan is above zero, so a rate or term not given is listed only then; with no loan it is
+        not used and not listed. Adjustments and evidence are lists of what the caller claims, not figures
+        with an example value, so they are never listed.
         """
-        return [name for name in DEAL_EXAMPLE_FIGURES if name not in self.model_fields_set]
+        unused = set()
+        if not self.senior_debt:
+            unused |= {"debt_rate", "debt_years"}
+        if not self.seller_note:
+            unused |= {"seller_rate", "seller_years"}
+        return [
+            name for name in DEAL_EXAMPLE_FIGURES if name not in self.model_fields_set and name not in unused
+        ]
+
+
+def _listed(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+# How a refusal names a figure that was not given: the subject, what to give, and whether it is plural.
+DEAL_REFUSAL_NAMES = {
+    "multiple_low": ("the low multiple", "a low multiple", False),
+    "multiple_high": ("the high multiple", "a high multiple", False),
+    "fees": ("the transaction fees", "the transaction fees", True),
+    "working_capital": ("the working capital funding", "the working capital funding", False),
+    "integration_cost": ("the integration costs", "the integration costs", True),
+    "senior_debt": ("the senior debt", "the senior debt", False),
+    "seller_note": ("the seller note", "the seller note", False),
+}
 
 
 # The figures of DealInputs that have an example value, in field order.

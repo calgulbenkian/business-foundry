@@ -154,7 +154,7 @@ def build_server():
 
     @server.tool()
     def analyze_acquisition(business_id: str, command_key: str, inputs: dict) -> dict:
-        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work. target, thesis, annual_revenue, reported_ebitda and purchase_price are required: use only figures the human gave you, and never invent them. A request without one is refused and nothing is saved. Every other figure you leave out takes the model's example value, and the result lists it in data.assumed_inputs. Tell the human which inputs were assumed."""
+        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work. target, thesis, annual_revenue, reported_ebitda and purchase_price are required: use only figures the human gave you, and never invent them. A request without one is refused and nothing is saved. Every other figure you leave out takes the model's example value, and the result lists it in data.assumed_inputs. Tell the human which inputs were assumed. The example senior debt and seller note are zero, so financing you leave out is no loan, and a loan's rate and term are used and listed only when the loan is given. A refusal caused by an example value names that figure and its value; ask the human for it rather than choosing one."""
         return request("POST", path(business_id) + "/deals", inputs, command_key)
 
     @server.tool()
@@ -215,9 +215,14 @@ def build_server():
             opening(business_id, "Run a guided acquisition screening and diligence intake.")
             + "Step 2: interview the human one topic at a time, in this order:\n"
             "1. Target and investment thesis.\n"
-            "2. Reported revenue and EBITDA, and the cost of replacement management.\n"
+            "2. The three required figures: annual revenue, reported EBITDA and the negotiated purchase "
+            "price. Then the cost of replacement management.\n"
             "3. Earnings adjustments, each backed by source evidence (add_evidence).\n"
-            "4. Valuation multiples, purchase uses, and debt or seller financing (analyze_acquisition).\n"
+            "4. Valuation multiples, other purchase uses, and any debt or seller financing "
+            "(analyze_acquisition).\n"
+            "Revenue, EBITDA and the purchase price must come from the human: never invent, estimate or "
+            "fill in any of the three. If one is unknown, ask for it and do not run the analysis. "
+            "A loan left out is no loan: the deal is then screened without debt. "
             "Multiples are the human's assumptions; do not present them as market comparables.\n\n" + rules
         )
 

@@ -209,7 +209,16 @@ def test_mcp_guided_prompts_are_static_and_state_human_review(setup):
                 "founder_intake",
                 ["buyer", "problem", "pricing", "third-party rights", "build_forecast", "add_evidence"],
             ),
-            ("acquisition_intake", ["thesis", "EBITDA", "replacement management", "analyze_acquisition"]),
+            (
+                "acquisition_intake",
+                [
+                    "thesis",
+                    "annual revenue, reported EBITDA and the negotiated purchase price",
+                    "never invent, estimate or fill in any of the three",
+                    "replacement management",
+                    "analyze_acquisition",
+                ],
+            ),
             ("readiness_review", ["blockers", "stale", "ask before"]),
         ]:
             prompt = await client.get_prompt(name, {"business_id": bid})

@@ -341,6 +341,24 @@ def assumed_text(deal) -> str:
     return "Not given, so the model's example value was used: " + "; ".join(parts) + "."
 
 
+NO_DEBT = (
+    "No debt was given and none was assumed, so the deal is screened as bought without debt. "
+    "There is no debt service: cash after debt service equals cash available, and there is no coverage ratio."
+)
+
+
+def debt_text(deal, currency) -> str:
+    """The annual debt service, or, for a deal with no senior debt and no seller note, that it has none.
+
+    The model's example loans are zero, so a deal with no financing given carries no debt, and its
+    empty coverage reads as intended, not missing.
+    """
+    a, inputs = deal["data"]["analysis"], deal["data"]["inputs"]
+    if Decimal(str(inputs["senior_debt"])) or Decimal(str(inputs["seller_note"])):
+        return f"Annual debt service: {fmt_money(a['annual_debt_service'])} {currency}."
+    return NO_DEBT
+
+
 def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> list[str]:
     a, inp = deal["data"]["analysis"], deal["data"]["inputs"]
     snap_deal = next((o for o in snapshot["objects"] if o["id"] == deal["id"]), None)
@@ -409,12 +427,7 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
         ],
         {2},
     )
-    out += [
-        "### Debt service and scenario coverage",
-        "",
-        f"Annual debt service: {fmt_money(a['annual_debt_service'])} {currency}.",
-        "",
-    ]
+    out += ["### Debt service and scenario coverage", "", debt_text(deal, currency), ""]
     out += fmt_table(
         [
             "Case",

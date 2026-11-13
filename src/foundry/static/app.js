@@ -2641,8 +2641,14 @@ function inspPlan(p) {
   if (evidence.length) out += sec('Evidence', attList(evidence));
   return out;
 }
+/* What a deal with no senior debt and no seller note says, as the investment memo says it. The model's
+   example loans are zero, so its empty coverage reads as intended, not missing. */
+const NO_DEBT =
+  'No debt was given and none was assumed, so the deal is screened as bought without debt. There is no debt service: cash after debt service equals cash available, and there is no coverage ratio.';
 function inspDeal(o) {
   const a = o.data.analysis;
+  const inputs = o.data.inputs || {};
+  const noDebt = decimalKey(inputs.senior_debt) === '0' && decimalKey(inputs.seller_note) === '0';
   const line = M.lines.find((l) => l.dealId === o.id);
   let out = head({
     kicker: 'Acquisition analysis',
@@ -2661,7 +2667,7 @@ function inspDeal(o) {
   out += `<p class="prose spaced">${h(o.data.inputs.thesis)}</p>`;
   out += sec(
     'Key figures',
-    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div><div>Buyer equity required</div><div class="v">${money(a.sources_and_uses.buyer_equity_required)}</div><div>Annual debt service</div><div class="v">${money(a.annual_debt_service)}</div></div><p class="fine">${CALC_NOTE}</p>`,
+    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div><div>Buyer equity required</div><div class="v">${money(a.sources_and_uses.buyer_equity_required)}</div><div>Annual debt service</div><div class="v">${noDebt ? 'None' : money(a.annual_debt_service)}</div></div>${noDebt ? `<p class="fine no-debt">${NO_DEBT}</p>` : ''}<p class="fine">${CALC_NOTE}</p>`,
   );
   out += sec('Inputs not given', `<p class="fine assumed-inputs">${assumedText(o)}</p>`);
   out += sec(
@@ -4108,6 +4114,9 @@ function forecastDialog() {
    left out of the request, the server uses the example value and records the field in assumed_inputs. */
 const DEAL_REQUIRED = ['annual_revenue', 'reported_ebitda', 'purchase_price'];
 const DEAL_WHOLE = ['debt_years', 'seller_years'];
+/* The two loans. Financing is the buyer's choice, so an empty loan is no loan: its example is zero. */
+const DEAL_LOANS = ['senior_debt', 'seller_note'];
+const DEAL_LOAN_TERMS = ['debt_rate', 'debt_years', 'seller_rate', 'seller_years'];
 const dealYears = (v) => `${h(v)} years`;
 const dealMultiple = (v) => `${ratio(v)}×`;
 const dealRate = (v) =>
@@ -4128,7 +4137,7 @@ const dealFields = [
   ['fees', 'Transaction fees', 30000, money],
   ['working_capital', 'Working capital funding', 50000, money],
   ['integration_cost', 'Integration costs', 0, money],
-  ['senior_debt', 'New senior debt', 400000, money],
+  ['senior_debt', 'New senior debt', 0, money],
   ['debt_rate', 'Senior annual interest rate', 0.09, dealRate],
   ['debt_years', 'Senior term (years)', 7, dealYears],
   ['seller_note', 'Seller financing', 0, money],
@@ -4203,10 +4212,15 @@ function dealDialog(id) {
             'number',
             DEAL_REQUIRED.includes(k)
               ? 'Required.'
-              : k.includes('rate')
-                ? 'Decimal rate: 0.09 means 9%. Leave empty to use the example.'
-                : 'Leave empty to use the example.',
-            `step="any" placeholder="Example: ${example}"${DEAL_REQUIRED.includes(k) ? ' required' : ''}`,
+              : DEAL_LOANS.includes(k)
+                ? 'Leave empty for no loan.'
+                : DEAL_LOAN_TERMS.includes(k)
+                  ? (k.includes('rate') ? 'Decimal rate: 0.09 means 9%. ' : '') +
+                    'Used only when its loan is entered. Leave empty to use the example.'
+                  : k.includes('rate')
+                    ? 'Decimal rate: 0.09 means 9%. Leave empty to use the example.'
+                    : 'Leave empty to use the example.',
+            `step="any" placeholder="${DEAL_LOANS.includes(k) ? 'Empty: no loan' : `Example: ${example}`}"${DEAL_REQUIRED.includes(k) ? ' required' : ''}`,
           ),
         )
         .join('') +
@@ -4235,7 +4249,7 @@ function dealDialog(id) {
       return post(scope.bid, '/deals', body, key);
     },
     'Calculate and create diligence work',
-    'Revenue, reported EBITDA and the purchase consideration are required. Any other figure left empty uses the example value shown, and the analysis lists it as not given. Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
+    'Revenue, reported EBITDA and the purchase consideration are required. An empty loan is no loan: the deal is screened without debt unless you enter one. Any other figure left empty uses the example value shown, and the analysis lists it as not given. Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
     selectAfter('deals', 'deal:'),
   );
 }

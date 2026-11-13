@@ -869,6 +869,18 @@ async function main() {
       assert.equal(await dealField(name).inputValue(), '', name + ' starts empty');
       assert.equal(await dealField(name).getAttribute('placeholder'), 'Example: ' + example);
     }
+    // Financing is the buyer's choice: an empty loan is no loan, with no example amount shown.
+    const dealHint = (name) =>
+      page.locator(`#dialog label:has([name="${name}"]) .hint`).innerText();
+    for (const name of ['senior_debt', 'seller_note']) {
+      assert.equal(await dealField(name).inputValue(), '', name + ' starts empty');
+      assert.equal(await dealField(name).getAttribute('placeholder'), 'Empty: no loan');
+      assert.equal(await dealHint(name), 'Leave empty for no loan.');
+    }
+    assert.equal(
+      await dealHint('debt_years'),
+      'Used only when its loan is entered. Leave empty to use the example.',
+    );
     const dealPosts = [];
     const onDealPost = (r) => {
       if (r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'))
@@ -889,6 +901,32 @@ async function main() {
     assert.equal(dealPosts.length, 0, 'nothing is sent while a required figure is empty');
     await dealField('purchase_price').fill('700000');
     await dealField('debt_years').fill('6');
+    // A refusal caused by an example value names it, in the same words as the API.
+    const highAssumed =
+      'body: Value error, High multiple must not be below low multiple. The high multiple was not given, so its example value 5 was used; give a high multiple.';
+    await dealField('multiple_low').fill('6');
+    const errorsBefore = errors.length;
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'),
+    );
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    const refusal = await refused;
+    assert.equal(refusal.status(), 422);
+    assert.equal((await refusal.json()).detail, highAssumed);
+    const formError = page.locator('#dialog p.error');
+    await formError.filter({ hasText: 'high multiple was not given' }).waitFor();
+    assert.equal(await formError.innerText(), highAssumed);
+    // The browser logs the refused save's 422 as a console error; that line, and no other, is expected.
+    const logged = errors.splice(errorsBefore);
+    assert.deepEqual(
+      logged.filter((t) => !t.includes('status of 422')),
+      [],
+    );
+    await dealField('multiple_low').fill('');
+    dealPosts.length = 0;
     // What was sent is checked before the save is awaited, so a wrong body fails here by name.
     const posted = page.waitForRequest(
       (r) => r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'),
@@ -920,8 +958,20 @@ async function main() {
       assumedLine,
     );
     assert.match(assumedLine, /Transaction fees \$30,000\.00/);
-    assert.match(assumedLine, /Seller term 5 years/);
+    assert.match(assumedLine, /New senior debt \$0\.00; Seller financing \$0\.00/);
     assert(!assumedLine.includes('Senior term'), 'the term that was given is not listed');
+    for (const unused of [
+      'Senior annual interest rate',
+      'Seller annual interest rate',
+      'Seller term',
+    ])
+      assert(!assumedLine.includes(unused), unused + ' has no loan, so it is not used or listed');
+    // No loan was given, so the page says the deal is screened without debt.
+    assert.equal(
+      await page.locator('#insp .no-debt').innerText(),
+      'No debt was given and none was assumed, so the deal is screened as bought without debt. There is no debt service: cash after debt service equals cash available, and there is no coverage ratio.',
+    );
+    assert.match(await page.locator('#insp .figs').innerText(), /Annual debt service\s+None/);
     // Opened again from this analysis, the form fills only what the analysis gave.
     await page.getByRole('button', { name: 'Revise assumptions', exact: true }).click();
     assert.equal(await dealField('annual_revenue').inputValue(), '900000');
@@ -5707,7 +5757,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition (refused without its three required figures, figures left empty not sent and listed as not given, and a reopened form filling only what was given), after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition (refused without its three required figures, a refusal caused by an example value naming it in the API’s words, empty loans meaning no loan and the page saying no debt was given, figures left empty not sent and listed as not given, and a reopened form filling only what was given), after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

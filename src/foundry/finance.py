@@ -394,6 +394,10 @@ def _deal_values(a: DealInputs, verified_evidence: set[str]) -> dict:
     Nothing here is rounded. Each figure that depends on debt service is kept over the exact debt-service
     denominator: cash after debt service is after_numerator / denominator and coverage is
     scaled_available / numerator, where scaled_available = available × denominator.
+
+    A loan of zero adds no payment (_debt_service_fraction skips it) and no interest (_mul of a zero is
+    zero), so its rate and term enter no figure. DealInputs.assumed_inputs relies on this: it lists a rate
+    or term the caller did not give only when its loan is above zero.
     """
     normalized = _sub(a.reported_ebitda, a.replacement_management)
     for item in a.adjustments:

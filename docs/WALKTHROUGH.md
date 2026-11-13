@@ -44,7 +44,7 @@ Choose **external receipt** for evidence of an action outside the app. A reviewe
 
 **Money** shows the latest model's position and recorded cash; **+ Build model** creates linked monthly statements and explicit base/downside/upside cases. Start with believable quantities and unit economics; include real labor and support costs. Examine collection timing and negative cash. Save new versions as assumptions improve.
 
-**Acquisition analyses** creates an earnings/valuation/financing analysis and seven target-specific diligence steps, which appear as their own line on the Journey map. Attach independent evidence to add-backs, check replacement management and financing costs, and inspect the cash available after debt service. A target is not approved because its spreadsheet looks attractive. The form needs the target's annual revenue, reported EBITDA and purchase consideration. A figure left empty takes the model's example value, and the analysis lists it under **Inputs not given**.
+**Acquisition analyses** creates an earnings/valuation/financing analysis and seven target-specific diligence steps, which appear as their own line on the Journey map. Attach independent evidence to add-backs, check replacement management and financing costs, and inspect the cash available after debt service. A target is not approved because its spreadsheet looks attractive. The form needs the target's annual revenue, reported EBITDA and purchase consideration. A figure left empty takes the model's example value, and the analysis lists it under **Inputs not given**. An empty loan is no loan: the deal is screened without debt unless you enter one, and the analysis says so.
 
 ```sh
 uv run foundry forecast BUSINESS_ID examples/forecast.json

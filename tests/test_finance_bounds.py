@@ -1140,7 +1140,7 @@ def check_reads(client, setup, deal_id):
     plan_doc = generate(client, bid, "business_plan")
     memo = generate(client, bid, "investment_memo", deal_id)
     download = client.get(f"/api/businesses/{bid}/documents/{memo['id']}/download")
-    assert download.status_code == 200 and "Annual debt service" in download.text
+    assert download.status_code == 200 and "Debt service and scenario coverage" in download.text
     assert plan_doc["data"]["content"]
     assert client.get(f"/api/businesses/{bid}/audit").json()["integrity"]["valid"]
     assert service.audit(actor, bid)["integrity"]["valid"]

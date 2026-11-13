@@ -193,7 +193,8 @@ def seed(service: Service, actor):
         actor,
         bid,
         "demo:deal:v1",
-        # Only the fields given here are sent, so the deal lists every other figure as assumed.
+        # Only the fields given here are sent, so the deal lists every other figure it used as assumed.
+        # The senior loan is given: financing is the buyer's choice, and the model assumes no debt.
         models.DealInputs(
             target="Example Mapping Studio · synthetic",
             thesis="Compare buying a small mapping-services operation with building delivery capacity. All figures are illustrative.",
@@ -205,6 +206,9 @@ def seed(service: Service, actor):
                 models.Adjustment(label="Unsupported seller add-back", amount=25000),
             ],
             replacement_management=60000,
+            senior_debt=400000,
+            debt_rate="0.09",
+            debt_years=7,
         ).model_dump(mode="json", exclude_unset=True),
     )
     service.generate_document(

@@ -67,7 +67,8 @@ MINIMAL = {
     "reported_ebitda": "180000",
     "purchase_price": "700000",
 }
-# Every figure with an example value, in the field order of DealInputs.
+# Every figure with an example value that the model used, in the field order of DealInputs. With no loan
+# given, both loans are zero, so their rates and terms are not used and not listed.
 MINIMAL_ASSUMED = [
     "replacement_management",
     "multiple_low",
@@ -76,11 +77,7 @@ MINIMAL_ASSUMED = [
     "working_capital",
     "integration_cost",
     "senior_debt",
-    "debt_rate",
-    "debt_years",
     "seller_note",
-    "seller_rate",
-    "seller_years",
     "annual_capex",
     "annual_working_capital_growth",
     "tax_rate",
@@ -90,9 +87,8 @@ MINIMAL_ASSUMED = [
 MINIMAL_SENTENCE = (
     "Not given, so the model's example value was used: Annual replacement management cost 0.00; "
     "Low EBITDA multiple 3.00x; High EBITDA multiple 5.00x; Transaction fees 30,000.00; "
-    "Working capital funding 50,000.00; Integration costs 0.00; New senior debt 400,000.00; "
-    "Senior annual interest rate 9.00%; Senior term 7 years; Seller financing 0.00; "
-    "Seller annual interest rate 6.00%; Seller term 5 years; Annual maintenance capex 15,000.00; "
+    "Working capital funding 50,000.00; Integration costs 0.00; New senior debt 0.00; "
+    "Seller financing 0.00; Annual maintenance capex 15,000.00; "
     "Annual working capital increase 0.00; Assumed tax rate 25.00%; Cash in valuation equity bridge 0.00; "
     "Debt in valuation equity bridge 0.00."
 )
@@ -306,9 +302,6 @@ def test_a_figure_sent_with_its_example_value_is_the_callers_own(client, setup):
         "working_capital",
         "integration_cost",
         "senior_debt",
-        "debt_rate",
-        "seller_rate",
-        "seller_years",
         "annual_capex",
         "annual_working_capital_growth",
         "cash_acquired",
@@ -538,5 +531,246 @@ def test_the_demo_deal_has_the_same_figures_as_on_main(setup):
             },
         },
     }
-    # The demo gives revenue, EBITDA, price and replacement management; everything else is assumed.
-    assert deal["data"]["assumed_inputs"] == MINIMAL_ASSUMED[1:]
+    # The demo gives revenue, EBITDA, price, replacement management and its senior loan with that
+    # loan's rate and term. Every other figure it used is assumed; with no seller note, the seller's rate
+    # and term are not used and not listed.
+    assert deal["data"]["assumed_inputs"] == [
+        "multiple_low",
+        "multiple_high",
+        "fees",
+        "working_capital",
+        "integration_cost",
+        "seller_note",
+        "annual_capex",
+        "annual_working_capital_growth",
+        "tax_rate",
+        "cash_acquired",
+        "debt_assumed",
+    ]
+
+
+# 8. Financing is the buyer's choice: a deal given no loan is screened as bought without debt.
+
+NO_DEBT = (
+    "No debt was given and none was assumed, so the deal is screened as bought without debt. "
+    "There is no debt service: cash after debt service equals cash available, and there is no coverage ratio."
+)
+LOAN_TERMS = ["debt_rate", "debt_years", "seller_rate", "seller_years"]
+
+
+def debt_line(content):
+    """The paragraph under the memo's debt service heading."""
+    lines = content.splitlines()
+    start = lines.index("### Debt service and scenario coverage")
+    return lines[start + 2]
+
+
+@pytest.mark.parametrize("price", ["175000", "300000"])
+def test_a_small_deal_with_no_financing_given_is_accepted_without_debt(client, setup, price):
+    store, _, _, bid, _ = setup
+    response = post(client, bid, {**MINIMAL, "purchase_price": price})
+    assert response.status_code == 201, response.text
+    deal = response.json()
+    assert deal["data"]["assumed_inputs"] == MINIMAL_ASSUMED
+    assert deal["data"]["inputs"]["senior_debt"] == "0" and deal["data"]["inputs"]["seller_note"] == "0"
+    assert not set(LOAN_TERMS) & set(deal["data"]["assumed_inputs"])
+    a = deal["data"]["analysis"]
+    # Uses: the price, the example fees 30,000 and working capital 50,000; funded wholly by the buyer.
+    total = {"175000": "255000.00", "300000": "380000.00"}[price]
+    assert a["sources_and_uses"]["total_uses"] == total
+    assert a["sources_and_uses"]["senior_debt"] == "0.00" and a["sources_and_uses"]["seller_note"] == "0.00"
+    assert a["sources_and_uses"]["buyer_equity_required"] == total
+    assert a["annual_debt_service"] == "0.00"
+    # EBITDA 180,000 less 25% tax (no interest) and the example capex 15,000; downside less 10% of
+    # revenue 900,000, upside plus 5% of it.
+    assert a["scenarios"] == {
+        "base": {
+            "ebitda": "180000.00",
+            "cash_available_for_debt_service": "120000.00",
+            "cash_after_debt_service": "120000.00",
+            "coverage_ratio": None,
+            "cash_shortfall": False,
+        },
+        "downside": {
+            "ebitda": "90000.00",
+            "cash_available_for_debt_service": "52500.00",
+            "cash_after_debt_service": "52500.00",
+            "coverage_ratio": None,
+            "cash_shortfall": False,
+        },
+        "upside": {
+            "ebitda": "225000.00",
+            "cash_available_for_debt_service": "153750.00",
+            "cash_after_debt_service": "153750.00",
+            "coverage_ratio": None,
+            "cash_shortfall": False,
+        },
+    }
+    content = memo(client, bid, deal["id"])
+    assert debt_line(content) == NO_DEBT
+    assert "Annual debt service:" not in content
+    base = next(line for line in content.splitlines() if line.startswith("| Base "))
+    assert [cell.strip() for cell in base.strip("|").split("|")] == [
+        "Base",
+        "180,000.00",
+        "120,000.00",
+        "120,000.00",
+        "No debt service",
+        "No",
+    ]
+    assert inputs_section(content) == MINIMAL_SENTENCE
+
+
+def test_a_deal_with_a_loan_keeps_its_annual_debt_service_line(client, setup):
+    _, _, _, bid, _ = setup
+    deal = post(client, bid, SENT).json()
+    assert debt_line(memo(client, bid, deal["id"])) == "Annual debt service: 102,304.37 USD."
+
+
+def test_a_given_loan_lists_its_rate_and_term_when_they_are_not_given(client, setup):
+    _, _, _, bid, _ = setup
+    senior = post(client, bid, {**MINIMAL, "senior_debt": "300000"}).json()
+    assumed = senior["data"]["assumed_inputs"]
+    assert [x for x in assumed if x in LOAN_TERMS] == ["debt_rate", "debt_years"]
+    assert "senior_debt" not in assumed and "seller_note" in assumed
+    assert senior["data"]["inputs"]["debt_rate"] == "0.09" and senior["data"]["inputs"]["debt_years"] == 7
+
+    seller = post(client, bid, {**MINIMAL, "seller_note": "100000"}).json()
+    assumed = seller["data"]["assumed_inputs"]
+    assert [x for x in assumed if x in LOAN_TERMS] == ["seller_rate", "seller_years"]
+    assert "seller_note" not in assumed and "senior_debt" in assumed
+
+    # A loan given with its rate but not its term lists only the term.
+    rate_only = post(client, bid, {**MINIMAL, "senior_debt": "300000", "debt_rate": "0.08"}).json()
+    assert [x for x in rate_only["data"]["assumed_inputs"] if x in LOAN_TERMS] == ["debt_years"]
+    content = memo(client, bid, senior["id"])
+    assert debt_line(content).startswith("Annual debt service: ")
+    assert "Senior annual interest rate 9.00%; Senior term 7 years" in inputs_section(content)
+
+
+def test_a_rate_and_term_without_their_loan_change_no_figure():
+    plain = acquisition(DealInputs(**MINIMAL), set())
+    odd = acquisition(
+        DealInputs(**MINIMAL, debt_rate="0.5", debt_years=1, seller_rate="0.4", seller_years=2), set()
+    )
+    assert figures(odd) == figures(plain)
+    assert odd["annual_debt_service"] == "0.00"
+    assert all(s["coverage_ratio"] is None for s in odd["scenarios"].values())
+
+
+# 9. A refusal caused by a figure the caller did not give names it and its example value.
+
+OLD_MULTIPLES = "High multiple must not be below low multiple."
+HIGH_ASSUMED = (
+    "High multiple must not be below low multiple. The high multiple was not given, so its example "
+    "value 5 was used; give a high multiple."
+)
+LOW_ASSUMED = (
+    "High multiple must not be below low multiple. The low multiple was not given, so its example "
+    "value 3 was used; give a low multiple."
+)
+OLD_DEBT = "Debt funding exceeds transaction uses."
+FEES_AND_WC_ASSUMED = (
+    "Debt funding exceeds transaction uses. The transaction fees and the working capital funding were "
+    "not given, so their example values 30,000 and 50,000 were used; give both."
+)
+WC_ASSUMED = (
+    "Debt funding exceeds transaction uses. The working capital funding was not given, so its example "
+    "value 50,000 was used; give the working capital funding."
+)
+FEES_ASSUMED = (
+    "Debt funding exceeds transaction uses. The transaction fees were not given, so their example "
+    "value 30,000 was used; give the transaction fees."
+)
+OLD_EBITDA = "Reported EBITDA exceeds revenue; review the inputs."
+# Each refused request, with the one message it must give. MINIMAL's price is 700,000.
+REFUSALS = [
+    ({"multiple_low": "6"}, HIGH_ASSUMED),
+    ({"multiple_high": "2"}, LOW_ASSUMED),
+    ({"multiple_low": "6", "multiple_high": "5"}, OLD_MULTIPLES),
+    ({"senior_debt": "790000"}, FEES_AND_WC_ASSUMED),
+    ({"senior_debt": "750001", "fees": "0"}, WC_ASSUMED),
+    ({"seller_note": "730001", "working_capital": "0"}, FEES_ASSUMED),
+    ({"senior_debt": "700001", "fees": "0", "working_capital": "0"}, OLD_DEBT),
+    ({"reported_ebitda": "900001"}, OLD_EBITDA),
+]
+REFUSAL_IDS = ["high", "low", "both multiples", "fees and wc", "wc", "fees", "all given", "ebitda"]
+
+
+@pytest.mark.parametrize(("change", "message"), REFUSALS, ids=REFUSAL_IDS)
+def test_the_api_refusal_names_each_assumed_figure_it_counted(client, setup, change, message):
+    store, _, _, bid, _ = setup
+    before = counts(store)
+    response = post(client, bid, {**MINIMAL, **change}, key="refused-key")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "body: Value error, " + message
+    assert counts(store) == before
+    # Nothing was stored and the key was not used: the same key then saves a valid request.
+    assert post(client, bid, MINIMAL, key="refused-key").status_code == 201
+
+
+def test_a_low_multiple_with_a_high_multiple_above_it_is_accepted(client, setup):
+    _, _, _, bid, _ = setup
+    response = post(client, bid, {**MINIMAL, "multiple_low": "6", "multiple_high": "7"})
+    assert response.status_code == 201, response.text
+    deal = response.json()
+    assert "multiple_low" not in deal["data"]["assumed_inputs"]
+    assert "multiple_high" not in deal["data"]["assumed_inputs"]
+    assert deal["data"]["analysis"]["enterprise_value_range"] == ["1080000.00", "1260000.00"]
+
+
+def test_the_cli_gives_each_refusal_as_one_line(tmp_path, capsys):
+    db = str(tmp_path / "cli" / "foundry.db")
+    cli.main(["--db", db, "init"])
+    business = tmp_path / "business.json"
+    business.write_text(
+        json.dumps({"name": "CLI refusal", "concept": "A synthetic business for CLI refusals."})
+    )
+    capsys.readouterr()
+    cli.main(["--db", db, "create", str(business)])
+    bid = json.loads(capsys.readouterr().out)["id"]
+    store = Store(db)
+    before = counts(store)
+    deal = tmp_path / "deal.json"
+    for change, message in REFUSALS:
+        deal.write_text(json.dumps({**MINIMAL, **change}))
+        with pytest.raises(SystemExit) as stopped:
+            cli.main(["--db", db, "acquire", bid, str(deal)])
+        assert stopped.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == f"Foundry: deal.json was not accepted: Value error, {message}\n"
+    assert counts(store) == before
+
+
+def test_the_mcp_tool_passes_back_each_refusal(setup):
+    store, service, owner, bid, _ = setup
+    agent = service.add_principal(owner, {"name": "Refusal agent", "role": "agent", "business_ids": [bid]})
+    texts = []
+
+    async def check(url):
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "foundry.cli", "mcp"],
+            env={**os.environ, "FOUNDRY_API_URL": url, "FOUNDRY_API_TOKEN": agent["token"]},
+        )
+        async with stdio_client(parameters) as (read, write):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                for change, _ in REFUSALS:
+                    result = await client.call_tool(
+                        "analyze_acquisition",
+                        {"business_id": bid, "command_key": "mcp-refused", "inputs": {**MINIMAL, **change}},
+                    )
+                    assert result.isError
+                    texts.append(result.content[0].text)
+
+    before = counts(store)
+    with api_server(store) as url:
+        asyncio.run(check(url))
+    for text, (_, message) in zip(texts, REFUSALS, strict=True):
+        assert "body: Value error, " + message in text
+        # The assumed sentence appears only where an example value was counted.
+        if message in {OLD_MULTIPLES, OLD_DEBT, OLD_EBITDA}:
+            assert "not given" not in text
+    assert counts(store) == before
