@@ -26,6 +26,9 @@ Earnings = _decimal(ge=Decimal("-1000000000"), le=Decimal("1000000000"))
 Multiple = _decimal(ge=0, le=100)
 Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
 Jurisdiction = Literal["undecided", "US-DE", "GB", "SE", "other"]
+# How a seller note is repaid over seller_years (docs/FINANCE.md): level payments, interest each year with the
+# principal at the end, or nothing until the end, when the principal and the interest accrued are due.
+SellerSchedule = Literal["amortizing", "interest_only", "deferred"]
 
 
 class Model(BaseModel):
@@ -188,8 +191,13 @@ class DealInputs(Model):
     The target's revenue and reported EBITDA and the purchase price have no default: nothing stands in
     for the figures that describe the business and its price. Every other figure has an example value
     that the model uses when the caller leaves it out; assumed_inputs names those (docs/FINANCE.md).
-    Financing is the buyer's choice, not a fact about the target, so the example senior debt and seller
-    note are zero: a deal given no financing is screened as bought without debt.
+    Financing is the buyer's choice, not a fact about the target, so the example senior debt, property
+    loan, seller note and investor equity are zero: a deal given no financing is screened as bought
+    without debt and with the buyer's own cash. The real estate price and the rent are zero too: a deal
+    that gives neither buys no building and pays no rent the reported EBITDA does not already bear.
+
+    purchase_price is the price of the business. A building sold with it is priced separately in
+    real_estate_price, so the valuation multiples apply to the business alone.
     """
 
     target: Short
@@ -201,15 +209,22 @@ class DealInputs(Model):
     multiple_low: Multiple = Decimal("3")
     multiple_high: Multiple = Decimal("5")
     purchase_price: Money
+    real_estate_price: Money = Decimal("0")
     fees: Money = Decimal("30000")
     working_capital: Money = Decimal("50000")
     integration_cost: Money = Decimal("0")
     senior_debt: Money = Decimal("0")
     debt_rate: Rate = Decimal("0.09")
     debt_years: Annotated[int, Field(ge=1, le=30)] = 7
+    property_debt: Money = Decimal("0")
+    property_rate: Rate = Decimal("0.08")
+    property_years: Annotated[int, Field(ge=1, le=30)] = 25
     seller_note: Money = Decimal("0")
     seller_rate: Rate = Decimal("0.06")
     seller_years: Annotated[int, Field(ge=1, le=30)] = 5
+    seller_schedule: SellerSchedule = "amortizing"
+    investor_equity: Money = Decimal("0")
+    annual_rent: Money = Decimal("0")
     annual_capex: Money = Decimal("15000")
     annual_working_capital_growth: Money = Decimal("0")
     tax_rate: Rate = Decimal("0.25")
@@ -232,9 +247,23 @@ class DealInputs(Model):
                     "High multiple must not be below low multiple.", ("multiple_low", "multiple_high")
                 )
             )
-        uses = self.purchase_price + self.fees + self.working_capital + self.integration_cost
-        if self.senior_debt + self.seller_note > uses:
-            counted = ("fees", "working_capital", "integration_cost", "senior_debt", "seller_note")
+        uses = (
+            self.purchase_price
+            + self.real_estate_price
+            + self.fees
+            + self.working_capital
+            + self.integration_cost
+        )
+        if self.senior_debt + self.property_debt + self.seller_note > uses:
+            counted = (
+                "real_estate_price",
+                "fees",
+                "working_capital",
+                "integration_cost",
+                "senior_debt",
+                "property_debt",
+                "seller_note",
+            )
             raise ValueError(
                 self._refusal(
                     "Debt funding exceeds transaction uses.",
@@ -276,11 +305,26 @@ class DealInputs(Model):
         unused = set()
         if not self.senior_debt:
             unused |= {"debt_rate", "debt_years"}
+        if not self.property_debt:
+            unused |= {"property_rate", "property_years"}
         if not self.seller_note:
-            unused |= {"seller_rate", "seller_years"}
+            unused |= {"seller_rate", "seller_years", "seller_schedule"}
         return [
             name for name in DEAL_EXAMPLE_FIGURES if name not in self.model_fields_set and name not in unused
         ]
+
+    def request(self) -> dict:
+        """The request an idempotency key guards: every input, plus the assumed list when it is not empty.
+
+        A field added in acquisition 1.1.0 that the caller did not give is left out of both, so a request
+        that gives none of them has the fingerprint it had before they existed and an earlier key still
+        replays. Left out, each always takes the same example value, so nothing that decides the figures is
+        lost; given, even at its example value, it is part of the request.
+        """
+        new = {name for name in DEAL_FIELDS_ADDED_IN_1_1 if name not in self.model_fields_set}
+        inputs = {k: v for k, v in self.model_dump(mode="json").items() if k not in new}
+        assumed = [name for name in self.assumed_inputs() if name not in new]
+        return {**inputs, "assumed_inputs": assumed} if assumed else inputs
 
 
 def _listed(items: list[str]) -> str:
@@ -296,7 +340,20 @@ DEAL_REFUSAL_NAMES = {
     "integration_cost": ("the integration costs", "the integration costs", True),
     "senior_debt": ("the senior debt", "the senior debt", False),
     "seller_note": ("the seller note", "the seller note", False),
+    "real_estate_price": ("the real estate price", "the real estate price", False),
+    "property_debt": ("the property loan", "the property loan", False),
 }
+
+# The inputs acquisition 1.1.0 added. DealInputs.request leaves each out when it was not given.
+DEAL_FIELDS_ADDED_IN_1_1 = (
+    "real_estate_price",
+    "property_debt",
+    "property_rate",
+    "property_years",
+    "seller_schedule",
+    "investor_equity",
+    "annual_rent",
+)
 
 
 # The figures of DealInputs that have an example value, in field order.

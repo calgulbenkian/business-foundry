@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from uuid import uuid4
 
@@ -34,8 +35,8 @@ from foundry.models import DealInputs
 from foundry.service import Service
 from foundry.store import Store
 
-# Every figure, each different from its example value.
-FULL = {
+# Every figure main (391b9fb) had, each different from its example value.
+MAIN_FULL = {
     "target": "Synthetic full target",
     "thesis": "A synthetic deal that gives every input.",
     "annual_revenue": "1234567.89",
@@ -64,8 +65,22 @@ FULL = {
     "debt_assumed": "10000",
     "evidence_ids": [],
 }
-# The same deal with no evidence to look up, for requests that go through the service.
-SENT = {**FULL, "adjustments": [{"label": "Unreviewed", "amount": "5000", "evidence_id": None}]}
+# The inputs acquisition 1.1.0 added, each different from its example value.
+STRUCTURE = {
+    "real_estate_price": "250000",
+    "property_debt": "200000",
+    "property_rate": "0.07",
+    "property_years": 20,
+    "seller_schedule": "interest_only",
+    "investor_equity": "50000",
+    "annual_rent": "12000",
+}
+# Every figure, each different from its example value.
+FULL = {**MAIN_FULL, **STRUCTURE}
+# The same deals with no evidence to look up, for requests that go through the service.
+UNREVIEWED = [{"label": "Unreviewed", "amount": "5000", "evidence_id": None}]
+SENT = {**FULL, "adjustments": UNREVIEWED}
+MAIN_SENT = {**MAIN_FULL, "adjustments": UNREVIEWED}
 MINIMAL = {
     "target": "Synthetic minimal target",
     "thesis": "A synthetic deal that gives only the required figures.",
@@ -74,16 +89,21 @@ MINIMAL = {
     "purchase_price": "700000",
 }
 # Every figure with an example value that the model used, in the field order of DealInputs. With no loan
-# given, both loans are zero, so their rates and terms are not used and not listed.
+# given, every loan is zero, so their rates and terms, and the seller note's schedule, are not used and
+# not listed.
 MINIMAL_ASSUMED = [
     "replacement_management",
     "multiple_low",
     "multiple_high",
+    "real_estate_price",
     "fees",
     "working_capital",
     "integration_cost",
     "senior_debt",
+    "property_debt",
     "seller_note",
+    "investor_equity",
+    "annual_rent",
     "annual_capex",
     "annual_working_capital_growth",
     "tax_rate",
@@ -92,9 +112,10 @@ MINIMAL_ASSUMED = [
 ]
 MINIMAL_SENTENCE = (
     "Not given, so the model's example value was used: Annual replacement management cost 0.00; "
-    "Low EBITDA multiple 3.00x; High EBITDA multiple 5.00x; Transaction fees 30,000.00; "
-    "Working capital funding 50,000.00; Integration costs 0.00; New senior debt 0.00; "
-    "Seller financing 0.00; Annual maintenance capex 15,000.00; "
+    "Low EBITDA multiple 3.00x; High EBITDA multiple 5.00x; Real estate price 0.00; "
+    "Transaction fees 30,000.00; Working capital funding 50,000.00; Integration costs 0.00; "
+    "New senior debt 0.00; Property loan 0.00; Seller financing 0.00; Investor equity 0.00; "
+    "Annual rent 0.00; Annual maintenance capex 15,000.00; "
     "Annual working capital increase 0.00; Assumed tax rate 25.00%; Cash in valuation equity bridge 0.00; "
     "Debt in valuation equity bridge 0.00."
 )
@@ -305,9 +326,13 @@ def test_a_figure_sent_with_its_example_value_is_the_callers_own(client, setup):
         "replacement_management",
         "multiple_low",
         "multiple_high",
+        "real_estate_price",
         "working_capital",
         "integration_cost",
         "senior_debt",
+        "property_debt",
+        "investor_equity",
+        "annual_rent",
         "annual_capex",
         "annual_working_capital_growth",
         "cash_acquired",
@@ -357,8 +382,32 @@ def test_the_memo_lists_the_assumed_inputs_with_their_values(client, setup):
 # 3. Deals stored before this change still load.
 
 
+def main_dump(body):
+    """DealInputs dumped as main dumped it: every input main had, with its defaults filled in."""
+    dump = DealInputs(**body).model_dump(mode="json")
+    return {k: v for k, v in dump.items() if k not in models.DEAL_FIELDS_ADDED_IN_1_1}
+
+
+def as_main(result):
+    """An analysis as acquisition 1.0.1 stored it: the figures it had, under its version.
+
+    test_figures_for_a_fixed_full_payload_are_unchanged_from_main shows that each figure 1.0.1 had is
+    unchanged in 1.1.0, so dropping the figures 1.1.0 added and its limitations gives 1.0.1's analysis.
+    """
+    result = {k: v for k, v in result.items() if k not in ADDED_FIGURES}
+    result["sources_and_uses"] = {
+        k: v for k, v in result["sources_and_uses"].items() if k not in ADDED_SOURCES_AND_USES
+    }
+    result["scenarios"] = {
+        name: {k: v for k, v in case.items() if k != "amortizing_coverage_ratio"}
+        for name, case in result["scenarios"].items()
+    }
+    return {**result, "model_version": "1.0.1", "limitations": MAIN_LIMITATIONS}
+
+
 def save_deal_as_before(service, actor, bid, key, payload):
-    """save_deal as it was before assumed_inputs existed (e2317d3): the payload was the full dump."""
+    """save_deal as it was before assumed_inputs existed (e2317d3): the payload was the full dump, and the
+    analysis was acquisition 1.0.1's."""
 
     def run(con):
         ids = payload["evidence_ids"] + [
@@ -366,7 +415,7 @@ def save_deal_as_before(service, actor, bid, key, payload):
         ]
         evidence = service.references(con, bid, ids, "evidence")
         reviewed = {e["id"] for e in evidence if e["state"] == "verified"}
-        result = finance.acquisition(DealInputs.model_validate(payload), reviewed)
+        result = as_main(finance.acquisition(DealInputs.model_validate(payload), reviewed))
         data = {
             "inputs": payload,
             "analysis": result,
@@ -382,7 +431,7 @@ def save_deal_as_before(service, actor, bid, key, payload):
 
 def test_a_deal_stored_without_the_list_loads_and_says_not_recorded(client, setup):
     store, service, actor, bid, _ = setup
-    old = save_deal_as_before(service, actor, bid, str(uuid4()), DealInputs(**SENT).model_dump(mode="json"))
+    old = save_deal_as_before(service, actor, bid, str(uuid4()), main_dump(MAIN_SENT))
     old_fields = {"inputs", "analysis", "evidence_ids", "evidence_versions"}
 
     snapshot = client.get(f"/api/businesses/{bid}").json()
@@ -412,7 +461,7 @@ def test_a_deal_stored_without_the_list_loads_and_says_not_recorded(client, setu
 
 def test_the_memo_renders_an_old_deal_from_a_snapshot(setup):
     _, service, actor, bid, _ = setup
-    old = save_deal_as_before(service, actor, bid, str(uuid4()), DealInputs(**SENT).model_dump(mode="json"))
+    old = save_deal_as_before(service, actor, bid, str(uuid4()), main_dump(MAIN_SENT))
     snapshot = service.snapshot(actor, bid)
     deal = next(o for o in snapshot["objects"] if o["id"] == old["id"])
     _, content = render_document("investment_memo", snapshot, deal)
@@ -420,16 +469,53 @@ def test_the_memo_renders_an_old_deal_from_a_snapshot(setup):
 
 
 # 7. The arithmetic is unchanged: figures computed on main (e2317d3) for a fixed full payload and the demo.
+# Acquisition 1.1.0 adds figures; every figure 1.0.1 had is the same for a request that gives none of the
+# inputs 1.1.0 added.
+
+# The figures acquisition 1.1.0 added, at the top level and in sources and uses.
+ADDED_FIGURES = ("debt_service_year", "amortizing_annual_debt_service", "seller_note_schedule")
+ADDED_SOURCES_AND_USES = (
+    "real_estate_price",
+    "property_debt",
+    "investor_equity",
+    "buyer_cash_at_closing",
+    "funding_beyond_uses",
+)
+# Acquisition 1.0.1's limitations, copied from src/foundry/finance.py at 391b9fb.
+MAIN_LIMITATIONS = [
+    "Multiples are user assumptions, not licensed transaction comparables.",
+    "Purchase price is the negotiated cash-equivalent consideration; existing claims must be explicitly included in transaction uses.",
+    "Debt service is level monthly amortization, annualized. Tax uses an approximate first-year interest estimate and excludes depreciation.",
+    "Downside subtracts 10% of revenue from EBITDA with no cost relief. Upside adds 5% of revenue; synergies are excluded.",
+    "Evidence review records a human attestation; it is not an audit or a quality-of-earnings opinion.",
+]
 
 
 def figures(analysis):
     return {k: v for k, v in analysis.items() if k not in {"inputs", "limitations"}}
 
 
+def main_figures(analysis):
+    """The figures acquisition 1.0.1 had, from a 1.1.0 analysis, with its model version."""
+    shaped = as_main(analysis)
+    return {**figures(shaped), "model_version": analysis["model_version"]}
+
+
+def added_figures(analysis):
+    """The figures acquisition 1.1.0 added."""
+    return {
+        **{k: analysis[k] for k in ADDED_FIGURES},
+        "sources_and_uses": {k: analysis["sources_and_uses"][k] for k in ADDED_SOURCES_AND_USES},
+        "amortizing_coverage_ratio": {
+            name: case["amortizing_coverage_ratio"] for name, case in analysis["scenarios"].items()
+        },
+    }
+
+
 def test_figures_for_a_fixed_full_payload_are_unchanged_from_main():
-    result = acquisition(DealInputs(**FULL), {"ev1"})
-    assert figures(result) == {
-        "model_version": "1.0.1",
+    result = acquisition(DealInputs(**MAIN_FULL), {"ev1"})
+    assert main_figures(result) == {
+        "model_version": "1.1.0",
         "normalized_ebitda": "201912.79",
         "accepted_adjustments": [{"label": "Reviewed", "amount": "12345.67", "evidence_id": "ev1"}],
         "excluded_adjustments": [
@@ -477,17 +563,43 @@ def test_figures_for_a_fixed_full_payload_are_unchanged_from_main():
             },
         },
     }
+    # The seller note of 100,000 at 5% over 4 years amortizes: monthly rate m = 0.05 / 12 over 48 months,
+    # payment = 100,000 × m / (1 − (1 + m)^−48) = 2,302.929… a month, × 12 = 27,635.15 a year, written
+    # out in rationals here rather than taken from the model.
+    m = Fraction(5, 1200)
+    seller_payment = 100000 * m / (1 - (1 + m) ** -48) * 12
+    assert f"{float(seller_payment):.2f}" == "27635.15"
+    assert added_figures(result) == {
+        "debt_service_year": 1,
+        # The seller note amortizes, so the lender's view is the same debt service and coverage.
+        "amortizing_annual_debt_service": "102304.37",
+        "seller_note_schedule": {
+            "schedule": "amortizing",
+            "years": 4,
+            "payments": [{"year": y, "payment": "27635.15"} for y in (1, 2, 3, 4)],
+            "balloon": None,
+        },
+        # No building, no property loan, no investors: the buyer's cash is the equity required.
+        "sources_and_uses": {
+            "real_estate_price": "0.00",
+            "property_debt": "0.00",
+            "investor_equity": "0.00",
+            "buyer_cash_at_closing": "330000.50",
+            "funding_beyond_uses": "0.00",
+        },
+        "amortizing_coverage_ratio": {"base": "1.4839", "downside": "0.5306", "upside": "1.9606"},
+    }
 
 
 def test_the_demo_deal_has_the_same_figures_as_on_main(setup):
     _, service, actor, _, _ = setup
     business = seed(service, actor)
     deal = next(o for o in service.snapshot(actor, business["id"])["objects"] if o["kind"] == "deal")
-    analysis = figures(deal["data"]["analysis"])
+    analysis = main_figures(deal["data"]["analysis"])
     for item in analysis["accepted_adjustments"]:
         item["evidence_id"] = "reviewed"
     assert analysis == {
-        "model_version": "1.0.1",
+        "model_version": "1.1.0",
         "normalized_ebitda": "150000.00",
         "accepted_adjustments": [
             {"label": "Illustrative one-time expense", "amount": "10000", "evidence_id": "reviewed"}
@@ -537,8 +649,15 @@ def test_the_demo_deal_has_the_same_figures_as_on_main(setup):
             },
         },
     }
-    # The demo gives every figure, with the values it used on main, so it lists none as assumed.
-    assert deal["data"]["assumed_inputs"] == []
+    # The demo gives every figure main had, with the values it used on main, so it lists none of them as
+    # assumed. It gives none of the inputs 1.1.0 added, so its request, and its idempotency fingerprint,
+    # are main's; the ones the model used are listed.
+    assert deal["data"]["assumed_inputs"] == [
+        "real_estate_price",
+        "property_debt",
+        "investor_equity",
+        "annual_rent",
+    ]
 
 
 # 8. Financing is the buyer's choice: a deal given no loan is screened as bought without debt.
@@ -582,6 +701,7 @@ def test_a_small_deal_with_no_financing_given_is_accepted_without_debt(client, s
             "cash_after_debt_service": "120000.00",
             "coverage_ratio": None,
             "cash_shortfall": False,
+            "amortizing_coverage_ratio": None,
         },
         "downside": {
             "ebitda": "90000.00",
@@ -589,6 +709,7 @@ def test_a_small_deal_with_no_financing_given_is_accepted_without_debt(client, s
             "cash_after_debt_service": "52500.00",
             "coverage_ratio": None,
             "cash_shortfall": False,
+            "amortizing_coverage_ratio": None,
         },
         "upside": {
             "ebitda": "225000.00",
@@ -596,11 +717,12 @@ def test_a_small_deal_with_no_financing_given_is_accepted_without_debt(client, s
             "cash_after_debt_service": "153750.00",
             "coverage_ratio": None,
             "cash_shortfall": False,
+            "amortizing_coverage_ratio": None,
         },
     }
     content = memo(client, bid, deal["id"])
     assert debt_line(content) == NO_DEBT
-    assert "Annual debt service:" not in content
+    assert "Annual debt service:" not in content and "Debt service due in year 1" not in content
     base = next(line for line in content.splitlines() if line.startswith("| Base "))
     assert [cell.strip() for cell in base.strip("|").split("|")] == [
         "Base",
@@ -615,8 +737,11 @@ def test_a_small_deal_with_no_financing_given_is_accepted_without_debt(client, s
 
 def test_a_deal_with_a_loan_keeps_its_annual_debt_service_line(client, setup):
     _, _, _, bid, _ = setup
-    deal = post(client, bid, SENT).json()
-    assert debt_line(memo(client, bid, deal["id"])) == "Annual debt service: 102,304.37 USD."
+    deal = post(client, bid, MAIN_SENT).json()
+    # From acquisition 1.1.0 the line names the year it screens; the amount is main's.
+    assert debt_line(memo(client, bid, deal["id"])) == (
+        "Debt service due in year 1, the year screened: 102,304.37 USD."
+    )
 
 
 def test_a_given_loan_lists_its_rate_and_term_when_they_are_not_given(client, setup):
@@ -636,14 +761,24 @@ def test_a_given_loan_lists_its_rate_and_term_when_they_are_not_given(client, se
     rate_only = post(client, bid, {**MINIMAL, "senior_debt": "300000", "debt_rate": "0.08"}).json()
     assert [x for x in rate_only["data"]["assumed_inputs"] if x in LOAN_TERMS] == ["debt_years"]
     content = memo(client, bid, senior["id"])
-    assert debt_line(content).startswith("Annual debt service: ")
+    assert debt_line(content).startswith("Debt service due in year 1, the year screened: ")
     assert "Senior annual interest rate 9.00%; Senior term 7 years" in inputs_section(content)
 
 
 def test_a_rate_and_term_without_their_loan_change_no_figure():
     plain = acquisition(DealInputs(**MINIMAL), set())
     odd = acquisition(
-        DealInputs(**MINIMAL, debt_rate="0.5", debt_years=1, seller_rate="0.4", seller_years=2), set()
+        DealInputs(
+            **MINIMAL,
+            debt_rate="0.5",
+            debt_years=1,
+            property_rate="0.3",
+            property_years=3,
+            seller_rate="0.4",
+            seller_years=2,
+            seller_schedule="deferred",
+        ),
+        set(),
     )
     assert figures(odd) == figures(plain)
     assert odd["annual_debt_service"] == "0.00"
@@ -906,10 +1041,12 @@ def test_the_web_forms_earlier_example_values_are_mains():
     pairs = re.findall(r"^\s+(\w+): '([^']*)',$", js_constant("DEAL_EXAMPLES_BEFORE_LIST"), re.M)
     assert dict(pairs) == MAIN_EXAMPLES and len(pairs) == len(MAIN_EXAMPLES)
     # Today's model differs from main only where this change made it differ: the three required figures
-    # have no example, and the example senior debt is zero.
+    # have no example, and the example senior debt is zero. The inputs acquisition 1.1.0 added are new.
     fields = DealInputs.model_fields
     assert list(MAIN_EXAMPLES) == [
-        n for n in fields if n not in {"target", "thesis", "adjustments", "evidence_ids"}
+        n
+        for n in fields
+        if n not in {"target", "thesis", "adjustments", "evidence_ids", *models.DEAL_FIELDS_ADDED_IN_1_1}
     ]
     changed = {}
     for name, value in MAIN_EXAMPLES.items():
@@ -949,10 +1086,15 @@ def test_the_web_forms_earlier_example_values_match_main_at_e2317d3():
 
 def test_the_web_forms_examples_are_todays_model():
     # dealFields' third column is today's example value; for the three required figures it is only the
-    # placeholder, main's example.
-    rows = re.findall(r"^\s+\['(\w+)', '[^']*', ([\d.]+), \w+\],$", js_constant("dealFields"), re.M)
-    assert [name for name, _ in rows] == list(MAIN_EXAMPLES)
+    # placeholder, main's example. The seller note schedule's example is a word, not a number.
+    rows = re.findall(r"^\s+\['(\w+)', '[^']*', ([\d.]+|'\w+'), \w+\],$", js_constant("dealFields"), re.M)
+    assert [name for name, _ in rows] == [
+        n for n in DealInputs.model_fields if n not in {"target", "thesis", "adjustments", "evidence_ids"}
+    ]
     for name, example in rows:
         field = DealInputs.model_fields[name]
         expected = MAIN_EXAMPLES[name] if field.is_required() else field.default
-        assert Decimal(example) == Decimal(str(expected)), name
+        if example.startswith("'"):
+            assert example.strip("'") == expected, name
+        else:
+            assert Decimal(example) == Decimal(str(expected)), name

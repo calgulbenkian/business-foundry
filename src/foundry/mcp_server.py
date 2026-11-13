@@ -154,7 +154,7 @@ def build_server():
 
     @server.tool()
     def analyze_acquisition(business_id: str, command_key: str, inputs: dict) -> dict:
-        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work. target, thesis, annual_revenue, reported_ebitda and purchase_price are required: use only figures the human gave you, and never invent them. A request without one is refused and nothing is saved. Every other figure you leave out takes the model's example value, and the result lists it in data.assumed_inputs. Tell the human which inputs were assumed. The example senior debt and seller note are zero, so financing you leave out is no loan, and a loan's rate and term are used and listed only when the loan is given. A refusal caused by an example value names that figure and its value; ask the human for it rather than choosing one."""
+        """Screen a target using explicit earnings, evidence, valuation multiples and financing assumptions. Send every amount and rate as a decimal string with at most 12 decimal places. Creates diligence work. target, thesis, annual_revenue, reported_ebitda and purchase_price are required: use only figures the human gave you, and never invent them. A request without one is refused and nothing is saved. Every other figure you leave out takes the model's example value, and the result lists it in data.assumed_inputs. Tell the human which inputs were assumed. The example senior debt, property_debt, seller note and investor_equity are zero, so financing you leave out is no loan and no investor, and a loan's rate and term (and the seller note's seller_schedule) are used and listed only when the loan is given. purchase_price is the business only: a building sold with it goes in real_estate_price, which the multiples do not value, and its own loan in property_debt, property_rate and property_years. annual_rent is rent the business will pay that reported EBITDA does not already bear; it is deducted from normalized EBITDA. seller_schedule is amortizing, interest_only (interest each year, principal at the end) or deferred (nothing until the end, interest compounding yearly); coverage uses what is due in year 1, and amortizing_coverage_ratio shows the coverage if the seller note amortized. investor_equity is cash from investors at closing; buyer_cash_at_closing is uses less all debt and investor equity. Foundry applies no SBA or bank rule. A refusal caused by an example value names that figure and its value; ask the human for it rather than choosing one."""
         return request("POST", path(business_id) + "/deals", inputs, command_key)
 
     @server.tool()
@@ -218,11 +218,17 @@ def build_server():
             "2. The three required figures: annual revenue, reported EBITDA and the negotiated purchase "
             "price. Then the cost of replacement management.\n"
             "3. Earnings adjustments, each backed by source evidence (add_evidence).\n"
-            "4. Valuation multiples, other purchase uses, and any debt or seller financing "
-            "(analyze_acquisition).\n"
+            "4. Whether the building is sold with the business: if so, its price separately "
+            "(real estate is not valued by the multiples) and any property loan; if not, any rent the "
+            "business will pay that reported EBITDA does not already bear.\n"
+            "5. Valuation multiples, other purchase uses, and any debt or seller financing, with the "
+            "seller note's schedule: amortizing, interest only or deferred to the end of its term. Then "
+            "any investor equity (analyze_acquisition).\n"
             "Revenue, EBITDA and the purchase price must come from the human: never invent, estimate or "
             "fill in any of the three. If one is unknown, ask for it and do not run the analysis. "
-            "A loan left out is no loan: the deal is then screened without debt. "
+            "A loan left out is no loan: the deal is then screened without debt. Do not apply SBA or "
+            "lender rules as if they were settled; name them only as something the human must check "
+            "with the lender. "
             "Multiples are the human's assumptions; do not present them as market comparables.\n\n" + rules
         )
 
