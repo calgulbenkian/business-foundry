@@ -4406,6 +4406,7 @@ print(json.dumps({
       }));
     const writerRoles = {
       reviewer: {
+        a: 'a reviewer',
         label: 'Reviewer',
         certainty: ['assumption', 'reported', 'verified'],
         moves: ['Approve…', 'Start work…', 'Reopen for review…', 'Not applicable…'],
@@ -4413,6 +4414,7 @@ print(json.dumps({
         other: 'operator',
       },
       operator: {
+        a: 'an operator',
         label: 'Operator',
         certainty: ['assumption', 'reported'],
         moves: ['Start work…', 'Reopen for review…'],
@@ -4421,157 +4423,206 @@ print(json.dumps({
       },
     };
     for (const [role, expected] of Object.entries(writerRoles))
-      lateCase(`round 11: a ${role} may write, and has none of an owner’s controls`, async () => {
-        const me = await writerKey(role);
-        // another key, one that an owner could revoke, for the revoke-key action sent below
-        const other = await writerKey(expected.other);
-        const prepared = (await snapshotOf(bid)).objects.find(
-          (o) => o.kind === 'task' && o.state === 'prepared' && !o.data.deal_id,
-        );
-        assert(prepared, 'the test business has a prepared step');
-        const writer = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
-        try {
-          const p = await newPage(writer);
-          p.on('pageerror', (e) => errors.push(e.message));
-          // every request this page makes about access keys, whatever its method
-          const keyRequests = [];
-          p.on('request', (r) => {
-            const path = new URL(r.url()).pathname;
-            if (path === '/api/principals' || path.startsWith('/api/principals/'))
-              keyRequests.push(`${r.method()} ${path}`);
-          });
-          await p.goto(origin);
-          await signInAs(p, me.token);
-          await quiet(p);
-          assert.equal(await p.evaluate(() => state.actor?.role), role, `the ${role} is named`);
-          assert.equal(await p.locator('#business-select').inputValue(), bid);
-          // the toolbar and the foot of the sources name them and their role, with no + New business
-          assert.equal(
-            await p.locator('#actor-name').innerText(),
-            `${me.name} · ${expected.label}`,
+      lateCase(
+        `round 11: ${expected.a} may write, and has none of an owner’s controls`,
+        async () => {
+          const me = await writerKey(role);
+          // another key, one that an owner could revoke, for the revoke-key action sent below
+          const other = await writerKey(expected.other);
+          const prepared = (await snapshotOf(bid)).objects.find(
+            (o) => o.kind === 'task' && o.state === 'prepared' && !o.data.deal_id,
           );
-          assert.equal(
-            await p.locator('#src-foot .account p').innerText(),
-            `Signed in as ${me.name} · ${expected.label}`,
-          );
-          assert.equal(
-            await p.locator('[data-action="new-business"]:visible').count(),
-            0,
-            'no + New business anywhere on the page',
-          );
-          // the toolbar's control, clicked from the page, opens no form
-          await clickFromPage(p, NEW_BUSINESS);
-          await quiet(p);
-          assert.deepEqual(await dialogIn(p), noDialog, 'a click on + New business opens no form');
-          // Access & assistants: no + Create access key, no key list, no owner's section
-          await p.locator('#src-nav .src[data-src="access"]').click();
-          await p.locator('#list .row[data-key="ai:overview"]').waitFor();
-          await quiet(p);
-          assert.deepEqual(
-            await p.locator('#list-right button').allInnerTexts(),
-            [],
-            'no + Create access key',
-          );
-          assert.deepEqual(await p.locator('#list .grp').allInnerTexts(), [], 'no Access keys');
-          assert.deepEqual(
-            await p.locator('#list .row').evaluateAll((rows) => rows.map((r) => r.dataset.key)),
-            ['ai:overview'],
-            'the one row is Assistants and sharing',
-          );
-          await p.locator('#list .row[data-key="ai:overview"]').click();
-          await p.locator('#insp-title', { hasText: 'Assistants and sharing' }).waitFor();
-          await quiet(p);
-          assert.deepEqual(
-            await p.locator('#insp .i-sec h3').allInnerTexts(),
-            ['Optional assistant review', 'Your business records'],
-            'no People and access keys',
-          );
-          assert.equal(await p.locator('[data-action="revoke-key"]').count(), 0, 'no Revoke');
-          // an owner's forms, reached by actions sent from the page, open nothing
-          for (const [action, id] of [
-            ['new-business', ''],
-            ['new-key', ''],
-            ['revoke-key', other.id],
-          ]) {
-            await actionFromPage(p, action, id);
+          assert(prepared, 'the test business has a prepared step');
+          const writer = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
+          try {
+            const p = await newPage(writer);
+            p.on('pageerror', (e) => errors.push(e.message));
+            // every request this page makes about access keys, whatever its method
+            const keyRequests = [];
+            p.on('request', (r) => {
+              const path = new URL(r.url()).pathname;
+              if (path === '/api/principals' || path.startsWith('/api/principals/'))
+                keyRequests.push(`${r.method()} ${path}`);
+            });
+            await p.goto(origin);
+            await signInAs(p, me.token);
             await quiet(p);
-            assert.deepEqual(await dialogIn(p), noDialog, `${action}: no form for the ${role}`);
-          }
-          // a record form they may use, with the evidence statuses of their role
-          await p.locator('#src-nav .src[data-src="records"]').click();
-          await p
-            .locator('#list-right')
-            .getByRole('button', { name: '+ Add record', exact: true })
-            .click();
-          await p.locator('#dialog-title', { hasText: 'Add business record' }).waitFor();
-          assert.deepEqual(await dialogIn(p), { open: true, title: 'Add business record' });
-          assert.deepEqual(
+            assert.equal(await p.evaluate(() => state.actor?.role), role, `the ${role} is named`);
+            assert.equal(
+              await p.locator('#business-select').inputValue(),
+              bid,
+              'the test business is open',
+            );
+            // the toolbar and the foot of the sources name them and their role, with no + New business
+            assert.equal(
+              await p.locator('#actor-name').innerText(),
+              `${me.name} · ${expected.label}`,
+              'the toolbar names them',
+            );
+            assert.equal(
+              await p.locator('#src-foot .account p').innerText(),
+              `Signed in as ${me.name} · ${expected.label}`,
+              'the account block names them',
+            );
+            assert.equal(
+              await p.locator('[data-action="new-business"]:visible').count(),
+              0,
+              'no + New business anywhere on the page',
+            );
+            // the account block at the foot of the sources is shown on a phone only; its
+            // controls are checked there, and in the markup at every width
+            assert.deepEqual(
+              await p.locator('#src-foot .account button').allInnerTexts(),
+              ['Sign out'],
+              'the account block offers Sign out only',
+            );
+            await p.setViewportSize({ width: 390, height: 844 });
+            await p.locator('#back-src').click();
+            await p.locator('#src-foot .account').waitFor();
+            await quiet(p);
+            assert.equal(
+              await p.locator('#src-foot .account p').innerText(),
+              `Signed in as ${me.name} · ${expected.label}`,
+              'on a phone, the account block names them',
+            );
+            assert.deepEqual(
+              await p.locator('#src-foot .account button:visible').allInnerTexts(),
+              ['Sign out'],
+              'on a phone, the account block shows Sign out only',
+            );
+            assert.equal(
+              await p.locator('[data-action="new-business"]:visible').count(),
+              0,
+              'no + New business anywhere on a phone',
+            );
+            await p.setViewportSize({ width: 1440, height: 1050 });
+            // the toolbar's control, clicked from the page, opens no form
+            await clickFromPage(p, NEW_BUSINESS);
+            await quiet(p);
+            assert.deepEqual(
+              await dialogIn(p),
+              noDialog,
+              'a click on + New business opens no form',
+            );
+            // Access & assistants: no + Create access key, no key list, no owner's section
+            await p.locator('#src-nav .src[data-src="access"]').click();
+            await p.locator('#list .row[data-key="ai:overview"]').waitFor();
+            await quiet(p);
+            assert.deepEqual(
+              await p.locator('#list-right button').allInnerTexts(),
+              [],
+              'no + Create access key',
+            );
+            assert.deepEqual(await p.locator('#list .grp').allInnerTexts(), [], 'no Access keys');
+            assert.deepEqual(
+              await p.locator('#list .row').evaluateAll((rows) => rows.map((r) => r.dataset.key)),
+              ['ai:overview'],
+              'the one row is Assistants and sharing',
+            );
+            await p.locator('#list .row[data-key="ai:overview"]').click();
+            await p.locator('#insp-title', { hasText: 'Assistants and sharing' }).waitFor();
+            await quiet(p);
+            assert.deepEqual(
+              await p.locator('#insp .i-sec h3').allInnerTexts(),
+              ['Optional assistant review', 'Your business records'],
+              'no People and access keys',
+            );
+            assert.equal(await p.locator('[data-action="revoke-key"]').count(), 0, 'no Revoke');
+            // an owner's forms, reached by actions sent from the page, open nothing
+            for (const [action, id] of [
+              ['new-business', ''],
+              ['new-key', ''],
+              ['revoke-key', other.id],
+            ]) {
+              await actionFromPage(p, action, id);
+              await quiet(p);
+              assert.deepEqual(await dialogIn(p), noDialog, `${action}: no form for the ${role}`);
+            }
+            // a record form they may use, with the evidence statuses of their role
+            await p.locator('#src-nav .src[data-src="records"]').click();
             await p
-              .locator('#dialog select[name="certainty"] option')
-              .evaluateAll((os) => os.map((o) => o.value)),
-            expected.certainty,
-            'the evidence statuses of the role',
-          );
-          await p.getByRole('button', { name: 'Close dialog', exact: true }).click();
-          assert.equal((await dialogIn(p)).open, false, 'the record form closes');
-          // a decision on a prepared step that their role may make, and only those
-          const category = String(prepared.data.category);
-          await p
-            .locator('#src-nav .src .lbl', {
-              hasText: new RegExp(`^${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`),
-            })
-            .click();
-          await p.locator(`#list .row[data-key="step:${prepared.id}"]`).click();
-          await p.locator('#insp-title', { hasText: prepared.title }).waitFor();
-          await quiet(p);
-          assert.deepEqual(
-            await p.locator('#insp [data-action="tx"]').allInnerTexts(),
-            expected.moves,
-            'the moves of the role',
-          );
-          await p.locator(`#insp [data-action="tx"][data-to="${expected.move}"]`).click();
-          await p.locator('#tx-form').waitFor();
-          assert.equal(
-            await p.locator('#tx-form [type=submit]').innerText(),
-            'Record decision',
-            'the decision form opens',
-          );
-          await p.locator('#tx-form').getByRole('button', { name: 'Not yet', exact: true }).click();
-          await quiet(p);
-          assert.equal(await p.locator('#tx-form').count(), 0, 'and closes unsent');
-          // a key the test serves as covering no business: the start page offers no business form
-          await p.route(
-            (u) => u.pathname === '/api/businesses',
-            (r) => (r.request().method() === 'GET' ? r.fulfill({ json: [] }) : r.continue()),
-          );
-          await p.reload();
-          await p.locator('#insp-title', { hasText: 'Start your first business' }).waitFor();
-          await quiet(p);
-          assert.equal(
-            await p.locator('#actor-name').innerText(),
-            `${me.name} · ${expected.label}`,
-          );
-          assert.equal(
-            await p.locator('#insp .prose').first().innerText(),
-            'This access key does not cover any business yet. Ask the workspace owner to give it access to one.',
-          );
-          assert.deepEqual(
-            await p.locator('#insp button').allInnerTexts(),
-            [],
-            'no Create a business',
-          );
-          assert.equal(
-            await p.locator('[data-action="new-business"]:visible').count(),
-            0,
-            'no + New business anywhere on the start page',
-          );
-          await p.unroute((u) => u.pathname === '/api/businesses');
-          // the page never asked about access keys, in either load
-          assert.deepEqual(keyRequests, [], 'no request about access keys');
-        } finally {
-          await writer.close();
-        }
-      });
+              .locator('#list-right')
+              .getByRole('button', { name: '+ Add record', exact: true })
+              .click();
+            await p.locator('#dialog-title', { hasText: 'Add business record' }).waitFor();
+            assert.deepEqual(
+              await dialogIn(p),
+              { open: true, title: 'Add business record' },
+              'the record form opens',
+            );
+            assert.deepEqual(
+              await p
+                .locator('#dialog select[name="certainty"] option')
+                .evaluateAll((os) => os.map((o) => o.value)),
+              expected.certainty,
+              'the evidence statuses of the role',
+            );
+            await p.getByRole('button', { name: 'Close dialog', exact: true }).click();
+            assert.equal((await dialogIn(p)).open, false, 'the record form closes');
+            // a decision on a prepared step that their role may make, and only those
+            const category = String(prepared.data.category);
+            await p
+              .locator('#src-nav .src .lbl', {
+                hasText: new RegExp(`^${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`),
+              })
+              .click();
+            await p.locator(`#list .row[data-key="step:${prepared.id}"]`).click();
+            await p.locator('#insp-title', { hasText: prepared.title }).waitFor();
+            await quiet(p);
+            assert.deepEqual(
+              await p.locator('#insp [data-action="tx"]').allInnerTexts(),
+              expected.moves,
+              'the moves of the role',
+            );
+            await p.locator(`#insp [data-action="tx"][data-to="${expected.move}"]`).click();
+            await p.locator('#tx-form').waitFor();
+            assert.equal(
+              await p.locator('#tx-form [type=submit]').innerText(),
+              'Record decision',
+              'the decision form opens',
+            );
+            await p
+              .locator('#tx-form')
+              .getByRole('button', { name: 'Not yet', exact: true })
+              .click();
+            await quiet(p);
+            assert.equal(await p.locator('#tx-form').count(), 0, 'and closes unsent');
+            // a key the test serves as covering no business: the start page offers no business form
+            const businessList = (u) => u.pathname === '/api/businesses';
+            await p.route(businessList, (r) =>
+              r.request().method() === 'GET' ? r.fulfill({ json: [] }) : r.continue(),
+            );
+            await p.reload();
+            await p.locator('#insp-title', { hasText: 'Start your first business' }).waitFor();
+            await quiet(p);
+            assert.equal(
+              await p.locator('#actor-name').innerText(),
+              `${me.name} · ${expected.label}`,
+              'the start page names them',
+            );
+            assert.equal(
+              await p.locator('#insp .prose').first().innerText(),
+              'This access key does not cover any business yet. Ask the workspace owner to give it access to one.',
+              'the start page says what to ask the owner',
+            );
+            assert.deepEqual(
+              await p.locator('#insp button').allInnerTexts(),
+              [],
+              'no Create a business',
+            );
+            assert.equal(
+              await p.locator('[data-action="new-business"]:visible').count(),
+              0,
+              'no + New business anywhere on the start page',
+            );
+            await p.unroute(businessList);
+            // the page never asked about access keys, in either load
+            assert.deepEqual(keyRequests, [], 'no request about access keys');
+          } finally {
+            await writer.close();
+          }
+        },
+      );
     // Round 9, H. A step's history served with entries that are not objects among real ones: its
     // view opens and lists the real entries only.
     lateCase('round 9 H: a history holding entries that are not objects', async () => {
