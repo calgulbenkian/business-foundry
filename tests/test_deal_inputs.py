@@ -26,6 +26,7 @@ from foundry.demo import seed
 from foundry.documents import render_document
 from foundry.finance import acquisition
 from foundry.models import DealInputs
+from foundry.service import Service
 from foundry.store import Store
 
 # Every figure, each different from its example value.
@@ -531,22 +532,8 @@ def test_the_demo_deal_has_the_same_figures_as_on_main(setup):
             },
         },
     }
-    # The demo gives revenue, EBITDA, price, replacement management and its senior loan with that
-    # loan's rate and term. Every other figure it used is assumed; with no seller note, the seller's rate
-    # and term are not used and not listed.
-    assert deal["data"]["assumed_inputs"] == [
-        "multiple_low",
-        "multiple_high",
-        "fees",
-        "working_capital",
-        "integration_cost",
-        "seller_note",
-        "annual_capex",
-        "annual_working_capital_growth",
-        "tax_rate",
-        "cash_acquired",
-        "debt_assumed",
-    ]
+    # The demo gives every figure, with the values it used on main, so it lists none as assumed.
+    assert deal["data"]["assumed_inputs"] == []
 
 
 # 8. Financing is the buyer's choice: a deal given no loan is screened as bought without debt.
@@ -774,3 +761,103 @@ def test_the_mcp_tool_passes_back_each_refusal(setup):
         if message in {OLD_MULTIPLES, OLD_DEBT, OLD_EBITDA}:
             assert "not given" not in text
     assert counts(store) == before
+
+
+# 10. `foundry demo` can be run again: on a database an earlier version seeded, and on its own.
+
+# The deal request main (e2317d3) sent for the demo: its DealInputs dumped with every default filled in.
+# Written out by hand, so a change to this branch's demo cannot change what the test seeds.
+MAIN_DEMO_DEAL = {
+    "target": "Example Mapping Studio · synthetic",
+    "thesis": "Compare buying a small mapping-services operation with building delivery capacity. All figures are illustrative.",
+    "annual_revenue": "1000000",
+    "reported_ebitda": "200000",
+    "adjustments": [
+        {"label": "Illustrative one-time expense", "amount": "10000", "evidence_id": "EVIDENCE"},
+        {"label": "Unsupported seller add-back", "amount": "25000", "evidence_id": None},
+    ],
+    "replacement_management": "60000",
+    "multiple_low": "3",
+    "multiple_high": "5",
+    "purchase_price": "800000",
+    "fees": "30000",
+    "working_capital": "50000",
+    "integration_cost": "0",
+    "senior_debt": "400000",
+    "debt_rate": "0.09",
+    "debt_years": 7,
+    "seller_note": "0",
+    "seller_rate": "0.06",
+    "seller_years": 5,
+    "annual_capex": "15000",
+    "annual_working_capital_growth": "0",
+    "tax_rate": "0.25",
+    "cash_acquired": "0",
+    "debt_assumed": "0",
+    "evidence_ids": [],
+}
+
+
+def run_cli(args, capsys):
+    """The exit status of `foundry` with these arguments, and what it printed."""
+    try:
+        cli.main(args)
+        code = 0
+    except SystemExit as stopped:
+        code = stopped.code
+    return code, capsys.readouterr()
+
+
+def verify_demo(db, capsys):
+    store = Store(db)
+    with store.read() as con:
+        (bid,) = con.execute("SELECT id FROM businesses").fetchone()
+    code, out = run_cli(["--db", db, "verify", bid], capsys)
+    assert code == 0, out.err
+    assert json.loads(out.out)["valid"] is True
+
+
+def test_the_demo_runs_again_on_a_database_seeded_by_main(tmp_path, capsys):
+    db = str(tmp_path / "upgraded" / "foundry.db")
+    assert run_cli(["--db", db, "init"], capsys)[0] == 0
+    store = Store(db)
+    service = Service(store)
+    actor = store.authenticate((tmp_path / "upgraded" / "owner.key").read_text().strip())
+
+    # Seed as main did: its demo, with the deal saved from main's request by save_deal as it was then.
+    def save_deal_as_on_main(actor, bid, key, payload):
+        request = json.loads(json.dumps(MAIN_DEMO_DEAL))
+        request["adjustments"][0]["evidence_id"] = payload["adjustments"][0]["evidence_id"]
+        return save_deal_as_before(service, actor, bid, key, request)
+
+    service.save_deal = save_deal_as_on_main
+    seed(service, actor)
+    before = counts(store)
+    with store.read() as con:
+        stored = con.execute("SELECT id, version, data FROM objects WHERE kind='deal'").fetchall()
+    assert len(stored) == 1 and "assumed_inputs" not in json.loads(stored[0]["data"])
+
+    code, out = run_cli(["--db", db, "demo"], capsys)
+    assert code == 0, out.err
+    assert "Foundry:" not in out.err
+    assert counts(store) == before
+    with store.read() as con:
+        assert [tuple(r) for r in con.execute("SELECT id, version, data FROM objects WHERE kind='deal'")] == [
+            tuple(r) for r in stored
+        ]
+    verify_demo(db, capsys)
+
+
+def test_the_demo_runs_twice_on_a_fresh_database(tmp_path, capsys):
+    db = str(tmp_path / "fresh" / "foundry.db")
+    code, out = run_cli(["--db", db, "demo"], capsys)
+    assert code == 0, out.err
+    store = Store(db)
+    first = counts(store)
+    assert first["objects"] > 0 and kinds(store, "deal") == 1
+
+    code, out = run_cli(["--db", db, "demo"], capsys)
+    assert code == 0, out.err
+    assert "Foundry:" not in out.err
+    assert counts(store) == first
+    verify_demo(db, capsys)

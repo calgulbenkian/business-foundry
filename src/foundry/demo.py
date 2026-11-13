@@ -193,22 +193,37 @@ def seed(service: Service, actor):
         actor,
         bid,
         "demo:deal:v1",
-        # Only the fields given here are sent, so the deal lists every other figure it used as assumed.
-        # The senior loan is given: financing is the buyer's choice, and the model assumes no debt.
+        # Every figure is given, with the value this demo has always used, so the deal lists no assumed
+        # inputs (the thesis says the figures are illustrative) and its request stays the one the demo
+        # stored before assumed_inputs existed: running `foundry demo` again on a database seeded by
+        # an earlier version replays the stored deal instead of refusing the reused key.
         models.DealInputs(
             target="Example Mapping Studio · synthetic",
             thesis="Compare buying a small mapping-services operation with building delivery capacity. All figures are illustrative.",
             annual_revenue=1000000,
             reported_ebitda=200000,
-            purchase_price=800000,
             adjustments=[
                 models.Adjustment(label="Illustrative one-time expense", amount=10000, evidence_id=eid),
                 models.Adjustment(label="Unsupported seller add-back", amount=25000),
             ],
             replacement_management=60000,
+            multiple_low=3,
+            multiple_high=5,
+            purchase_price=800000,
+            fees=30000,
+            working_capital=50000,
+            integration_cost=0,
             senior_debt=400000,
             debt_rate="0.09",
             debt_years=7,
+            seller_note=0,
+            seller_rate="0.06",
+            seller_years=5,
+            annual_capex=15000,
+            annual_working_capital_growth=0,
+            tax_rate="0.25",
+            cash_acquired=0,
+            debt_assumed=0,
         ).model_dump(mode="json", exclude_unset=True),
     )
     service.generate_document(
