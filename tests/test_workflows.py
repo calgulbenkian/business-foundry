@@ -703,7 +703,13 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     assert table_rows(memo, "| Assumed enterprise value range ")[1].startswith("Not meaningful")
     assert table_rows(memo, "| Assumed equity value range ")[1].startswith("Not meaningful")
     assert table_rows(memo, "| Buyer equity required ") == ["Sources", "Buyer equity required", "50,000.00"]
-    assert "Annual debt service: 0.00 USD." in memo
+    # No loan was given, so the memo says the deal is screened without debt instead of a zero payment.
+    assert "Annual debt service" not in memo
+    assert (
+        "No debt was given and none was assumed, so the deal is screened as bought without debt. "
+        "There is no debt service: cash after debt service equals cash available, and there is no "
+        "coverage ratio."
+    ) in memo
     assert table_rows(memo, "| Base     |") == [
         "Base",
         "-12,000.00",
@@ -787,7 +793,21 @@ def test_maximum_bound_forecast_generates_business_plan(setup):
 def test_long_forecast_renders_yearly_dcf_columns(setup):
     _, s, a, bid, _ = setup
     s.save_forecast(a, bid, key(), dump(models.ForecastCreate, title="Default plan"))
-    s.save_deal(a, bid, key(), dump(models.DealInputs, target="Debt case", thesis="A financed target."))
+    s.save_deal(
+        a,
+        bid,
+        key(),
+        dump(
+            models.DealInputs,
+            target="Debt case",
+            thesis="A financed target.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+            # The model assumes no loan, so the financed case gives its own.
+            senior_debt=400000,
+        ),
+    )
     snapshot = s.snapshot(a, bid)
     _, plan = render_document("business_plan", snapshot)
     assert table_rows(plan, "| Line item ") == ["Line item", "Year 1", "Year 2", "Year 3"]

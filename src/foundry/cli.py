@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import get_args
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from . import models
 from .service import Service
 from .store import DomainError, Store
@@ -358,6 +360,30 @@ def start_foundry(
             signal.signal(signal.SIGTERM, sigterm)
 
 
+def read_configuration(model, path: Path, only_set=False) -> dict:
+    """A JSON configuration file, validated by the model.
+
+    With only_set, only the fields the file sets are returned: a deal records each figure the file
+    leaves out as assumed. A refusal is one plain line naming each field, without the file's values.
+    """
+    try:
+        value = model.model_validate_json(path.read_text())
+        return value.model_dump(mode="json", exclude_unset=only_set)
+    except ValidationError as exc:
+        problems = []
+        for error in exc.errors():
+            where = ".".join(str(part) for part in error["loc"])
+            if error["type"] == "missing":
+                problem = f"{where} is required"
+            else:
+                problem = f"{where}: {error['msg']}" if where else error["msg"]
+            # The line ends with one full stop, so a message that ends with its own loses it here.
+            problem = problem.rstrip(".")
+            if problem not in problems:
+                problems.append(problem)
+        raise ValueError(f"{path.name} was not accepted: " + "; ".join(problems) + ".") from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Business Foundry: start, acquire and operate with evidence."
@@ -534,13 +560,11 @@ def main(argv=None):
                 if not result["integrity"]["valid"]:
                     raise SystemExit(1)
             elif args.command == "create":
-                payload = models.BusinessCreate.model_validate_json(
-                    args.configuration.read_text()
-                ).model_dump(mode="json")
+                payload = read_configuration(models.BusinessCreate, args.configuration)
                 print(json.dumps(service.create_business(actor, str(uuid4()), payload), indent=2))
             elif args.command in {"forecast", "acquire"}:
                 model = models.ForecastCreate if args.command == "forecast" else models.DealInputs
-                payload = model.model_validate_json(args.configuration.read_text()).model_dump(mode="json")
+                payload = read_configuration(model, args.configuration, args.command == "acquire")
                 fn = service.save_forecast if args.command == "forecast" else service.save_deal
                 print(json.dumps(fn(actor, args.business_id, str(uuid4()), payload), indent=2))
             elif args.command == "jurisdiction":

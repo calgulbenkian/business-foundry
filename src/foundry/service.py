@@ -730,24 +730,38 @@ class Service:
         return self.command(actor, bid, key, "finance.forecast", payload, run)
 
     def save_deal(self, actor, bid, key, payload):
+        """Screen an acquisition from the inputs as the caller sent them.
+
+        A figure the caller left out takes the model's example value. The deal records which ones in
+        assumed_inputs, in field order, so pass only what the caller gave: the API and the command line
+        pass the fields that were set, never a dump with every default filled in. The stored inputs hold
+        every value the model used. The request the idempotency key guards is the full inputs, plus the
+        assumed list when it is not empty, so a request that gives every figure has the same fingerprint
+        as before assumed_inputs existed, and the same values given and left out are different requests.
+        """
+        deal = DealInputs.model_validate(payload)
+        inputs, assumed = deal.model_dump(mode="json"), deal.assumed_inputs()
+        request = {**inputs, "assumed_inputs": assumed} if assumed else inputs
+
         def run(con):
-            ids = payload["evidence_ids"] + [
-                a["evidence_id"] for a in payload["adjustments"] if a.get("evidence_id")
+            ids = inputs["evidence_ids"] + [
+                a["evidence_id"] for a in inputs["adjustments"] if a.get("evidence_id")
             ]
             evidence = self.references(con, bid, ids, "evidence")
             reviewed = {e["id"] for e in evidence if e["state"] == "verified"}
-            result = evaluate(finance.acquisition, DealInputs.model_validate(payload), reviewed)
+            result = evaluate(finance.acquisition, deal, reviewed)
             data = {
-                "inputs": payload,
+                "inputs": inputs,
+                "assumed_inputs": assumed,
                 "analysis": result,
                 "evidence_ids": list(set(ids)),
                 "evidence_versions": {e["id"]: e["version"] for e in evidence},
             }
-            item = self.store.add(con, bid, "deal", payload["target"], data, actor, "screening")
+            item = self.store.add(con, bid, "deal", inputs["target"], data, actor, "screening")
             self._tasks(con, bid, catalog.DEAL_TASKS, actor, item["id"])
             return item
 
-        return self.command(actor, bid, key, "deal.create", payload, run)
+        return self.command(actor, bid, key, "deal.create", request, run)
 
     def create_invoice(self, actor, bid, key, payload):
         def run(con):

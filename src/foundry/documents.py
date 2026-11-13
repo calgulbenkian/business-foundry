@@ -291,6 +291,74 @@ def coverage(value) -> str:
     return "No debt service" if value is None else f"{Decimal(str(value)):.2f}x"
 
 
+def fmt_multiple(value) -> str:
+    return f"{Decimal(str(value)):.2f}x"
+
+
+# Every figure of DealInputs that has an example value, with its label in the analysis form.
+DEAL_EXAMPLE_ROWS = {
+    "replacement_management": ("Annual replacement management cost", fmt_money),
+    "multiple_low": ("Low EBITDA multiple", fmt_multiple),
+    "multiple_high": ("High EBITDA multiple", fmt_multiple),
+    "fees": ("Transaction fees", fmt_money),
+    "working_capital": ("Working capital funding", fmt_money),
+    "integration_cost": ("Integration costs", fmt_money),
+    "senior_debt": ("New senior debt", fmt_money),
+    "debt_rate": ("Senior annual interest rate", fmt_rate),
+    "debt_years": ("Senior term", lambda v: f"{v} years"),
+    "seller_note": ("Seller financing", fmt_money),
+    "seller_rate": ("Seller annual interest rate", fmt_rate),
+    "seller_years": ("Seller term", lambda v: f"{v} years"),
+    "annual_capex": ("Annual maintenance capex", fmt_money),
+    "annual_working_capital_growth": ("Annual working capital increase", fmt_money),
+    "tax_rate": ("Assumed tax rate", fmt_rate),
+    "cash_acquired": ("Cash in valuation equity bridge", fmt_money),
+    "debt_assumed": ("Debt in valuation equity bridge", fmt_money),
+}
+
+ASSUMED_NOT_RECORDED = (
+    "Not recorded. This analysis was saved before Foundry recorded which inputs were given, "
+    "so any of its figures may be the model's example values. Check each one."
+)
+NONE_ASSUMED = "Every input was given. The model used none of its example values."
+
+
+def assumed_text(deal) -> str:
+    """One plain sentence naming each input the caller did not give, with the example value used.
+
+    A deal saved before the list was recorded has no assumed_inputs: that is "not recorded", never
+    "none assumed".
+    """
+    assumed, inputs = deal["data"].get("assumed_inputs"), deal["data"]["inputs"]
+    if not isinstance(assumed, list):
+        return ASSUMED_NOT_RECORDED
+    if not assumed:
+        return NONE_ASSUMED
+    parts = []
+    for key in assumed:
+        label, fmt = DEAL_EXAMPLE_ROWS.get(key, (str(key), str))
+        parts.append(f"{label} {fmt(inputs[key])}" if key in inputs else label)
+    return "Not given, so the model's example value was used: " + "; ".join(parts) + "."
+
+
+NO_DEBT = (
+    "No debt was given and none was assumed, so the deal is screened as bought without debt. "
+    "There is no debt service: cash after debt service equals cash available, and there is no coverage ratio."
+)
+
+
+def debt_text(deal, currency) -> str:
+    """The annual debt service, or, for a deal with no senior debt and no seller note, that it has none.
+
+    The model's example loans are zero, so a deal with no financing given carries no debt, and its
+    empty coverage reads as intended, not missing.
+    """
+    a, inputs = deal["data"]["analysis"], deal["data"]["inputs"]
+    if Decimal(str(inputs["senior_debt"])) or Decimal(str(inputs["seller_note"])):
+        return f"Annual debt service: {fmt_money(a['annual_debt_service'])} {currency}."
+    return NO_DEBT
+
+
 def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> list[str]:
     a, inp = deal["data"]["analysis"], deal["data"]["inputs"]
     snap_deal = next((o for o in snapshot["objects"] if o["id"] == deal["id"]), None)
@@ -359,12 +427,7 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
         ],
         {2},
     )
-    out += [
-        "### Debt service and scenario coverage",
-        "",
-        f"Annual debt service: {fmt_money(a['annual_debt_service'])} {currency}.",
-        "",
-    ]
+    out += ["### Debt service and scenario coverage", "", debt_text(deal, currency), ""]
     out += fmt_table(
         [
             "Case",
@@ -387,6 +450,7 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
         ],
         {1, 2, 3, 4},
     )
+    out += ["### Inputs not given", "", inline(assumed_text(deal)), ""]
     out += ["### Screening limitations", ""]
     out += [f"- {inline(x)}" for x in a.get("limitations", [])] + [""]
     return out

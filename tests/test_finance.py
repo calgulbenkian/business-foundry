@@ -254,9 +254,15 @@ def test_full_retention_and_step_balance_at_maximum_bounds():
 
 
 def deal(**changes):
-    return DealInputs(
-        **(dict(target="Example target", thesis="Acquire predictable delivery capacity.") | changes)
+    # The target's figures and price are required; these are the values the model once filled in for them.
+    base = dict(
+        target="Example target",
+        thesis="Acquire predictable delivery capacity.",
+        annual_revenue=1000000,
+        reported_ebitda=200000,
+        purchase_price=800000,
     )
+    return DealInputs(**(base | changes))
 
 
 def test_acquisition_only_supported_adjustments_and_sources_equal_uses():

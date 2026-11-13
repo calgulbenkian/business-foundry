@@ -855,7 +855,380 @@ async function main() {
     await page
       .getByLabel('Investment thesis', { exact: true })
       .fill('Acquire repeatable delivery capacity subject to independent diligence.');
-    await submit('Calculate and create diligence work');
+    // The three figures that describe the target and its price start empty, with the model's
+    // example only as placeholder text, and the browser refuses the form until they are filled.
+    // Every other figure starts empty too.
+    const dealField = (name) => page.locator(`#dialog [name="${name}"]`);
+    for (const [name, example] of [
+      ['annual_revenue', '1000000'],
+      ['reported_ebitda', '200000'],
+      ['purchase_price', '800000'],
+      ['fees', '30000'],
+      ['debt_years', '7'],
+    ]) {
+      assert.equal(await dealField(name).inputValue(), '', name + ' starts empty');
+      assert.equal(await dealField(name).getAttribute('placeholder'), 'Example: ' + example);
+    }
+    // Financing is the buyer's choice: an empty loan is no loan, with no example amount shown.
+    const dealHint = (name) =>
+      page.locator(`#dialog label:has([name="${name}"]) .hint`).innerText();
+    for (const name of ['senior_debt', 'seller_note']) {
+      assert.equal(await dealField(name).inputValue(), '', name + ' starts empty');
+      assert.equal(await dealField(name).getAttribute('placeholder'), 'Empty: no loan');
+      assert.equal(await dealHint(name), 'Leave empty for no loan.');
+    }
+    assert.equal(
+      await dealHint('debt_years'),
+      'Used only when its loan is entered. Leave empty to use the example.',
+    );
+    const dealPosts = [];
+    const onDealPost = (r) => {
+      if (r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'))
+        dealPosts.push(r.postDataJSON());
+    };
+    page.on('request', onDealPost);
+    await dealField('annual_revenue').fill('900000');
+    await dealField('reported_ebitda').fill('180000');
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    assert.equal(await dealField('purchase_price').evaluate((e) => e.matches(':invalid')), true);
+    assert(
+      await page.locator('#dialog').isVisible(),
+      'the form stays open without a purchase price',
+    );
+    assert.equal(dealPosts.length, 0, 'nothing is sent while a required figure is empty');
+    await dealField('purchase_price').fill('700000');
+    await dealField('debt_years').fill('6');
+    // A refusal caused by an example value names it, in the same words as the API.
+    const highAssumed =
+      'body: Value error, High multiple must not be below low multiple. The high multiple was not given, so its example value 5 was used; give a high multiple.';
+    await dealField('multiple_low').fill('6');
+    const errorsBefore = errors.length;
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'),
+    );
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    const refusal = await refused;
+    assert.equal(refusal.status(), 422);
+    assert.equal((await refusal.json()).detail, highAssumed);
+    const formError = page.locator('#dialog p.error');
+    await formError.filter({ hasText: 'high multiple was not given' }).waitFor();
+    assert.equal(await formError.innerText(), highAssumed);
+    // The browser logs the refused save's 422 as a console error; that line, and no other, is expected.
+    const logged = errors.splice(errorsBefore);
+    assert.deepEqual(
+      logged.filter((t) => !t.includes('status of 422')),
+      [],
+    );
+    await dealField('multiple_low').fill('');
+    dealPosts.length = 0;
+    // What was sent is checked before the save is awaited, so a wrong body fails here by name.
+    const posted = page.waitForRequest(
+      (r) => r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'),
+    );
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    await posted;
+    page.off('request', onDealPost);
+    assert.equal(dealPosts.length, 1);
+    const sentDeal = dealPosts[0];
+    assert.deepEqual(
+      [sentDeal.annual_revenue, sentDeal.reported_ebitda, sentDeal.purchase_price],
+      ['900000', '180000', '700000'],
+    );
+    assert.equal(sentDeal.debt_years, 6, 'a filled term is sent as a number');
+    for (const name of ['fees', 'seller_years', 'tax_rate'])
+      assert(!(name in sentDeal), name + ' was left empty and is not sent');
+    await saved();
+    const browserDeal = (
+      await (await context.request.get(origin + '/api/businesses/' + bid)).json()
+    ).objects.find((o) => o.kind === 'deal' && o.title === 'Browser synthetic target');
+    assert(browserDeal.data.assumed_inputs.includes('fees'));
+    assert(!browserDeal.data.assumed_inputs.includes('debt_years'));
+    const assumedLine = await page.locator('#insp .assumed-inputs').innerText();
+    assert(
+      assumedLine.startsWith("Not given, so the model's example value was used: "),
+      assumedLine,
+    );
+    assert.match(assumedLine, /Transaction fees \$30,000\.00/);
+    assert.match(assumedLine, /New senior debt \$0\.00; Seller financing \$0\.00/);
+    assert(!assumedLine.includes('Senior term'), 'the term that was given is not listed');
+    for (const unused of [
+      'Senior annual interest rate',
+      'Seller annual interest rate',
+      'Seller term',
+    ])
+      assert(!assumedLine.includes(unused), unused + ' has no loan, so it is not used or listed');
+    // No loan was given, so the page says the deal is screened without debt.
+    assert.equal(
+      await page.locator('#insp .no-debt').innerText(),
+      'No debt was given and none was assumed, so the deal is screened as bought without debt. There is no debt service: cash after debt service equals cash available, and there is no coverage ratio.',
+    );
+    assert.match(await page.locator('#insp .figs').innerText(), /Annual debt service\s+None/);
+    // Opened again from an analysis, the form fills exactly what that analysis gave. Every figure of
+    // the form is read, so a field filled or left empty by mistake fails by name.
+    const dealNames = [
+      'annual_revenue',
+      'reported_ebitda',
+      'replacement_management',
+      'multiple_low',
+      'multiple_high',
+      'purchase_price',
+      'fees',
+      'working_capital',
+      'integration_cost',
+      'senior_debt',
+      'debt_rate',
+      'debt_years',
+      'seller_note',
+      'seller_rate',
+      'seller_years',
+      'annual_capex',
+      'annual_working_capital_growth',
+      'tax_rate',
+      'cash_acquired',
+      'debt_assumed',
+    ];
+    // What the form should start with: the given figures filled, every other one empty.
+    const startsWith = (given) => ({
+      ...Object.fromEntries(dealNames.map((n) => [n, ''])),
+      ...given,
+    });
+    const reopenDeal = async (id, title) => {
+      await page.locator(`#list .row[data-key="deal:${id}"]`).click();
+      await page.locator('#insp-title', { hasText: title }).waitFor();
+      await page.getByRole('button', { name: 'Revise assumptions', exact: true }).click();
+      await page.locator('#dialog').waitFor();
+      const names = await page
+        .locator('#dialog input[type="number"]')
+        .evaluateAll((es) => es.map((e) => e.name).filter((n) => n !== 'adjustment_amount'));
+      assert.deepEqual(names, dealNames, 'the form has every figure, in order');
+      return Object.fromEntries(
+        await Promise.all(dealNames.map(async (n) => [n, await dealField(n).inputValue()])),
+      );
+    };
+    const cancelDeal = async () => {
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await page.locator('#dialog').waitFor({ state: 'hidden' });
+    };
+    // No loan: the senior term was given (6 years), but no loan was, so the term starts empty with
+    // the rates and the seller term; only the three required figures were given.
+    assert.deepEqual(
+      await reopenDeal(browserDeal.id, 'Browser synthetic target'),
+      startsWith({ annual_revenue: '900000', reported_ebitda: '180000', purchase_price: '700000' }),
+      'a reopened analysis with no loan',
+    );
+    // Entering only a loan amount then sends no rate or term, and the page lists both as assumed.
+    const revised = page.waitForRequest(
+      (r) => r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'),
+    );
+    await dealField('senior_debt').fill('100000');
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    const revisedBody = (await revised).postDataJSON();
+    assert.equal(revisedBody.senior_debt, '100000');
+    for (const name of ['debt_rate', 'debt_years'])
+      assert(!(name in revisedBody), name + ' was not given again and is not sent');
+    await saved();
+    const revisedDeal = (
+      await (await context.request.get(origin + '/api/businesses/' + bid)).json()
+    ).objects.find(
+      (o) => o.kind === 'deal' && o.title === 'Browser synthetic target' && o.id !== browserDeal.id,
+    );
+    for (const name of ['debt_rate', 'debt_years'])
+      assert(revisedDeal.data.assumed_inputs.includes(name), name + ' is recorded as assumed');
+    await page.locator('#insp-title', { hasText: 'Browser synthetic target' }).waitFor();
+    const revisedLine = await page.locator('#insp .assumed-inputs').innerText();
+    assert.match(revisedLine, /Senior annual interest rate 9\.00%/);
+    assert.match(revisedLine, /Senior term 7 years/);
+    // Three more kinds of saved analysis, served alongside the real ones: one with a list and both
+    // loans given (the seller note as zero), one with loans whose terms were not given, and one
+    // saved before the list was recorded, holding main's example values where figures were left out.
+    const zeros = Object.fromEntries(dealNames.map((n) => [n, '0']));
+    const servedDeal = (suffix, title, inputs, assumed) => {
+      const o = structuredClone(browserDeal);
+      o.id = browserDeal.id + suffix;
+      o.title = title;
+      o.data.inputs = { ...o.data.inputs, ...zeros, target: title, ...inputs };
+      if (assumed) o.data.assumed_inputs = assumed;
+      else delete o.data.assumed_inputs;
+      return o;
+    };
+    const dealKinds = [
+      [
+        servedDeal(
+          '-listed',
+          'Served analysis with a list',
+          {
+            annual_revenue: '950000',
+            reported_ebitda: '190000',
+            purchase_price: '750000',
+            multiple_low: '3',
+            multiple_high: '5',
+            fees: '30000',
+            working_capital: '50000',
+            senior_debt: '200000',
+            debt_rate: '0.09',
+            debt_years: 7,
+            seller_rate: '0.07',
+            seller_years: 4,
+            annual_capex: '15000',
+            tax_rate: '0.25',
+          },
+          [
+            'replacement_management',
+            'multiple_low',
+            'multiple_high',
+            'fees',
+            'working_capital',
+            'integration_cost',
+            'annual_capex',
+            'annual_working_capital_growth',
+            'cash_acquired',
+            'debt_assumed',
+          ],
+        ),
+        // Given figures equal to an example are filled; the seller note was given as zero, so its
+        // rate and term start empty.
+        {
+          annual_revenue: '950000',
+          reported_ebitda: '190000',
+          purchase_price: '750000',
+          senior_debt: '200000',
+          debt_rate: '0.09',
+          debt_years: '7',
+          seller_note: '0',
+          tax_rate: '0.25',
+        },
+      ],
+      [
+        servedDeal(
+          '-no-term',
+          'Served analysis with a loan but no term',
+          {
+            annual_revenue: '950000',
+            reported_ebitda: '190000',
+            purchase_price: '750000',
+            multiple_low: '3',
+            multiple_high: '5',
+            fees: '25000',
+            working_capital: '50000',
+            senior_debt: '200000',
+            debt_rate: '0.1',
+            debt_years: 7,
+            seller_note: '50000',
+            seller_rate: '0.06',
+            seller_years: 5,
+            annual_capex: '15000',
+            tax_rate: '0.25',
+          },
+          [
+            'replacement_management',
+            'multiple_low',
+            'multiple_high',
+            'working_capital',
+            'integration_cost',
+            'debt_years',
+            'seller_rate',
+            'seller_years',
+            'annual_capex',
+            'annual_working_capital_growth',
+            'tax_rate',
+            'cash_acquired',
+            'debt_assumed',
+          ],
+        ),
+        {
+          annual_revenue: '950000',
+          reported_ebitda: '190000',
+          purchase_price: '750000',
+          fees: '25000',
+          senior_debt: '200000',
+          debt_rate: '0.1',
+          seller_note: '50000',
+        },
+      ],
+      [
+        servedDeal('-before-list', 'Served analysis saved before the list', {
+          annual_revenue: '1000000',
+          reported_ebitda: '210000',
+          purchase_price: '800000',
+          multiple_low: '3',
+          multiple_high: '6',
+          fees: '30000',
+          working_capital: '60000',
+          senior_debt: '400000',
+          debt_rate: '0.1',
+          debt_years: 7,
+          seller_note: '100000',
+          seller_rate: '0.06',
+          seller_years: 4,
+          annual_capex: '15000',
+          tax_rate: '0.3',
+        }),
+        // Main's examples start empty: its 400,000 senior debt with it, and so that loan's rate and
+        // term. The revenue and price equal main's examples too. Only figures that differ are filled.
+        {
+          reported_ebitda: '210000',
+          multiple_high: '6',
+          working_capital: '60000',
+          seller_note: '100000',
+          seller_years: '4',
+          tax_rate: '0.3',
+        },
+      ],
+    ];
+    const snapshotPath = (url) => url.pathname === '/api/businesses/' + bid;
+    const withServed = async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await route.fetch();
+      const body = await response.json();
+      body.objects.push(...dealKinds.map(([o]) => o));
+      await route.fulfill({ response, json: body });
+    };
+    await page.route(snapshotPath, withServed);
+    await page.reload();
+    await source('deals');
+    for (const [o, given] of dealKinds) {
+      assert.deepEqual(await reopenDeal(o.id, o.title), startsWith(given), o.title);
+      await cancelDeal();
+    }
+    await page.unroute(snapshotPath, withServed);
+    // The real analysis served as saved before the list was recorded: the page says "not recorded",
+    // and the reopened form fills only figures that differ from the model's example.
+    const withoutList = async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const response = await route.fetch();
+      const body = await response.json();
+      for (const o of body.objects) if (o.kind === 'deal') delete o.data.assumed_inputs;
+      await route.fulfill({ response, json: body });
+    };
+    await page.route(snapshotPath, withoutList);
+    await page.reload();
+    await source('deals');
+    await page.locator(`#list .row[data-key="deal:${browserDeal.id}"]`).click();
+    await page.locator('#insp-title', { hasText: 'Browser synthetic target' }).waitFor();
+    assert.equal(
+      await page.locator('#insp .assumed-inputs').innerText(),
+      "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.",
+    );
+    assert.deepEqual(
+      await reopenDeal(browserDeal.id, 'Browser synthetic target'),
+      startsWith({ annual_revenue: '900000', reported_ebitda: '180000', purchase_price: '700000' }),
+      'the analysis with no loan, served without its list',
+    );
+    await cancelDeal();
+    await page.unroute(snapshotPath, withoutList);
+    await page.reload();
     await source('documents');
     await page.getByRole('button', { name: '+ Generate document', exact: true }).click();
     await submit('Generate draft');
@@ -5601,7 +5974,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition, after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition (refused without its three required figures, a refusal caused by an example value naming it in the API’s words, empty loans meaning no loan and the page saying no debt was given, figures left empty not sent and listed as not given, a reopened form filling exactly what each kind of saved analysis gave, every figure read, with assumed figures, the rate and term of a loan it did not have and an earlier analysis’s example values empty, and a loan amount entered alone sending no rate or term, which the page then lists as not given), after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));

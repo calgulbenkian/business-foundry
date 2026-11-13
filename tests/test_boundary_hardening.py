@@ -403,6 +403,9 @@ def test_defined_locations_stay_useful(client, setup):
         json={
             "target": "Synthetic target",
             "thesis": "A synthetic acquisition thesis.",
+            "annual_revenue": "1000000",
+            "reported_ebitda": "200000",
+            "purchase_price": "800000",
             "adjustments": [{"label": "First", "amount": 1}, {"label": "Second", "amount": "not-a-number"}],
         },
     )
@@ -416,6 +419,9 @@ def test_defined_locations_stay_useful(client, setup):
         json={
             "target": "Synthetic target",
             "thesis": "A synthetic acquisition thesis.",
+            "annual_revenue": "1000000",
+            "reported_ebitda": "200000",
+            "purchase_price": "800000",
             "adjustments": [{"label": "First", "amount": 1, "token": 1}],
         },
     )

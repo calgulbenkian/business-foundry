@@ -52,7 +52,20 @@ from foundry.models import Adjustment, DealInputs, ForecastCreate, ForecastInput
 
 D = Decimal
 PLAIN_MONEY = re.compile(r"-?\d+\.\d{2}")
-DEAL = {"target": "Synthetic target", "thesis": "A synthetic acquisition for bounds tests."}
+# The target's figures and price are required; these are the values the model once filled in for them.
+REQUIRED_FIGURES = {"annual_revenue": "1000000", "reported_ebitda": "200000", "purchase_price": "800000"}
+DEAL = {
+    "target": "Synthetic target",
+    "thesis": "A synthetic acquisition for bounds tests.",
+    **REQUIRED_FIGURES,
+}
+
+
+def deal_inputs(**changes) -> DealInputs:
+    """DealInputs for DEAL, with any of its fields replaced."""
+    return DealInputs(**(DEAL | changes))
+
+
 FORECAST_RATES = [
     "monthly_growth",
     "monthly_retention",
@@ -237,8 +250,7 @@ def test_sub_cent_shortfall_is_flagged_but_displays_zero():
     assert plan["first_shortfall_month"] == 1
     assert plan["minimum_cash"] == "0.00" and plan["additional_cash_needed"] == "0.00"
     deal = acquisition(
-        DealInputs(
-            **DEAL,
+        deal_inputs(
             annual_revenue=100,
             reported_ebitda="0.004",
             senior_debt=0,
@@ -319,9 +331,9 @@ def test_forecast_rates_take_twelve_places_not_thirteen(field):
 
 @pytest.mark.parametrize("field", DEAL_RATES)
 def test_deal_rates_take_twelve_places_not_thirteen(field):
-    assert getattr(DealInputs(**DEAL, **{field: TWELVE_PLACES}), field) == D(TWELVE_PLACES)
+    assert getattr(deal_inputs(**{field: TWELVE_PLACES}), field) == D(TWELVE_PLACES)
     with pytest.raises(ValidationError) as caught:
-        DealInputs(**DEAL, **{field: THIRTEEN_PLACES})
+        deal_inputs(**{field: THIRTEEN_PLACES})
     errors = caught.value.errors()
     assert [e["loc"] for e in errors] == [(field,)] and errors[0]["type"] == "decimal_max_places"
 
@@ -354,12 +366,12 @@ def test_places_are_counted_on_the_value_not_its_spelling():
 
 def test_money_fields_refuse_digits_beyond_twelve_places():
     amount = "123.456789012345678901234567890123456789012"
-    for build in (lambda x: ForecastInputs(unit_price=x), lambda x: DealInputs(**DEAL, fees=x)):
+    for build in (lambda x: ForecastInputs(unit_price=x), lambda x: deal_inputs(fees=x)):
         with pytest.raises(ValidationError) as caught:
             build(amount)
         assert caught.value.errors()[0]["type"] == "decimal_max_places"
     assert ForecastInputs(unit_price=amount[:16]).unit_price == D("123.456789012345")
-    assert DealInputs(**DEAL, fees=amount[:16]).fees == D("123.456789012345")
+    assert deal_inputs(fees=amount[:16]).fees == D("123.456789012345")
 
 
 # Debt service at the corners and across the accepted range.
@@ -404,7 +416,7 @@ def test_random_accepted_debt_service_matches_exact_rationals():
         principal = random_decimal(rng, 10**12, rng.choice([0, 2, 2, 2, 6, 12]))
         rate = random_decimal(rng, 1, rng.randint(1, 12))
         years = rng.randint(1, 30)
-        DealInputs(**DEAL, senior_debt=0, debt_rate=rate, purchase_price=principal)  # accepted inputs
+        deal_inputs(senior_debt=0, debt_rate=rate, purchase_price=principal)  # accepted inputs
         assert money(annual_debt_service(principal, rate, years)) == exact_service(principal, rate, years), (
             principal,
             rate,
@@ -753,7 +765,10 @@ def test_a_json_number_amount_with_more_float_places_is_refused(client, setup):
 def test_api_saves_a_zero_with_an_extreme_exponent(client, setup, zero):
     bid = setup[3]
     response = post(
-        client, bid, "deals", {"target": "Synthetic", "thesis": "Synthetic testing", "senior_debt": zero}
+        client,
+        bid,
+        "deals",
+        {"target": "Synthetic", "thesis": "Synthetic testing", **REQUIRED_FIGURES, "senior_debt": zero},
     )
     assert response.status_code == 201
     analysis = response.json()["data"]["analysis"]
@@ -820,6 +835,7 @@ def test_api_refuses_the_finding_2_principals(client, setup):
     body = {
         "target": "Synthetic",
         "thesis": "Synthetic testing",
+        **REQUIRED_FIGURES,
         "purchase_price": "1000000000000",
         "senior_debt": FINDING_2_PRINCIPAL,
         "seller_note": FINDING_2_PRINCIPAL,
@@ -873,8 +889,7 @@ def test_random_pairs_of_accepted_loans_total_exactly():
         (p1, r1, y1), (p2, r2, y2) = loans
         expected = half_even(exact_total(*loans))
         assert money(total_annual_debt_service(*loans)) == expected, loans
-        deal = DealInputs(
-            **DEAL,
+        deal = deal_inputs(
             purchase_price="1000000000000",
             fees="1000000000000",
             senior_debt=p1,
@@ -895,7 +910,10 @@ def test_api_refuses_a_principal_beyond_twelve_places(client, setup, principal):
     store, _, _, bid, _ = setup
     before = counts(store)
     response = post(
-        client, bid, "deals", {"target": "Synthetic", "thesis": "Synthetic testing", "senior_debt": principal}
+        client,
+        bid,
+        "deals",
+        {"target": "Synthetic", "thesis": "Synthetic testing", **REQUIRED_FIGURES, "senior_debt": principal},
     )
     assert response.status_code == 422
     assert response.json()["detail"] == f"body.senior_debt: {PLACES_MESSAGE}"
@@ -908,7 +926,7 @@ def test_api_evaluates_the_smallest_accepted_principal(client, setup):
         client,
         setup[3],
         "deals",
-        {"target": "Synthetic", "thesis": "Synthetic testing", "senior_debt": "1E-12"},
+        {"target": "Synthetic", "thesis": "Synthetic testing", **REQUIRED_FIGURES, "senior_debt": "1E-12"},
     )
     assert response.status_code == 201
     analysis = response.json()["data"]["analysis"]
@@ -1040,7 +1058,7 @@ def test_forecast_corners_evaluate_within_the_stated_magnitudes(corner):
 
 @pytest.mark.parametrize("corner", DEAL_CORNERS)
 def test_deal_corners_evaluate_within_the_stated_magnitudes(corner):
-    inputs = DealInputs(**DEAL, **DEAL_CORNERS[corner])
+    inputs = deal_inputs(**DEAL_CORNERS[corner])
     with bounded_magnitudes():
         result = acquisition(inputs, {"reviewed"})
     values = displayed(result)
@@ -1059,14 +1077,14 @@ def test_deal_corners_evaluate_within_the_stated_magnitudes(corner):
 
 def test_corner_outputs_match_the_stated_extremes():
     # The largest coverage ratio: cash of about −3.15E+12 over the smallest service, 1E-12 / 30 years.
-    deal = acquisition(DealInputs(**DEAL, **DEAL_CORNERS["largest_coverage"]), {"reviewed"})
+    deal = acquisition(deal_inputs(**DEAL_CORNERS["largest_coverage"]), {"reviewed"})
     coverage = Fraction(D(deal["scenarios"]["downside"]["coverage_ratio"]))
     assert -(10**26) < coverage < -(10**25)
     # The largest money output: the enterprise value with the narrowest spread, below 1E+44.
     plan = forecast(ForecastInputs(**EXTREME))["scenarios"]["upside"]["summary"]["dcf"]
     assert 10**42 < Fraction(D(plan["enterprise_value"])) < 10**44
     # The smallest non-zero outputs are one cent and one basis point.
-    tiny = acquisition(DealInputs(**DEAL, **DEAL_CORNERS["smallest"]), {"reviewed"})
+    tiny = acquisition(deal_inputs(**DEAL_CORNERS["smallest"]), {"reviewed"})
     assert tiny["annual_debt_service"] == "0.00" and tiny["normalized_ebitda"] == "0.00"
 
 
@@ -1122,7 +1140,7 @@ def check_reads(client, setup, deal_id):
     plan_doc = generate(client, bid, "business_plan")
     memo = generate(client, bid, "investment_memo", deal_id)
     download = client.get(f"/api/businesses/{bid}/documents/{memo['id']}/download")
-    assert download.status_code == 200 and "Annual debt service" in download.text
+    assert download.status_code == 200 and "Debt service and scenario coverage" in download.text
     assert plan_doc["data"]["content"]
     assert client.get(f"/api/businesses/{bid}/audit").json()["integrity"]["valid"]
     assert service.audit(actor, bid)["integrity"]["valid"]
@@ -1201,7 +1219,7 @@ def test_records_saved_before_the_places_limit_stay_usable(client, setup, monkey
         "evidence_ids": [],
     }
     deal = {
-        **DealInputs(**DEAL).model_dump(mode="json"),
+        **deal_inputs().model_dump(mode="json"),
         "purchase_price": "1000000000000",
         "senior_debt": FINDING_2_PRINCIPAL,
         "seller_note": FINDING_2_PRINCIPAL,
@@ -1404,8 +1422,7 @@ def deal_with_available(rng, loans, target: Fraction, adjust: bool = False) -> D
             {"label": "Synthetic reviewed", "amount": dec(amount), "evidence_id": "reviewed"},
             {"label": "Synthetic unreviewed", "amount": D(rng.randint(1, 10**6)), "evidence_id": "other"},
         ]
-    deal = DealInputs(
-        **DEAL,
+    deal = deal_inputs(
         annual_revenue=D(max(whole, int(reported)) + 1 + rng.randint(0, 10**6)),
         reported_ebitda=dec(reported),
         adjustments=adjustments,
@@ -1542,8 +1559,7 @@ def deal_with_value_beside_a_half_cent(rng, side) -> tuple[DealInputs, Fraction]
     adjustments.append({"label": "Synthetic unsupported", "amount": "1000", "evidence_id": None})
     other = rng.randint(0, multiple) if rng.random() < 0.5 else rng.randint(multiple, 100 * 10**12)
     low, high = sorted([multiple, other])
-    deal = DealInputs(
-        **DEAL,
+    deal = deal_inputs(
         annual_revenue="1000000000000",
         reported_ebitda=dec(reported),
         adjustments=adjustments,
@@ -1601,8 +1617,7 @@ def random_deal(rng, wide: bool) -> DealInputs:
     senior = share(min(total * Fraction(3, 5), Fraction(10**12)))
     seller = share(min(total - Fraction(senior), Fraction(10**12)))
     low = amount(20, rng.choice([0, 2, 12]) if wide else 1)
-    return DealInputs(
-        **DEAL,
+    return deal_inputs(
         annual_revenue=revenue,
         reported_ebitda=reported,
         adjustments=adjustments,
@@ -1640,6 +1655,7 @@ def test_random_deals_are_exact_in_every_figure(wide):
 TIE_REQUEST = {
     "target": "Synthetic",
     "thesis": "Synthetic testing",
+    **REQUIRED_FIGURES,
     "senior_debt": "100000",
     "debt_rate": "0",
     "debt_years": 6,
@@ -1671,10 +1687,10 @@ def test_cash_after_debt_service_of_exactly_zero_is_not_a_shortfall():
     # 0.01 / 3 + 0.035 / 3 = 0.015 exactly, and cash available is 0.015 with no tax, capex or interest.
     loans = {"senior_debt": "0.01", "seller_note": "0.035", "debt_rate": "0", "seller_rate": "0"}
     body = {**DEAL, **loans, "debt_years": 3, "seller_years": 3, "annual_capex": "0", "tax_rate": "0"}
-    base = assert_exact(DealInputs(**body, reported_ebitda="0.015"))["scenarios"]["base"]
+    base = assert_exact(DealInputs(**(body | {"reported_ebitda": "0.015"})))["scenarios"]["base"]
     assert base["cash_after_debt_service"] == "0.00" and base["cash_shortfall"] is False
     assert base["coverage_ratio"] == "1.0000"
-    base = assert_exact(DealInputs(**body, reported_ebitda="0.014999999999"))["scenarios"]["base"]
+    base = assert_exact(DealInputs(**(body | {"reported_ebitda": "0.014999999999"})))["scenarios"]["base"]
     assert base["cash_after_debt_service"] == "0.00" and base["cash_shortfall"] is True
     assert base["coverage_ratio"] == "1.0000"
 
@@ -1686,6 +1702,7 @@ def synthetic(**fields):
     return {
         "target": "Synthetic target",
         "thesis": "Synthetic thesis for a probe.",
+        **REQUIRED_FIGURES,
         "multiple_low": "3",
         "multiple_high": "5",
         "tax_rate": "0.000000000001",
@@ -1892,13 +1909,13 @@ def step_digits(inputs: DealInputs, verified=REVIEWED) -> dict:
 
 
 def test_witnesses_reach_the_stated_digit_bounds():
-    found = [step_digits(DealInputs(**DEAL, **w)) for w in DIGIT_WITNESSES.values()]
+    found = [step_digits(deal_inputs(**w)) for w in DIGIT_WITNESSES.values()]
     assert {k: max(f[k] for f in found) for k in STEP_DIGITS} == STEP_DIGITS
 
 
 def digit_bound_cases():
-    yield from (DealInputs(**DEAL, **w) for w in DIGIT_WITNESSES.values())
-    yield from (DealInputs(**DEAL, **c) for c in DEAL_CORNERS.values())
+    yield from (deal_inputs(**w) for w in DIGIT_WITNESSES.values())
+    yield from (deal_inputs(**c) for c in DEAL_CORNERS.values())
     for wide in (False, True):
         rng = random.Random(20261208 + wide)
         yield from (random_deal(rng, wide) for _ in range(100))
@@ -1913,7 +1930,7 @@ def test_no_accepted_input_exceeds_the_stated_digit_bounds():
 
 def test_exceeding_a_digit_bound_is_caught():
     # A 13-place rate, which validation refuses, needs one digit more for the interest than the stated bound.
-    inputs = DealInputs(**DEAL, **DIGIT_WITNESSES["negative"])
+    inputs = deal_inputs(**DIGIT_WITNESSES["negative"])
     over = inputs.model_copy(update={"debt_rate": D("0.9999999999999")})
     assert step_digits(inputs)["interest"] == STEP_DIGITS["interest"] < step_digits(over)["interest"]
 
@@ -1923,7 +1940,7 @@ def test_exceeding_a_digit_bound_is_caught():
 
 def test_largest_and_smallest_accepted_coverage_are_exact():
     # Most negative: downside cash of −1.051E+12 − 1E+11 − 2E+12 = −3.151E+12 over 1E-12 / 30 a year.
-    smallest = assert_exact(DealInputs(**DEAL, **DEAL_CORNERS["largest_coverage"]))["scenarios"]["downside"]
+    smallest = assert_exact(deal_inputs(**DEAL_CORNERS["largest_coverage"]))["scenarios"]["downside"]
     assert smallest["coverage_ratio"] == "-94530000000000000000000000.0000"
     # Most positive: upside cash of 51 × 1E+9 + 5% of 1E+12 = 1.01E+11 over the same payment.
     largest = {
@@ -1936,14 +1953,14 @@ def test_largest_and_smallest_accepted_coverage_are_exact():
         "senior_debt": TINY,
         "debt_years": 30,
     }
-    upside = assert_exact(DealInputs(**DEAL, **largest))["scenarios"]["upside"]
+    upside = assert_exact(deal_inputs(**largest))["scenarios"]["upside"]
     assert upside["coverage_ratio"] == "3030000000000000000000000.0000"
     # At these sizes the fourth place still counts: a 1E-12 rate and cash with 36 places.
     for name, changes in {
         "smallest": DEAL_CORNERS["largest_coverage"] | {"debt_rate": TINY},
         "largest": largest | {"debt_rate": TINY, "tax_rate": TINY, "annual_capex": TINY},
     }.items():
-        result = assert_exact(DealInputs(**DEAL, **changes))
+        result = assert_exact(deal_inputs(**changes))
         coverage = result["scenarios"]["downside" if name == "smallest" else "upside"]["coverage_ratio"]
         assert len(coverage.lstrip("-").split(".")[0]) == (26 if name == "smallest" else 25)
         assert coverage[-4:] != "0000"

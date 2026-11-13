@@ -2641,8 +2641,14 @@ function inspPlan(p) {
   if (evidence.length) out += sec('Evidence', attList(evidence));
   return out;
 }
+/* What a deal with no senior debt and no seller note says, as the investment memo says it. The model's
+   example loans are zero, so its empty coverage reads as intended, not missing. */
+const NO_DEBT =
+  'No debt was given and none was assumed, so the deal is screened as bought without debt. There is no debt service: cash after debt service equals cash available, and there is no coverage ratio.';
 function inspDeal(o) {
   const a = o.data.analysis;
+  const inputs = o.data.inputs || {};
+  const noDebt = decimalKey(inputs.senior_debt) === '0' && decimalKey(inputs.seller_note) === '0';
   const line = M.lines.find((l) => l.dealId === o.id);
   let out = head({
     kicker: 'Acquisition analysis',
@@ -2661,8 +2667,9 @@ function inspDeal(o) {
   out += `<p class="prose spaced">${h(o.data.inputs.thesis)}</p>`;
   out += sec(
     'Key figures',
-    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div><div>Buyer equity required</div><div class="v">${money(a.sources_and_uses.buyer_equity_required)}</div><div>Annual debt service</div><div class="v">${money(a.annual_debt_service)}</div></div><p class="fine">${CALC_NOTE}</p>`,
+    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div><div>Buyer equity required</div><div class="v">${money(a.sources_and_uses.buyer_equity_required)}</div><div>Annual debt service</div><div class="v">${noDebt ? 'None' : money(a.annual_debt_service)}</div></div>${noDebt ? `<p class="fine no-debt">${NO_DEBT}</p>` : ''}<p class="fine">${CALC_NOTE}</p>`,
   );
+  out += sec('Inputs not given', `<p class="fine assumed-inputs">${assumedText(o)}</p>`);
   out += sec(
     'Cases',
     `<div class="tbl-wrap stack"><table><thead><tr><th>Case</th><th class="num">EBITDA</th><th class="num">Cash after debt service</th><th class="num">Coverage ratio</th></tr></thead><tbody>${Object.entries(
@@ -4101,44 +4108,159 @@ function forecastDialog() {
     selectAfter('money', 'plan:'),
   );
 }
+/* The analysis form's figures: [field, label, the model's example value, how the deal page names the
+   value]. The first three describe the target and its price and are required; no example stands in for
+   them, and their examples are only placeholder text. Every other field may be left empty: it is then
+   left out of the request, the server uses the example value and records the field in assumed_inputs. */
+const DEAL_REQUIRED = ['annual_revenue', 'reported_ebitda', 'purchase_price'];
+const DEAL_WHOLE = ['debt_years', 'seller_years'];
+/* The two loans. Financing is the buyer's choice, so an empty loan is no loan: its example is zero. */
+const DEAL_LOANS = ['senior_debt', 'seller_note'];
+const DEAL_LOAN_TERMS = ['debt_rate', 'debt_years', 'seller_rate', 'seller_years'];
+const dealYears = (v) => `${h(v)} years`;
+const dealMultiple = (v) => `${ratio(v)}×`;
+const dealRate = (v) =>
+  noMarkup(
+    new Intl.NumberFormat(undefined, {
+      style: 'percent',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(String(v)),
+  );
 const dealFields = [
-  ['annual_revenue', 'Annual revenue', 1000000],
-  ['reported_ebitda', 'Reported EBITDA', 200000],
-  ['replacement_management', 'Annual replacement management cost', 0],
-  ['multiple_low', 'Low EBITDA multiple', 3],
-  ['multiple_high', 'High EBITDA multiple', 5],
-  ['purchase_price', 'Negotiated purchase consideration', 800000],
-  ['fees', 'Transaction fees', 30000],
-  ['working_capital', 'Working capital funding', 50000],
-  ['integration_cost', 'Integration costs', 0],
-  ['senior_debt', 'New senior debt', 400000],
-  ['debt_rate', 'Senior annual interest rate', 0.09],
-  ['debt_years', 'Senior term (years)', 7],
-  ['seller_note', 'Seller financing', 0],
-  ['seller_rate', 'Seller annual interest rate', 0.06],
-  ['seller_years', 'Seller term (years)', 5],
-  ['annual_capex', 'Annual maintenance capex', 15000],
-  ['annual_working_capital_growth', 'Annual working capital increase', 0],
-  ['tax_rate', 'Assumed tax rate', 0.25],
-  ['cash_acquired', 'Cash in valuation equity bridge', 0],
-  ['debt_assumed', 'Debt in valuation equity bridge', 0],
+  ['annual_revenue', 'Annual revenue', 1000000, money],
+  ['reported_ebitda', 'Reported EBITDA', 200000, money],
+  ['replacement_management', 'Annual replacement management cost', 0, money],
+  ['multiple_low', 'Low EBITDA multiple', 3, dealMultiple],
+  ['multiple_high', 'High EBITDA multiple', 5, dealMultiple],
+  ['purchase_price', 'Negotiated purchase consideration', 800000, money],
+  ['fees', 'Transaction fees', 30000, money],
+  ['working_capital', 'Working capital funding', 50000, money],
+  ['integration_cost', 'Integration costs', 0, money],
+  ['senior_debt', 'New senior debt', 0, money],
+  ['debt_rate', 'Senior annual interest rate', 0.09, dealRate],
+  ['debt_years', 'Senior term (years)', 7, dealYears],
+  ['seller_note', 'Seller financing', 0, money],
+  ['seller_rate', 'Seller annual interest rate', 0.06, dealRate],
+  ['seller_years', 'Seller term (years)', 5, dealYears],
+  ['annual_capex', 'Annual maintenance capex', 15000, money],
+  ['annual_working_capital_growth', 'Annual working capital increase', 0, money],
+  ['tax_rate', 'Assumed tax rate', 0.25, dealRate],
+  ['cash_acquired', 'Cash in valuation equity bridge', 0, money],
+  ['debt_assumed', 'Debt in valuation equity bridge', 0, money],
 ];
+/* The inputs a saved analysis did not give, in plain words, as the investment memo says them. An
+   analysis saved before the list was recorded has none: that is "not recorded", never "none
+   assumed". */
+function assumedText(o) {
+  const assumed = o.data.assumed_inputs,
+    inputs = o.data.inputs || {};
+  if (!Array.isArray(assumed))
+    return "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.";
+  if (!assumed.length) return 'Every input was given. The model used none of its example values.';
+  const parts = assumed.map((k) => {
+    const f = dealFields.find((x) => x[0] === k);
+    const name = f ? f[1].replace(' (years)', '') : String(k);
+    return k in inputs ? `${h(name)} ${(f ? f[3] : h)(inputs[k])}` : h(name);
+  });
+  return "Not given, so the model's example value was used: " + parts.join('; ') + '.';
+}
+/* The example values DealInputs had on main until the three figures were required and the example loans
+   were zero: src/foundry/models.py at e2317d3, the same values in every earlier commit. An analysis saved
+   then has no assumed_inputs, and holds one of these wherever its figure was left out. The tests check
+   them against that commit and against today's model. */
+const DEAL_EXAMPLES_BEFORE_LIST = {
+  annual_revenue: '1000000',
+  reported_ebitda: '200000',
+  replacement_management: '0',
+  multiple_low: '3',
+  multiple_high: '5',
+  purchase_price: '800000',
+  fees: '30000',
+  working_capital: '50000',
+  integration_cost: '0',
+  senior_debt: '400000',
+  debt_rate: '0.09',
+  debt_years: '7',
+  seller_note: '0',
+  seller_rate: '0.06',
+  seller_years: '5',
+  annual_capex: '15000',
+  annual_working_capital_growth: '0',
+  tax_rate: '0.25',
+  cash_acquired: '0',
+  debt_assumed: '0',
+};
+/* The loan whose rate or term each loan-term field is. */
+const DEAL_TERM_LOAN = {
+  debt_rate: 'senior_debt',
+  debt_years: 'senior_debt',
+  seller_rate: 'seller_note',
+  seller_years: 'seller_note',
+};
+/* What the form shows for a field when it is opened again from an earlier analysis. A field that
+   analysis gave is filled in. One it recorded as assumed starts empty, so it is not sent as the
+   founder's own. A loan's rate and term start empty whenever that loan was zero in the analysis or
+   starts empty itself: they were not used, and the stored record cannot tell a term that was given
+   from one that was not, so they are either typed again or, when a loan is entered, recorded as
+   assumed. For an analysis saved before the list was recorded, a figure equal to the model's example
+   value, today's or the one it had when the analysis was saved, cannot be told apart from an assumed
+   one and starts empty; a figure that differs from both must have been given and is filled in. */
+function dealStart(d, assumed, k) {
+  if (!(k in d)) return '';
+  const loan = DEAL_TERM_LOAN[k];
+  if (loan && (decimalKey(d[loan]) === '0' || dealStart(d, assumed, loan) === '')) return '';
+  if (Array.isArray(assumed)) return assumed.includes(k) ? '' : d[k];
+  const same = decimalKey(d[k]);
+  if (same === null) return d[k];
+  const examples = [dealFields.find((f) => f[0] === k)?.[2], DEAL_EXAMPLES_BEFORE_LIST[k]];
+  return examples.some((e) => e !== undefined && decimalKey(e) === same) ? '' : d[k];
+}
+/* A decimal string or number in one canonical form, so equal values compare equal exactly: "30000",
+   "30000.00" and "3E+4" all give the same key. Anything that is not a decimal gives null. */
+function decimalKey(v) {
+  const m = /^\s*([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?\s*$/.exec(String(v ?? ''));
+  if (!m || !(m[2] || m[3])) return null;
+  let digits = ((m[2] || '') + (m[3] || '')).replace(/^0+/, '');
+  let exp = Number(m[4] || 0) - (m[3] || '').length;
+  if (!digits) return '0';
+  while (digits.endsWith('0')) {
+    digits = digits.slice(0, -1);
+    exp += 1;
+  }
+  return (m[1] === '-' ? '-' : '') + digits + 'e' + exp;
+}
 function dealDialog(id) {
-  const d = id ? find(id).data.inputs : {};
+  const o = id ? find(id) : null;
+  const d = o ? o.data.inputs : {};
+  const assumed = o ? o.data.assumed_inputs : [];
+  const unrecorded = o && !Array.isArray(assumed);
   formDialog(
     'Analyze an acquisition',
     input('target', 'Target business', d.target || '', 'text', '', 'required') +
       evidenceSelect('evidence_ids', 'Source evidence', d.evidence_ids || []) +
       area('thesis', 'Investment thesis', d.thesis || '') +
+      (unrecorded
+        ? `<p class="hint full">This analysis was saved before Foundry recorded which figures were given. A figure equal to the model's example value, today's or the one it had then, is left empty, and so are the rate and term of a loan left empty; enter them again if they are yours.</p>`
+        : '') +
       dealFields
-        .map(([k, t, v]) =>
+        .map(([k, t, example]) =>
           input(
             k,
             t,
-            d[k] ?? v,
+            dealStart(d, assumed, k),
             'number',
-            k.includes('rate') ? 'Decimal rate: 0.09 means 9%.' : '',
-            'step="any" required',
+            DEAL_REQUIRED.includes(k)
+              ? 'Required.'
+              : DEAL_LOANS.includes(k)
+                ? 'Leave empty for no loan.'
+                : DEAL_LOAN_TERMS.includes(k)
+                  ? (k.includes('rate') ? 'Decimal rate: 0.09 means 9%. ' : '') +
+                    'Used only when its loan is entered. Leave empty to use the example.'
+                  : k.includes('rate')
+                    ? 'Decimal rate: 0.09 means 9%. Leave empty to use the example.'
+                    : 'Leave empty to use the example.',
+            `step="any" placeholder="${DEAL_LOANS.includes(k) ? 'Empty: no loan' : `Example: ${example}`}"${DEAL_REQUIRED.includes(k) ? ' required' : ''}`,
           ),
         )
         .join('') +
@@ -4150,8 +4272,11 @@ function dealDialog(id) {
         evidence_ids: f.getAll('evidence_ids'),
         adjustments: d.adjustments || [],
       };
-      for (const [k] of dealFields)
-        body[k] = ['debt_years', 'seller_years'].includes(k) ? Number(f.get(k)) : f.get(k);
+      // An empty figure is left out, so the server records it as assumed rather than as given.
+      for (const [k] of dealFields) {
+        const raw = String(f.get(k) ?? '').trim();
+        if (raw !== '') body[k] = DEAL_WHOLE.includes(k) ? Number(raw) : raw;
+      }
       if (f.get('adjustment_label'))
         body.adjustments = [
           ...body.adjustments,
@@ -4164,7 +4289,7 @@ function dealDialog(id) {
       return post(scope.bid, '/deals', body, key);
     },
     'Calculate and create diligence work',
-    'Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
+    'Revenue, reported EBITDA and the purchase consideration are required. An empty loan is no loan: the deal is screened without debt unless you enter one. Any other figure left empty uses the example value shown, and the analysis lists it as not given. Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
     selectAfter('deals', 'deal:'),
   );
 }

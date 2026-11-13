@@ -398,7 +398,13 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
 
     @app.post("/api/businesses/{bid}/deals", status_code=201)
     def deal(bid: str, body: models.DealInputs, who=Depends(actor), command=Depends(key)):
-        return service.save_deal(who, bid, command, body.model_dump(mode="json"))
+        """Screen an acquisition and create its diligence steps.
+
+        annual_revenue, reported_ebitda and purchase_price are required. Every other figure left out
+        takes the model's example value, and the deal lists it in data.assumed_inputs, in field order.
+        """
+        # Only the fields the client sent: the service records every figure left out as assumed.
+        return service.save_deal(who, bid, command, body.model_dump(mode="json", exclude_unset=True))
 
     @app.post("/api/businesses/{bid}/documents", status_code=201)
     def document(bid: str, body: models.DocumentCreate, who=Depends(actor), command=Depends(key)):

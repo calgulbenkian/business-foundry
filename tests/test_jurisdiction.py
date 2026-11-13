@@ -545,7 +545,14 @@ def test_acquisition_business_keeps_its_deal_steps_and_reopens_completed_ones(se
         owner,
         bid,
         key(),
-        dump(models.DealInputs, target="Synthetic target", thesis="A synthetic deal thesis."),
+        dump(
+            models.DealInputs,
+            target="Synthetic target",
+            thesis="A synthetic deal thesis.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+        ),
     )
     deals = deal_steps(service, owner, bid)
     assert len(deals) == 7
@@ -593,7 +600,14 @@ def test_deal_steps_are_never_superseded_even_with_package_keys(setup, monkeypat
         owner,
         bid,
         key(),
-        dump(models.DealInputs, target="Synthetic target", thesis="A synthetic deal thesis."),
+        dump(
+            models.DealInputs,
+            target="Synthetic target",
+            thesis="A synthetic deal thesis.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+        ),
     )
     deals = deal_steps(service, owner, bid)
     core = live_core(service, owner, bid)
@@ -721,7 +735,14 @@ def preview_fixture(service, owner, start):
         owner,
         bid,
         key(),
-        dump(models.DealInputs, target="Synthetic target", thesis="A synthetic deal thesis."),
+        dump(
+            models.DealInputs,
+            target="Synthetic target",
+            thesis="A synthetic deal thesis.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
+        ),
     )
     core = live_core(service, owner, bid)
     move(service, owner, bid, core["structure"], "not_applicable", [evidence])
@@ -1245,8 +1266,10 @@ FORECAST_SAVED_UNDER = (
     "This forecast was saved while the planning jurisdiction was {saved}. It is now {now}. "
     "Check its assumptions, the tax rate among them, and save a revised forecast before relying on these figures."
 )
-# What a deal and a forecast row held before this round; it adds no stored field.
-DEAL_FIELDS = {"inputs", "analysis", "evidence_ids", "evidence_versions"}
+# What a deal and a forecast row hold. The jurisdiction round added no stored field. A deal has held
+# assumed_inputs since a later round; tests/test_deal_inputs.py checks that a deal stored without it,
+# as earlier code wrote it, still loads and is still marked after a jurisdiction change.
+DEAL_FIELDS = {"inputs", "assumed_inputs", "analysis", "evidence_ids", "evidence_versions"}
 FORECAST_FIELDS = {
     "model_version",
     "inputs",
@@ -1289,6 +1312,9 @@ def save_deal(service, actor, bid, target="Synthetic target", evidence=()):
             models.DealInputs,
             target=target,
             thesis="A synthetic deal thesis.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
             evidence_ids=[e["id"] for e in evidence],
         ),
     )

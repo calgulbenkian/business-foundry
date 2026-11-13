@@ -176,6 +176,9 @@ def compact(tmp_path_factory):
             models.DealInputs,
             target="Corner shop",
             thesis="A synthetic target.",
+            annual_revenue=1000000,
+            reported_ebitda=200000,
+            purchase_price=800000,
             adjustments=[
                 {"label": "Owner salary", "amount": 1000, "evidence_id": interview["id"]},
                 {"label": "Unsupported add-back", "amount": 500},
