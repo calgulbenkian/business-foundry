@@ -312,6 +312,22 @@ def test_a_failed_write_to_the_output_does_not_stop_the_server(tmp_path):
     assert run.err.getvalue() == ""
 
 
+def test_the_running_server_listens_on_127_0_0_1_only(tmp_path):
+    """Read the address of every socket the running server listens on.
+
+    The address is written out here rather than taken from cli.START_HOST, so a change to
+    that constant fails this test too. It reads the sockets themselves, so it does not
+    depend on which other network interfaces the machine has.
+    """
+    with Running(tmp_path / "foundry.db", empty=True, browser=False) as run:
+        listening = [sock for server in run.server.servers for sock in server.sockets]
+        assert listening, "the server reported no listening socket"
+        for sock in listening:
+            assert sock.family == socket.AF_INET
+            assert sock.getsockname() == ("127.0.0.1", run.port)
+        assert f"Open this address in your web browser: http://127.0.0.1:{run.port}" in run.out.getvalue()
+
+
 @pytest.mark.parametrize("words", [["--host", "0.0.0.0"], ["--host=0.0.0.0"]], ids=["separate", "joined"])
 def test_start_has_no_host_option(tmp_path, monkeypatch, capsys, words):
     """`start` listens on 127.0.0.1 only; an option to choose another address is refused."""
