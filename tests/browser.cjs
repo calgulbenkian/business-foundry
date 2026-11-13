@@ -889,7 +889,15 @@ async function main() {
     assert.equal(dealPosts.length, 0, 'nothing is sent while a required figure is empty');
     await dealField('purchase_price').fill('700000');
     await dealField('debt_years').fill('6');
-    await submit('Calculate and create diligence work');
+    // What was sent is checked before the save is awaited, so a wrong body fails here by name.
+    const posted = page.waitForRequest(
+      (r) => r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/deals'),
+    );
+    await page
+      .locator('#dialog')
+      .getByRole('button', { name: 'Calculate and create diligence work', exact: true })
+      .click();
+    await posted;
     page.off('request', onDealPost);
     assert.equal(dealPosts.length, 1);
     const sentDeal = dealPosts[0];
@@ -900,6 +908,7 @@ async function main() {
     assert.equal(sentDeal.debt_years, 6, 'a filled term is sent as a number');
     for (const name of ['fees', 'seller_years', 'tax_rate'])
       assert(!(name in sentDeal), name + ' was left empty and is not sent');
+    await saved();
     const browserDeal = (
       await (await context.request.get(origin + '/api/businesses/' + bid)).json()
     ).objects.find((o) => o.kind === 'deal' && o.title === 'Browser synthetic target');
