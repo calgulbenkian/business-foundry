@@ -3789,6 +3789,111 @@ def test_known_limit_export_orders_ai_review_dates_as_binary_text(setup, first_d
     assert exported_archive(service, actor, bid)["ai_runs"] == expected
 
 
+# Whole review data of every other kind: a string with surrounding space and non-ASCII text, true, a
+# fraction, a whole number written as a float, a negative integer, a list with a repeated item and a
+# nested list, and a list of objects. Each case gives the text stored, the value the export carries
+# and that value written as JSON. Python compares True equal to 1 and 1.0 equal to 1, so the exported
+# data is also compared as JSON text.
+WHOLE_AI_DATA_OF_OTHER_KINDS = [
+    pytest.param(
+        '"  Synthetic advice for Zoë\'s café.  "',
+        "  Synthetic advice for Zoë's café.  ",
+        '"  Synthetic advice for Zo\\u00eb\'s caf\\u00e9.  "',
+        id="string",
+    ),
+    pytest.param("true", True, "true", id="true"),
+    pytest.param("1.5", 1.5, "1.5", id="fraction"),
+    pytest.param("1.0", 1.0, "1.0", id="whole-float"),
+    pytest.param("-7", -7, "-7", id="negative-integer"),
+    pytest.param(
+        '["zulu","alpha","zulu",["b","a"]]',
+        ["zulu", "alpha", "zulu", ["b", "a"]],
+        '["zulu", "alpha", "zulu", ["b", "a"]]',
+        id="list",
+    ),
+    pytest.param('[{"b":1},{"a":2}]', [{"b": 1}, {"a": 2}], '[{"b": 1}, {"a": 2}]', id="list-of-objects"),
+]
+
+
+# Rule: a review whose whole data is a string, true, a number or a non-empty list, with a matching
+# event, is clean, and the export carries that value exactly as stored. Neither the audit nor the
+# export strips, cuts or changes the case of a string, reads true as 1, changes a number's type or
+# rounds it, or sorts, reverses, cuts, de-duplicates or flattens a list.
+@pytest.mark.parametrize(("stored", "value", "as_json"), WHOLE_AI_DATA_OF_OTHER_KINDS)
+def test_ai_review_data_of_any_other_kind_with_matching_history_is_clean_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, data=value)
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == stored
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is changed by SQL from ordinary data to a string, true, a number or
+# a non-empty list is reported, and the export carries that value exactly as stored.
+@pytest.mark.parametrize(("stored", "value", "as_json"), WHOLE_AI_DATA_OF_OTHER_KINDS)
+def test_ai_review_data_changed_to_a_value_of_any_other_kind_is_reported_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    with store.write() as con:
+        assert con.execute("UPDATE ai_calls SET data=? WHERE id='review_synthetic'", (stored,)).rowcount == 1
+    plain = audited(service, actor, bid)
+    assert plain["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert plain["valid"] is False
+    archive = exported_archive(service, actor, bid)
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+    runs = archive["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is a list, rewritten by SQL only in form (other spacing), is clean:
+# the audit compares the value the text holds, not the text. The export carries that value.
+def test_ai_review_data_that_is_a_list_rewritten_only_in_form_is_clean_and_exported_as_its_value(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, data=["zulu", "alpha", "zulu", ["b", "a"]])
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET data=? WHERE id='review_synthetic'",
+                ('[ "zulu" ,"alpha",\n"zulu",[ "b","a" ] ]',),
+            ).rowcount
+            == 1
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": ["zulu", "alpha", "zulu", ["b", "a"]],
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == '["zulu", "alpha", "zulu", ["b", "a"]]'
+
+
 def test_export_digest_covers_the_archive_with_its_ai_review(setup):
     store, service, actor, bid, _ = setup
     add_ai_review(store, actor, bid)
