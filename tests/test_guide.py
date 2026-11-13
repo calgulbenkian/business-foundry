@@ -280,6 +280,13 @@ def test_an_acquisition_path_ticks_off_stop_by_stop_and_reopens_with_a_new_fact(
     thesis = move(service, owner, bid, thesis, "approved", [listing["id"]])
     guide = service.guide(owner, bid)
     assert done(guide) == [True] * 5 and guide["path"]["complete"]
+    # The decide stop says the checks cannot be approved until the thesis is finished, not just approved.
+    assert guide["path"]["stops"][4]["why"] == (
+        "The checks on the books and the contracts cannot be approved until this step is finished: "
+        "verified, or ruled out as not applicable. Decide here before you pay anyone for those checks."
+    )
+    for title in ("Reconcile earnings and working capital", "Review liabilities and transfer rights"):
+        assert step(guide, title)["blockers"] == ["Complete: Approve the acquisition thesis"]
     # the path is done; the approved thesis now waits on the owner to verify it
     assert (guide["next"]["from"], guide["next"]["label"]) == (
         "waiting_on_you",
@@ -626,3 +633,173 @@ def test_a_viewer_is_offered_no_stop_of_the_path(setup):
     assert [s["waiting_on"] for s in guide["path"]["stops"]] == [None] + [
         "You can read this business. A person who can write to it takes this step."
     ] * 4
+
+
+def test_a_second_analysis_moves_the_path_and_the_lines_to_the_newest_deal(setup):
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    review(service, owner, bid, evidence(service, owner, bid))
+    first = deal(service, owner, bid)
+    second = service.save_deal(
+        owner,
+        bid,
+        key(),
+        models.DealInputs(
+            target="Juniper Street Laundry · second offer",
+            thesis="Synthetic thesis: the same laundromat at a lower price.",
+            annual_revenue="210000",
+            reported_ebitda="62000",
+            purchase_price="150000",
+        ).model_dump(mode="json", exclude_unset=True),
+    )
+    theses = [
+        o
+        for o in service.snapshot(owner, bid)["objects"]
+        if o["kind"] == "task" and o["data"].get("key") == "mandate" and live(o)
+    ]
+    assert [t["data"]["deal_id"] for t in theses] == [first["id"], second["id"]]
+    old, new = theses
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True, True, True, True, False]
+    # stop 4 offers nothing more and stop 5 is the newest analysis's thesis, not the first one's
+    assert guide["path"]["stops"][3]["action"] is None
+    assert guide["path"]["stops"][4]["steps"] == [new["id"]]
+    assert guide["next"] == {
+        "from": "path",
+        "stop": 5,
+        "task_id": None,
+        "action": {
+            "do": "transition",
+            "task_id": new["id"],
+            "to": "in_progress",
+            "label": "Start work on Approve the acquisition thesis",
+        },
+        "label": "Start work on Approve the acquisition thesis",
+        "why": None,
+    }
+    # each analysis has its own Acquisition line; the path's stop is on the newest one's
+    rows = [x for x in guide["lines"] if x["category"] == "Acquisition"]
+    assert [(x["deal_id"], x["deal_title"], x["stop"], x["status"]) for x in rows] == [
+        (first["id"], "Juniper Street Laundry", None, "ready"),
+        (second["id"], "Juniper Street Laundry · second offer", 5, "your_move"),
+    ]
+    assert rows[0]["next"]["task_id"] == old["id"]
+    assert rows[1]["next"]["task_id"] == new["id"]
+
+    # Approving the newest thesis finishes the path, though the first analysis's thesis is not started.
+    reviewed = review(service, owner, bid, evidence(service, owner, bid, "Lease summary · synthetic"))
+    new = move(service, owner, bid, new, "prepared", [reviewed["id"]])
+    move(service, owner, bid, new, "approved", [reviewed["id"]])
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True] * 5
+    assert step(guide, "Approve the acquisition thesis")["state"] == "pending"
+
+
+def submitted_registration(service, owner, bid):
+    """The demo with one external step submitted and every other unfinished step ruled out."""
+    receipt = service.add_evidence(
+        owner,
+        bid,
+        key(),
+        data(
+            models.EvidenceCreate,
+            title="Registration receipt · synthetic",
+            content="SYNTHETIC confirmation that a registration was received.",
+            source_type="external_receipt",
+        ),
+    )
+    receipt = review(service, owner, bid, receipt)
+    registration = task(service, owner, bid, "Verify applicable registrations")
+    for state in ("needs_review", "prepared", "approved", "submitted"):
+        registration = move(service, owner, bid, registration, state, [receipt["id"]])
+    # Reopening the registration reopens the steps that relied on it; rule out every step left.
+    for _ in range(3):
+        for t in service.snapshot(owner, bid)["objects"]:
+            if t["kind"] != "task" or not live(t) or t["id"] == registration["id"]:
+                continue
+            if t["state"] in {"verified", "not_applicable"}:
+                continue
+            if t["state"] in {"approved", "submitted"}:
+                t = move(service, owner, bid, t, "needs_review")
+            move(service, owner, bid, t, "not_applicable", [receipt["id"]])
+    left = [
+        t["id"]
+        for t in service.snapshot(owner, bid)["objects"]
+        if t["kind"] == "task" and live(t) and t["state"] not in {"verified", "not_applicable"}
+    ]
+    assert left == [registration["id"]]
+    return registration, receipt
+
+
+def test_a_submitted_step_is_the_next_action_for_whoever_can_add_its_receipt(setup):
+    store, service, owner, _, owner_token = setup
+    bid = seed(service, owner)["id"]
+    registration, receipt = submitted_registration(service, owner, bid)
+    made = {
+        role: service.add_principal(owner, {"name": f"Receipt {role}", "role": role, "business_ids": [bid]})[
+            "token"
+        ]
+        for role in ("reviewer", "operator", "agent", "viewer")
+    }
+    guides = {
+        role: guide_as(store, token, bid).json() for role, token in {"owner": owner_token, **made}.items()
+    }
+    rid = registration["id"]
+    verify = {
+        "do": "transition",
+        "task_id": rid,
+        "to": "verified",
+        "label": "Add the receipt for Verify applicable registrations",
+    }
+    for role, guide in guides.items():
+        assert guide["path"]["complete"], role
+        explained = step(guide, "Verify applicable registrations")
+        # Today's rule is unchanged: a submitted step waits on the outside body, never on you
+        assert explained["your_move"] is None, role
+        assert explained["why"] == ["It was submitted and waits for the outside body's receipt."], role
+        setup_line = line(guide, "Setup")
+        assert (setup_line["status"], setup_line["stop"], setup_line["focus"]["id"]) == (
+            "waiting",
+            None,
+            rid,
+        ), role
+        assert [x["status"] for x in guide["lines"] if x["category"] != "Setup"] == ["done"] * 7, role
+    # An owner and a reviewer can add the receipt: it is their next action, last of all kinds.
+    for role in ("owner", "reviewer"):
+        guide = guides[role]
+        assert guide["next"] == {
+            "from": "receipt",
+            "stop": None,
+            "task_id": rid,
+            "action": verify,
+            "label": "Add the receipt for Verify applicable registrations",
+            "why": "Verify applicable registrations is with the outside body: add their receipt when it "
+            "arrives.",
+        }, role
+        explained = step(guide, "Verify applicable registrations")
+        assert (explained["next"], explained["waiting_on"]) == (verify, None), role
+        assert line(guide, "Setup")["next"] == verify, role
+    # An operator and an agent cannot verify it: nothing is offered, and what they are told is true.
+    for role in ("operator", "agent"):
+        guide = guides[role]
+        assert guide["next"] == {
+            "from": None,
+            "stop": None,
+            "task_id": None,
+            "action": None,
+            "label": "Nothing is waiting on you",
+            "why": "Every step left waits on another step, or on someone else.",
+        }, role
+        explained = step(guide, "Verify applicable registrations")
+        assert (explained["next"], explained["waiting_on"]) == (
+            None,
+            "It waits on the outside body's receipt, then an owner or reviewer to verify it.",
+        ), role
+        assert line(guide, "Setup")["next"] is None, role
+    assert guides["viewer"]["next"]["label"] == "Nothing here is yours to do"
+    assert line(guides["viewer"], "Setup")["next"] is None
+    # The move the guide offers is one the service accepts; then nothing is left to do.
+    move(service, owner, bid, registration, "verified", [receipt["id"]])
+    guide = service.guide(owner, bid)
+    assert (guide["next"]["from"], guide["next"]["label"]) == (None, "Nothing is waiting on you")
+    assert line(guide, "Setup")["status"] == "done"

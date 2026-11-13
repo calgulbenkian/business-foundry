@@ -209,6 +209,13 @@ def step_next(task, items, actor):
     return {"do": "transition", "task_id": task["id"], "to": to, "label": move_label(task, to)}
 
 
+def receipt_why(task, items):
+    """Why a submitted step is the next action: it is with the outside body until their receipt arrives."""
+    why = f"{task['title']} is with the outside body: add their receipt when it arrives."
+    # A prerequisite reopened after it was submitted: the action is to finish that first, and it says so.
+    return " ".join([why, blocker_why(items[0])]) if items else why
+
+
 def explain_step(task, items, actor):
     why = [blocker_why(i) for i in items]
     unlocks = [blocker_unlock(i) for i in items]
@@ -279,6 +286,9 @@ def build_guide(snapshot, items, actor):
     ready = [t for t in ready if t["data"].get("category") == first_line] + [
         t for t in ready if t["data"].get("category") != first_line
     ]
+    # A submitted step waits on the outside body, so Today does not count it as waiting on you. Once its
+    # receipt arrives an owner or reviewer adds it, so it comes last: every other action can be taken now.
+    receipts = [t for t in tasks if t["state"] == "submitted" and steps[t["id"]]["next"]]
 
     def stop_on(line):
         stop = first_open
@@ -292,6 +302,7 @@ def build_guide(snapshot, items, actor):
         stop = stop_on(line)
         yours = next((t for t in mine if t["id"] in ids), None)
         start = next((t for t in ready if t["id"] in ids), None)
+        receipt = next((t for t in receipts if t["id"] in ids), None)
         open_tasks = [t for t in line["tasks"] if t["state"] not in FINISHED]
         if stop:
             status, action, focus = "your_move", stop["action"], None
@@ -299,6 +310,8 @@ def build_guide(snapshot, items, actor):
             status, action, focus = "your_move", steps[yours["id"]]["next"], yours
         elif start:
             status, action, focus = "ready", steps[start["id"]]["next"], start
+        elif receipt:
+            status, action, focus = "waiting", steps[receipt["id"]]["next"], receipt
         else:
             status = "waiting" if open_tasks else "done"
             action, focus = None, open_tasks[0] if open_tasks else None
@@ -345,7 +358,8 @@ def build_guide(snapshot, items, actor):
             )
 
     # The one next action for this person: the first stop of the path not done, if it is theirs to
-    # take; then the first step waiting on them, in Today's order; then the first step ready to start.
+    # take; then the first step waiting on them, in Today's order; then the first step ready to start;
+    # then the first submitted step whose receipt they can add when it arrives.
     if first_open and first_open["action"]:
         nxt = {"from": "path", "stop": first_open["n"], "task_id": None, "action": first_open["action"]}
     elif mine:
@@ -354,11 +368,14 @@ def build_guide(snapshot, items, actor):
     elif ready and writer(actor):
         t = ready[0]
         nxt = {"from": "ready", "stop": None, "task_id": t["id"], "action": steps[t["id"]]["next"]}
+    elif receipts:
+        t = receipts[0]
+        nxt = {"from": "receipt", "stop": None, "task_id": t["id"], "action": steps[t["id"]]["next"]}
     else:
         nxt = {"from": None, "stop": None, "task_id": None, "action": None}
     if nxt["action"]:
         nxt["label"] = nxt["action"]["label"]
-        nxt["why"] = None
+        nxt["why"] = receipt_why(receipts[0], items[receipts[0]["id"]]) if nxt["from"] == "receipt" else None
     elif not writer(actor):
         nxt["label"] = "Nothing here is yours to do"
         nxt["why"] = "You can read this business. A person who can write to it takes each next step."

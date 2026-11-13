@@ -368,8 +368,9 @@ PATHS = {
                 "done_when": "Done when Approve the acquisition thesis, for the newest analysis, is approved or further along.",
                 "title": "Decide whether to keep going",
                 "detail": "Approve the acquisition thesis. It is the first real decision.",
-                "why": "The checks on the books and the contracts wait on this step, so nothing is "
-                "spent on them before you decide.",
+                "why": "The checks on the books and the contracts cannot be approved until this step "
+                "is finished: verified, or ruled out as not applicable. Decide here before you pay anyone "
+                "for those checks.",
                 "line": "Acquisition",
                 "steps": ["mandate"],
             },
