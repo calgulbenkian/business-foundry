@@ -3461,6 +3461,114 @@ def test_documented_limit_ai_review_data_repeating_a_key_is_read_with_its_last_v
     ]
 
 
+# Rule: the audit and the export read every number in a review's data exactly as stored, with its
+# precision, sign and type. A fractional number keeps every digit, a whole-valued float such as 1.0
+# stays a float, -0.0 keeps its sign, a float stored with an exponent keeps its value, and an integer
+# beyond 2**53, beyond 2**64 or below -2**63 keeps every digit. Python compares 1.0 equal to 1 and
+# -0.0 equal to 0.0, so the exported data is written out as JSON and compared as text.
+def test_ai_review_numbers_are_checked_and_exported_with_their_precision_sign_and_type(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={
+            "advice": {
+                "estimates": {
+                    "markup_percent": 100.0,
+                    "smallest_price_step": 1e-07,
+                    "tray_area_per_radius_squared": 3.141592653589793,
+                    "unit_cost": 2.5,
+                    "upper_bound": 1.5e300,
+                    "weekly_change": -3.75,
+                },
+                "summary": "Price the catering order from the costed menu.",
+            },
+            "http_status": 200,
+            "response": {
+                "frequency_penalty": 0.1,
+                "id": "resp_synthetic_numbers",
+                "max_tool_calls": -1,
+                "presence_penalty": -0.0,
+                "seed": -9223372036854775809,
+                "sequence": 9007199254740993,
+                "status": "completed",
+                "temperature": 1.0,
+                "top_p": 0.123456789,
+                "usage": {"cached_tokens": 0, "lifetime_tokens": 100000000000000000000},
+            },
+        },
+    )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == (
+            '{"advice":{"estimates":{"markup_percent":100.0,"smallest_price_step":1e-07,'
+            '"tray_area_per_radius_squared":3.141592653589793,"unit_cost":2.5,"upper_bound":1.5e+300,'
+            '"weekly_change":-3.75},"summary":"Price the catering order from the costed menu."},'
+            '"http_status":200,'
+            '"response":{"frequency_penalty":0.1,"id":"resp_synthetic_numbers","max_tool_calls":-1,'
+            '"presence_penalty":-0.0,"seed":-9223372036854775809,"sequence":9007199254740993,'
+            '"status":"completed","temperature":1.0,"top_p":0.123456789,'
+            '"usage":{"cached_tokens":0,"lifetime_tokens":100000000000000000000}}}'
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert [(run["id"], run["state"], run["created_at"]) for run in runs] == [
+        ("review_synthetic", "succeeded", "2026-02-01T00:00:00+00:00")
+    ]
+    assert json.dumps(runs[0]["data"], sort_keys=True) == (
+        '{"advice": {"estimates": {"markup_percent": 100.0, "smallest_price_step": 1e-07, '
+        '"tray_area_per_radius_squared": 3.141592653589793, "unit_cost": 2.5, "upper_bound": 1.5e+300, '
+        '"weekly_change": -3.75}, "summary": "Price the catering order from the costed menu."}, '
+        '"http_status": 200, '
+        '"response": {"frequency_penalty": 0.1, "id": "resp_synthetic_numbers", "max_tool_calls": -1, '
+        '"presence_penalty": -0.0, "seed": -9223372036854775809, "sequence": 9007199254740993, '
+        '"status": "completed", "temperature": 1.0, "top_p": 0.123456789, '
+        '"usage": {"cached_tokens": 0, "lifetime_tokens": 100000000000000000000}}}'
+    )
+
+
+# Rule, at the edges of precision: a float that needs all 17 significant digits, a subnormal float
+# and an integer beyond 2**64 that a float cannot hold are read exactly too. The test above holds
+# none of them: its floats need at most 16 digits and are at most 17 characters long, its smallest
+# float is normal, and 10**20 is exact as a float.
+def test_ai_review_numbers_at_the_edges_of_precision_are_checked_and_exported_exactly(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={
+            "advice": {"summary": "Price the catering order from the costed menu."},
+            "response": {
+                "id": "resp_synthetic_precision",
+                "smallest_logprob": 5e-324,
+                "top_p": 0.30000000000000004,
+                "usage": {"lifetime_tokens": 123456789012345678901},
+            },
+        },
+    )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == (
+            '{"advice":{"summary":"Price the catering order from the costed menu."},'
+            '"response":{"id":"resp_synthetic_precision","smallest_logprob":5e-324,'
+            '"top_p":0.30000000000000004,"usage":{"lifetime_tokens":123456789012345678901}}}'
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert [(run["id"], run["state"], run["created_at"]) for run in runs] == [
+        ("review_synthetic", "succeeded", "2026-02-01T00:00:00+00:00")
+    ]
+    assert json.dumps(runs[0]["data"], sort_keys=True) == (
+        '{"advice": {"summary": "Price the catering order from the costed menu."}, '
+        '"response": {"id": "resp_synthetic_precision", "smallest_logprob": 5e-324, '
+        '"top_p": 0.30000000000000004, "usage": {"lifetime_tokens": 123456789012345678901}}}'
+    )
+
+
 def test_export_digest_covers_the_archive_with_its_ai_review(setup):
     store, service, actor, bid, _ = setup
     add_ai_review(store, actor, bid)
