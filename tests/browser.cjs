@@ -530,6 +530,12 @@ async function startHere(page, context, browser, origin, keyFile) {
       'It cannot be approved until there is a contract record.',
     ],
   );
+  // Its next action opens the form for what it needs: a contract record, already chosen.
+  await stands.getByRole('button', { name: 'Add a contract record', exact: true }).click();
+  await page.locator('#dialog-title', { hasText: 'Add business record' }).waitFor();
+  assert.equal(await page.locator('#dialog select[name="kind"]').inputValue(), 'contract');
+  await page.locator('#dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.locator('#dialog').waitFor({ state: 'hidden' });
   // The step's own ? opens the same text as its line's ? in the source list.
   const stepHelp = page.locator('#insp .i-kicker [data-action="help"]');
   await stepHelp.click();

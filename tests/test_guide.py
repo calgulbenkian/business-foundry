@@ -216,6 +216,13 @@ def test_an_acquisition_path_ticks_off_stop_by_stop_and_reopens_with_a_new_fact(
     guide = service.guide(owner, bid)
     assert done(guide) == [True, True, True, False, False]
     assert guide["next"]["action"] == {"do": "deal", "label": "Screen the deal in an acquisition analysis"}
+    # one more item waiting for review: the check is not done until it is reviewed too
+    lease = evidence(service, owner, bid, "Lease summary · synthetic")
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True, True, False, False, False]
+    assert guide["next"]["action"]["evidence_id"] == lease["id"]
+    review(service, owner, bid, lease)
+    assert done(service.guide(owner, bid)) == [True, True, True, False, False]
 
     deal(service, owner, bid)
     thesis = task(service, owner, bid, "Approve the acquisition thesis")
@@ -233,7 +240,13 @@ def test_an_acquisition_path_ticks_off_stop_by_stop_and_reopens_with_a_new_fact(
     thesis = move(service, owner, bid, thesis, "in_progress")
     assert service.guide(owner, bid)["next"]["label"] == "Finish preparing Approve the acquisition thesis"
     thesis = move(service, owner, bid, thesis, "prepared", [listing["id"]])
-    assert service.guide(owner, bid)["next"]["label"] == "Approve: Approve the acquisition thesis"
+    guide = service.guide(owner, bid)
+    # prepared is not decided: the stop waits for the approval
+    assert done(guide) == [True, True, True, True, False]
+    assert (guide["next"]["from"], guide["next"]["label"]) == (
+        "path",
+        "Approve: Approve the acquisition thesis",
+    )
     thesis = move(service, owner, bid, thesis, "approved", [listing["id"]])
     guide = service.guide(owner, bid)
     assert done(guide) == [True] * 5 and guide["path"]["complete"]
@@ -243,7 +256,8 @@ def test_an_acquisition_path_ticks_off_stop_by_stop_and_reopens_with_a_new_fact(
         "Verify: Approve the acquisition thesis",
     )
 
-    # A new fact: the listing is withdrawn. The thesis that cited it reopens, and the path with it.
+    # A new fact: the listing is withdrawn. The thesis that cited it reopens, and the path with it;
+    # the lease is still reviewed, so the earlier stops stay done.
     service.review_evidence(
         owner,
         bid,
@@ -255,13 +269,64 @@ def test_an_acquisition_path_ticks_off_stop_by_stop_and_reopens_with_a_new_fact(
         revoke=True,
     )
     guide = service.guide(owner, bid)
-    assert done(guide) == [True, False, False, True, False]
-    assert guide["next"]["stop"] == 2
+    assert done(guide) == [True, True, True, True, False]
+    assert guide["next"]["stop"] == 5
     reopened = step(guide, "Approve the acquisition thesis")
     assert reopened["state"] == "needs_review"
     assert reopened["why"] == ["It was reopened: Evidence withdrawn: Listing text · synthetic."]
     assert reopened["unlocks"] == ["Prepare it again from the current records."]
     assert reopened["next"]["label"] == "Prepare Approve the acquisition thesis again"
+
+
+def test_an_analysis_whose_evidence_changed_reopens_the_screen_stop(setup):
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    listing = review(service, owner, bid, evidence(service, owner, bid))
+    saved = service.save_deal(
+        owner,
+        bid,
+        key(),
+        models.DealInputs(
+            target="Juniper Street Laundry",
+            thesis="Synthetic thesis that cites the listing.",
+            annual_revenue="210000",
+            reported_ebitda="62000",
+            purchase_price="180000",
+            evidence_ids=[listing["id"]],
+        ).model_dump(mode="json", exclude_unset=True),
+    )
+    assert done(service.guide(owner, bid)) == [True, True, True, True, False]
+    # withdrawing the listing changes its version, so the saved analysis is out of date
+    service.review_evidence(
+        owner,
+        bid,
+        listing["id"],
+        key(),
+        data(
+            models.Review, note="The seller withdrew this listing text.", expected_version=listing["version"]
+        ),
+        revoke=True,
+    )
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True, False, False, False, False]
+    stop = guide["path"]["stops"][3]
+    assert stop["action"] == {
+        "do": "deal",
+        "deal_id": saved["id"],
+        "label": "Save a fresh acquisition analysis",
+    }
+    thesis = step(guide, "Approve the acquisition thesis")
+    assert thesis["blockers"] == ["Supporting deal evidence changed; create and review a fresh analysis"]
+    assert thesis["why"] == [
+        "It cannot be approved until there is a fresh acquisition analysis: the evidence behind the saved one "
+        "changed."
+    ]
+    assert thesis["unlocks"] == ["Save a fresh acquisition analysis from the current evidence."]
+    assert thesis["next"] == {
+        "do": "deal",
+        "deal_id": saved["id"],
+        "label": "Save a fresh acquisition analysis",
+    }
 
 
 def test_a_start_up_path_ticks_off_stop_by_stop(setup):
@@ -391,18 +456,21 @@ def test_the_next_action_rule_path_then_waiting_on_you_then_ready(setup):
     # (c) nothing waits on the owner: the first step ready to start
     assert service.guide(owner, bid)["next"]["from"] == "ready"
     # (b) a step being prepared waits on the owner
-    move(service, owner, bid, thesis, "in_progress")
-    guide = service.guide(owner, bid)
-    assert (guide["next"]["from"], guide["next"]["task_id"]) == ("waiting_on_you", thesis["id"])
-    # in Today's order, a step that needs review comes before the rest waiting on you
-    move(service, owner, bid, registration, "needs_review")
+    registration = move(service, owner, bid, registration, "needs_review")
+    move(service, owner, bid, registration, "in_progress")
     guide = service.guide(owner, bid)
     assert guide["path"]["complete"]
-    assert guide["next"]["task_id"] == registration["id"]
-    assert guide["next"]["label"] == "Prepare Verify applicable registrations again"
+    assert (guide["next"]["from"], guide["next"]["task_id"]) == ("waiting_on_you", registration["id"])
+    assert guide["next"]["label"] == "Finish preparing Verify applicable registrations"
+    # in Today's order, a step that needs review comes first, even on a later line
+    thesis = move(service, owner, bid, thesis, "in_progress")
+    move(service, owner, bid, thesis, "needs_review")
+    guide = service.guide(owner, bid)
+    assert (guide["next"]["from"], guide["next"]["task_id"]) == ("waiting_on_you", thesis["id"])
+    assert guide["next"]["label"] == "Prepare Approve the acquisition thesis again"
     # each line names its own next action
-    assert line(guide, "Setup")["next"]["task_id"] == registration["id"]
-    assert line(guide, "Acquisition")["next"]["label"] == "Finish preparing Approve the acquisition thesis"
+    assert line(guide, "Setup")["next"]["label"] == "Finish preparing Verify applicable registrations"
+    assert line(guide, "Acquisition")["next"]["task_id"] == thesis["id"]
     assert (line(guide, "Market")["status"], line(guide, "Market")["next"]) == ("done", None)
     # (a) a stop of the path not done comes before both: the structure decision reopens
     structure = task(service, owner, bid, "Decide the entity and ownership structure")
@@ -481,3 +549,14 @@ def test_the_guide_endpoint_reads_and_changes_nothing(setup, client):
     with store.read() as con:
         assert con.execute("SELECT count(*) FROM events").fetchone()[0] == before
     assert client.post(f"/api/businesses/{bid}/guide", headers={"Idempotency-Key": key()}).status_code == 405
+
+
+def test_a_viewer_is_offered_no_stop_of_the_path(setup):
+    store, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    viewer = service.add_principal(owner, {"name": "Guide viewer", "role": "viewer", "business_ids": [bid]})
+    guide = guide_as(store, viewer["token"], bid).json()
+    assert [s["action"] for s in guide["path"]["stops"]] == [None] * 5
+    assert [s["waiting_on"] for s in guide["path"]["stops"]] == [None] + [
+        "You can read this business. A person who can write to it takes this step."
+    ] * 4
