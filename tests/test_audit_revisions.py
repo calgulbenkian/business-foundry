@@ -3307,6 +3307,160 @@ def test_ai_reviews_of_two_principals_with_one_command_key_each_keep_their_own_d
     ]
 
 
+# Rule: the audit and the export read a review's data exactly as stored, whatever JSON values it
+# holds: nested objects, lists in their stored order, empty lists, objects and strings, null, true
+# and false, integers large and negative, fractional numbers, and strings with surrounding space or
+# non-ASCII text. The audit's digest and the exported data change if any of them is read in another
+# form.
+def test_ai_review_data_with_every_kind_of_json_value_is_checked_and_exported_exactly(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={
+            "advice": {
+                "recommendations": [
+                    {
+                        "action": "Raise the café lunch price",
+                        "evidence_ids": ["evidence_menu", "evidence_costs"],
+                        "reason": "Food costs rose by a fifth since spring.",
+                    },
+                    {"action": "Delay the second van", "evidence_ids": [], "reason": ""},
+                ],
+                "summary": "  Keep three months of costs in cash.  ",
+                "unknowns": [" Whether the lease renews in March. ", "Supplier terms for 2027"],
+            },
+            "http_status": 200,
+            "note": "Menu prices in € for the café, checked by Zoë.",
+            "response": {
+                "balance_change": -42,
+                "created_at": 1767225600,
+                "id": "resp_synthetic",
+                "incomplete_details": None,
+                "metadata": {},
+                "parallel_tool_calls": False,
+                "score_delta": -12.5,
+                "sequence": 9007199254740993,
+                "status": "completed",
+                "store": True,
+                "temperature": 0.75,
+                "top_p": 0.2,
+                "usage": {
+                    "cached_tokens": 0,
+                    "input_tokens": 1834,
+                    "output_tokens": 412,
+                    "total_tokens": 2246,
+                },
+            },
+            "shared_record_ids": ["record_zeta", "record_alpha", "record_mid"],
+        },
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {
+                "advice": {
+                    "recommendations": [
+                        {
+                            "action": "Raise the café lunch price",
+                            "evidence_ids": ["evidence_menu", "evidence_costs"],
+                            "reason": "Food costs rose by a fifth since spring.",
+                        },
+                        {"action": "Delay the second van", "evidence_ids": [], "reason": ""},
+                    ],
+                    "summary": "  Keep three months of costs in cash.  ",
+                    "unknowns": [" Whether the lease renews in March. ", "Supplier terms for 2027"],
+                },
+                "http_status": 200,
+                "note": "Menu prices in € for the café, checked by Zoë.",
+                "response": {
+                    "balance_change": -42,
+                    "created_at": 1767225600,
+                    "id": "resp_synthetic",
+                    "incomplete_details": None,
+                    "metadata": {},
+                    "parallel_tool_calls": False,
+                    "score_delta": -12.5,
+                    "sequence": 9007199254740993,
+                    "status": "completed",
+                    "store": True,
+                    "temperature": 0.75,
+                    "top_p": 0.2,
+                    "usage": {
+                        "cached_tokens": 0,
+                        "input_tokens": 1834,
+                        "output_tokens": 412,
+                        "total_tokens": 2246,
+                    },
+                },
+                "shared_record_ids": ["record_zeta", "record_alpha", "record_mid"],
+            },
+        }
+    ]
+    # Python compares 200 equal to 200.0 and True equal to 1, so the exported data is also written
+    # out as JSON and compared as text: 200 against 200.0 and true against 1 differ there.
+    assert json.dumps(runs[0]["data"], sort_keys=True, ensure_ascii=False) == (
+        '{"advice": {"recommendations": [{"action": "Raise the café lunch price", '
+        '"evidence_ids": ["evidence_menu", "evidence_costs"], '
+        '"reason": "Food costs rose by a fifth since spring."}, '
+        '{"action": "Delay the second van", "evidence_ids": [], "reason": ""}], '
+        '"summary": "  Keep three months of costs in cash.  ", '
+        '"unknowns": [" Whether the lease renews in March. ", "Supplier terms for 2027"]}, '
+        '"http_status": 200, '
+        '"note": "Menu prices in € for the café, checked by Zoë.", '
+        '"response": {"balance_change": -42, "created_at": 1767225600, "id": "resp_synthetic", '
+        '"incomplete_details": null, "metadata": {}, "parallel_tool_calls": false, '
+        '"score_delta": -12.5, "sequence": 9007199254740993, "status": "completed", "store": true, '
+        '"temperature": 0.75, "top_p": 0.2, '
+        '"usage": {"cached_tokens": 0, "input_tokens": 1834, "output_tokens": 412, "total_tokens": 2246}}, '
+        '"shared_record_ids": ["record_zeta", "record_alpha", "record_mid"]}'
+    )
+
+
+# Documented limit: the audit compares a review's data as a value, not as text, and a stored text
+# that repeats a key is read with that key's last value, by the audit and the export alike. An
+# earlier copy of the key, written by SQL, is seen by neither.
+def test_documented_limit_ai_review_data_repeating_a_key_is_read_with_its_last_value(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+    )
+    repeated = (
+        '{"advice":{"summary":"Advice that was never returned.",'
+        '"summary":"Keep three months of costs in cash."},"http_status":200}'
+    )
+    with store.write() as con:
+        assert (
+            con.execute("UPDATE ai_calls SET data=? WHERE id='review_synthetic'", (repeated,)).rowcount == 1
+        )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == (
+            '{"advice":{"summary":"Advice that was never returned.",'
+            '"summary":"Keep three months of costs in cash."},"http_status":200}'
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+        }
+    ]
+
+
 def test_export_digest_covers_the_archive_with_its_ai_review(setup):
     store, service, actor, bid, _ = setup
     add_ai_review(store, actor, bid)
