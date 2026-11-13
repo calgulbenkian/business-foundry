@@ -5,14 +5,19 @@ caller leaves out takes the model's example value, and the deal records it in as
 way through the API, the command line and the MCP adapter. Expected values are written out by hand.
 """
 
+import ast
 import asyncio
 import contextlib
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import threading
 import time
+from decimal import Decimal
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -861,3 +866,93 @@ def test_the_demo_runs_twice_on_a_fresh_database(tmp_path, capsys):
     assert "Foundry:" not in out.err
     assert counts(store) == first
     verify_demo(db, capsys)
+
+
+# The example values of DealInputs on main before this change, written out by hand from
+# src/foundry/models.py at e2317d3 (the same values in every earlier commit). The web form compares an
+# analysis saved without assumed_inputs with these, so a figure left out then starts empty when reopened.
+MAIN_EXAMPLES = {
+    "annual_revenue": "1000000",
+    "reported_ebitda": "200000",
+    "replacement_management": "0",
+    "multiple_low": "3",
+    "multiple_high": "5",
+    "purchase_price": "800000",
+    "fees": "30000",
+    "working_capital": "50000",
+    "integration_cost": "0",
+    "senior_debt": "400000",
+    "debt_rate": "0.09",
+    "debt_years": "7",
+    "seller_note": "0",
+    "seller_rate": "0.06",
+    "seller_years": "5",
+    "annual_capex": "15000",
+    "annual_working_capital_growth": "0",
+    "tax_rate": "0.25",
+    "cash_acquired": "0",
+    "debt_assumed": "0",
+}
+APP_JS = Path(__file__).resolve().parents[1] / "src" / "foundry" / "static" / "app.js"
+
+
+def js_constant(name: str) -> str:
+    source = APP_JS.read_text()
+    start = source.index(f"const {name} = ")
+    return source[start : source.index("\n};\n", start)]
+
+
+def test_the_web_forms_earlier_example_values_are_mains():
+    pairs = re.findall(r"^\s+(\w+): '([^']*)',$", js_constant("DEAL_EXAMPLES_BEFORE_LIST"), re.M)
+    assert dict(pairs) == MAIN_EXAMPLES and len(pairs) == len(MAIN_EXAMPLES)
+    # Today's model differs from main only where this change made it differ: the three required figures
+    # have no example, and the example senior debt is zero.
+    fields = DealInputs.model_fields
+    assert list(MAIN_EXAMPLES) == [
+        n for n in fields if n not in {"target", "thesis", "adjustments", "evidence_ids"}
+    ]
+    changed = {}
+    for name, value in MAIN_EXAMPLES.items():
+        today = None if fields[name].is_required() else str(fields[name].default)
+        if today is None or Decimal(today) != Decimal(value):
+            changed[name] = today
+    assert changed == {
+        "annual_revenue": None,
+        "reported_ebitda": None,
+        "purchase_price": None,
+        "senior_debt": "0",
+    }
+
+
+def test_the_web_forms_earlier_example_values_match_main_at_e2317d3():
+    shown = subprocess.run(
+        ["git", "show", "e2317d3:src/foundry/models.py"],
+        cwd=APP_JS.parents[3],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if shown.returncode:
+        pytest.skip("commit e2317d3 is not in this checkout")
+    tree = ast.parse(shown.stdout)
+    (deal,) = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DealInputs"]
+    defaults = {}
+    for item in deal.body:
+        if isinstance(item, ast.AnnAssign) and item.value is not None:
+            value = item.value
+            if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "Decimal":
+                defaults[item.target.id] = value.args[0].value
+            elif isinstance(value, ast.Constant):
+                defaults[item.target.id] = str(value.value)
+    assert defaults == MAIN_EXAMPLES
+
+
+def test_the_web_forms_examples_are_todays_model():
+    # dealFields' third column is today's example value; for the three required figures it is only the
+    # placeholder, main's example.
+    rows = re.findall(r"^\s+\['(\w+)', '[^']*', ([\d.]+), \w+\],$", js_constant("dealFields"), re.M)
+    assert [name for name, _ in rows] == list(MAIN_EXAMPLES)
+    for name, example in rows:
+        field = DealInputs.model_fields[name]
+        expected = MAIN_EXAMPLES[name] if field.is_required() else field.default
+        assert Decimal(example) == Decimal(str(expected)), name

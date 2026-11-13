@@ -4165,16 +4165,56 @@ function assumedText(o) {
   });
   return "Not given, so the model's example value was used: " + parts.join('; ') + '.';
 }
+/* The example values DealInputs had on main until the three figures were required and the example loans
+   were zero: src/foundry/models.py at e2317d3, the same values in every earlier commit. An analysis saved
+   then has no assumed_inputs, and holds one of these wherever its figure was left out. The tests check
+   them against that commit and against today's model. */
+const DEAL_EXAMPLES_BEFORE_LIST = {
+  annual_revenue: '1000000',
+  reported_ebitda: '200000',
+  replacement_management: '0',
+  multiple_low: '3',
+  multiple_high: '5',
+  purchase_price: '800000',
+  fees: '30000',
+  working_capital: '50000',
+  integration_cost: '0',
+  senior_debt: '400000',
+  debt_rate: '0.09',
+  debt_years: '7',
+  seller_note: '0',
+  seller_rate: '0.06',
+  seller_years: '5',
+  annual_capex: '15000',
+  annual_working_capital_growth: '0',
+  tax_rate: '0.25',
+  cash_acquired: '0',
+  debt_assumed: '0',
+};
+/* The loan whose rate or term each loan-term field is. */
+const DEAL_TERM_LOAN = {
+  debt_rate: 'senior_debt',
+  debt_years: 'senior_debt',
+  seller_rate: 'seller_note',
+  seller_years: 'seller_note',
+};
 /* What the form shows for a field when it is opened again from an earlier analysis. A field that
    analysis gave is filled in. One it recorded as assumed starts empty, so it is not sent as the
-   founder's own. For an analysis saved before the list was recorded, a figure that differs from the
-   model's example value must have been given and is filled in; one equal to it cannot be told apart
-   from an assumed one and starts empty, so it is either typed again or recorded as assumed. */
-function dealStart(d, assumed, k, example) {
+   founder's own. A loan's rate and term start empty whenever that loan was zero in the analysis or
+   starts empty itself: they were not used, and the stored record cannot tell a term that was given
+   from one that was not, so they are either typed again or, when a loan is entered, recorded as
+   assumed. For an analysis saved before the list was recorded, a figure equal to the model's example
+   value, today's or the one it had when the analysis was saved, cannot be told apart from an assumed
+   one and starts empty; a figure that differs from both must have been given and is filled in. */
+function dealStart(d, assumed, k) {
   if (!(k in d)) return '';
+  const loan = DEAL_TERM_LOAN[k];
+  if (loan && (decimalKey(d[loan]) === '0' || dealStart(d, assumed, loan) === '')) return '';
   if (Array.isArray(assumed)) return assumed.includes(k) ? '' : d[k];
   const same = decimalKey(d[k]);
-  return same !== null && same === decimalKey(example) ? '' : d[k];
+  if (same === null) return d[k];
+  const examples = [dealFields.find((f) => f[0] === k)?.[2], DEAL_EXAMPLES_BEFORE_LIST[k]];
+  return examples.some((e) => e !== undefined && decimalKey(e) === same) ? '' : d[k];
 }
 /* A decimal string or number in one canonical form, so equal values compare equal exactly: "30000",
    "30000.00" and "3E+4" all give the same key. Anything that is not a decimal gives null. */
@@ -4201,14 +4241,14 @@ function dealDialog(id) {
       evidenceSelect('evidence_ids', 'Source evidence', d.evidence_ids || []) +
       area('thesis', 'Investment thesis', d.thesis || '') +
       (unrecorded
-        ? `<p class="hint full">This analysis was saved before Foundry recorded which figures were given. A figure equal to the model's example value is left empty; enter it again if it is yours.</p>`
+        ? `<p class="hint full">This analysis was saved before Foundry recorded which figures were given. A figure equal to the model's example value, today's or the one it had then, is left empty, and so are the rate and term of a loan left empty; enter them again if they are yours.</p>`
         : '') +
       dealFields
         .map(([k, t, example]) =>
           input(
             k,
             t,
-            dealStart(d, assumed, k, example),
+            dealStart(d, assumed, k),
             'number',
             DEAL_REQUIRED.includes(k)
               ? 'Required.'
