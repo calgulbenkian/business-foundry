@@ -142,6 +142,36 @@ def test_the_catalog_explains_every_line_and_gives_every_entry_path_a_path():
     assert not [w for w in words if "—" in w]
 
 
+def test_the_screen_stop_says_what_the_deal_model_requires_and_lists():
+    """The sentence under Screen the deal is checked against DealInputs, not read from it."""
+    stop = next(s for s in catalog.PATHS["acquire"]["stops"] if s["key"] == "deal")
+    assert stop["detail"] == (
+        "An acquisition analysis needs the revenue, the earnings and the price of the business itself; a "
+        "building sold with it has a price of its own, which can be left empty. Any other figure you leave "
+        "out, and the seller note's schedule, takes an example value, and the analysis lists each one it "
+        "used."
+    )
+    # The three figures it names are the model's only required figures; the building's price is not one.
+    fields = models.DealInputs.model_fields
+    required = {name for name, field in fields.items() if field.is_required()}
+    assert required == {"target", "thesis", "annual_revenue", "reported_ebitda", "purchase_price"}
+    assert not fields["real_estate_price"].is_required()
+    given = {
+        "target": "Screen stop target · synthetic",
+        "thesis": "A synthetic deal to check the sentence.",
+        "annual_revenue": "900000",
+        "reported_ebitda": "200000",
+        "purchase_price": "600000",
+    }
+    # With no seller note, its rate, term and schedule are not used, and not listed.
+    unused = {"seller_rate", "seller_years", "seller_schedule"}
+    assert not unused & set(models.DealInputs(**given).assumed_inputs())
+    # With one, the schedule left out takes the example and is listed with its rate and term.
+    with_note = models.DealInputs(**given, seller_note="100000").assumed_inputs()
+    assert unused <= set(with_note) and "real_estate_price" in with_note
+    assert models.DealInputs(**given, seller_note="100000").seller_schedule == "amortizing"
+
+
 def test_the_demo_has_finished_its_path_and_its_next_action_is_the_thesis(setup):
     _, service, owner, _, _ = setup
     bid = seed(service, owner)["id"]

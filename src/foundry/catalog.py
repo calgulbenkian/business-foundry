@@ -353,8 +353,10 @@ PATHS = {
                 "key": "deal",
                 "done_when": "Done when an acquisition analysis is saved and the newest one is not out of date.",
                 "title": "Screen the deal",
-                "detail": "An acquisition analysis needs the price, the revenue and the earnings. Any "
-                "other figure you leave out takes an example value, and the analysis lists each one.",
+                "detail": "An acquisition analysis needs the revenue, the earnings and the price of the "
+                "business itself; a building sold with it has a price of its own, which can be left "
+                "empty. Any other figure you leave out, and the seller note's schedule, takes an "
+                "example value, and the analysis lists each one it used.",
                 "why": "Screening shows whether the price can make sense before you spend money on "
                 "checks. Saving it lays out the Acquisition line.",
                 "line": "Acquisition",
