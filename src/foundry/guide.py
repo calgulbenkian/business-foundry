@@ -452,9 +452,11 @@ def build_path(route, objects, steps, step_by_key, newest_deal, actor):
             if writer(actor):
                 action = record_action(key) | {"label": stop["action"]}
         elif key == "forecast":
-            done = bool(plans) and not plans[-1].get("stale")
+            stale = bool(plans) and bool(plans[-1].get("stale"))
+            done = bool(plans) and not stale
             if writer(actor):
-                action = {"do": "forecast", "label": stop["action"]}
+                # An out-of-date forecast's reason says to save a revised forecast; the button says the same.
+                action = {"do": "forecast", "label": "Save a revised forecast" if stale else stop["action"]}
         elif key == "structure":
             done, _, action, waiting = decision(step_by_key("structure"), None)
         else:  # pragma: no cover - every stop in the catalog has a rule above

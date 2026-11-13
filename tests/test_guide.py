@@ -359,6 +359,42 @@ def test_an_analysis_whose_evidence_changed_reopens_the_screen_stop(setup):
     }
 
 
+def test_a_forecast_saved_under_another_jurisdiction_reopens_the_forecast_stop(setup):
+    _, service, owner, bid, _ = setup
+    record(service, owner, bid, "customer", "Synthetic buyer")
+    review(service, owner, bid, evidence(service, owner, bid, "Interview notes · synthetic"))
+    record(service, owner, bid, "offer", "Synthetic offer")
+    service.save_forecast(
+        owner,
+        bid,
+        key(),
+        data(
+            models.ForecastCreate, title="Synthetic forecast", inputs=models.ForecastInputs(), evidence_ids=[]
+        ),
+    )
+    assert done(service.guide(owner, bid)) == [True, True, True, True, True, False]
+    # A forecast stores no evidence versions: a jurisdiction change is what puts it out of date.
+    service.change_jurisdiction(
+        owner,
+        bid,
+        key(),
+        data(
+            models.JurisdictionChange,
+            expected_version=service.snapshot(owner, bid)["business"]["version"],
+            jurisdiction="GB",
+            reason="Synthetic decision: plan under England and Wales.",
+        ),
+    )
+    plans = [o for o in service.snapshot(owner, bid)["objects"] if o["kind"] == "financial_plan"]
+    assert [p["stale"] for p in plans] == [True]
+    assert [[r["code"] for r in p["stale_reasons"]] for p in plans] == [["jurisdiction_changed"]]
+    guide = service.guide(owner, bid)
+    stop = guide["path"]["stops"][4]
+    assert stop["title"] == "Review cash needs"
+    assert stop["done"] is False
+    assert stop["action"] == {"do": "forecast", "label": "Save a revised forecast"}
+
+
 def test_a_start_up_path_ticks_off_stop_by_stop(setup):
     _, service, owner, bid, _ = setup
     guide = service.guide(owner, bid)
