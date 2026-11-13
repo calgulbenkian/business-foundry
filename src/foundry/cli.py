@@ -382,7 +382,9 @@ def main(argv=None):
     serve = commands.add_parser("serve", help="Start the local web application")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
-    backup = commands.add_parser("backup", help="Create an atomic SQLite backup, including access keys")
+    backup = commands.add_parser(
+        "backup", help="Create an atomic SQLite backup, including the access keys' hashes"
+    )
     backup.add_argument("destination", type=Path)
     restore = commands.add_parser("restore", help="Restore into a new, absent database path")
     restore.add_argument("source", type=Path)
