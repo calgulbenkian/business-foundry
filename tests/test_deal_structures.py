@@ -348,7 +348,7 @@ def test_investor_equity_reduces_the_buyers_cash(investors, cash, beyond):
     # Uses 900,000 + 50,000 + 50,000 = 1,000,000; debt 700,000; equity required 300,000. Less investors:
     # 300,000 − 120,000 = 180,000; − 300,000 = 0; − 350,000 = −50,000, which is funding beyond uses.
     assert su["total_uses"] == "1000000.00" and su["buyer_equity_required"] == "300000.00"
-    assert su["investor_equity"] == f"{Fraction(investors):.0f}.00"
+    assert su["investor_equity"] == f"{int(investors)}.00"
     assert (su["buyer_cash_at_closing"], su["funding_beyond_uses"]) == (cash, beyond)
 
 

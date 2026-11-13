@@ -568,7 +568,7 @@ def test_figures_for_a_fixed_full_payload_are_unchanged_from_main():
     # out in rationals here rather than taken from the model.
     m = Fraction(5, 1200)
     seller_payment = 100000 * m / (1 - (1 + m) ** -48) * 12
-    assert f"{float(seller_payment):.2f}" == "27635.15"
+    assert round(seller_payment, 2) == Fraction("27635.15")  # Fraction rounds half-even, exactly.
     assert added_figures(result) == {
         "debt_service_year": 1,
         # The seller note amortizes, so the lender's view is the same debt service and coverage.
