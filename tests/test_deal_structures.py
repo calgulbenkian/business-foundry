@@ -626,3 +626,40 @@ def test_the_mcp_tool_and_prompt_name_the_new_inputs(monkeypatch):
         assert name in description, name
     for words in ("real estate", "rent", "investor", "interest only", "deferred"):
         assert words in prompt, words
+
+
+# 9. A deal saved under acquisition 1.0.1 keeps rendering as it did.
+
+
+def test_a_memo_for_a_deal_saved_under_1_0_1_shows_only_the_figures_it_has(setup):
+    from test_deal_inputs import MAIN_SENT, as_main, main_dump, save_deal_as_before
+
+    from foundry.documents import render_document
+
+    _, service, actor, bid, _ = setup
+    old = save_deal_as_before(service, actor, bid, str(uuid4()), main_dump(MAIN_SENT))
+    assert old["data"]["analysis"]["model_version"] == "1.0.1"
+    assert as_main(old["data"]["analysis"]) == old["data"]["analysis"]
+    snapshot = service.snapshot(actor, bid)
+    deal_object = next(o for o in snapshot["objects"] if o["id"] == old["id"])
+    _, content = render_document("investment_memo", snapshot, deal_object)
+    # main's rows and debt line, and none of 1.1.0's.
+    row = next(line for line in content.splitlines() if "Buyer equity required" in line)
+    assert [cell.strip() for cell in row.strip("|").split("|")] == [
+        "Sources",
+        "Buyer equity required",
+        "330,000.50",
+    ]
+    assert "Annual debt service: 102,304.37 USD." in content
+    for added in (
+        "Real estate",
+        "Property loan",
+        "Investor equity",
+        "Buyer cash at closing",
+        "Less: annual rent",
+        "Seller note payments",
+        "Coverage if the seller note amortized",
+        "Lender rules",
+        "year 1",
+    ):
+        assert added not in content, added

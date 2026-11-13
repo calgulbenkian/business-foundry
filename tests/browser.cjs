@@ -1238,7 +1238,28 @@ async function main() {
       if (route.request().method() !== 'GET') return route.fallback();
       const response = await route.fetch();
       const body = await response.json();
-      for (const o of body.objects) if (o.kind === 'deal') delete o.data.assumed_inputs;
+      for (const o of body.objects)
+        if (o.kind === 'deal') {
+          delete o.data.assumed_inputs;
+          // Saved under acquisition 1.0.1 too: none of the figures 1.1.0 added.
+          const a = o.data.analysis;
+          a.model_version = '1.0.1';
+          for (const k of [
+            'debt_service_year',
+            'amortizing_annual_debt_service',
+            'seller_note_schedule',
+          ])
+            delete a[k];
+          for (const k of [
+            'real_estate_price',
+            'property_debt',
+            'investor_equity',
+            'buyer_cash_at_closing',
+            'funding_beyond_uses',
+          ])
+            delete a.sources_and_uses[k];
+          for (const c of Object.values(a.scenarios)) delete c.amortizing_coverage_ratio;
+        }
       await route.fulfill({ response, json: body });
     };
     await page.route(snapshotPath, withoutList);
@@ -1250,6 +1271,12 @@ async function main() {
       await page.locator('#insp .assumed-inputs').innerText(),
       "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.",
     );
+    // A 1.0.1 analysis shows the figures it has, under their earlier names, and none it lacks.
+    const oldFigs = await page.locator('#insp .figs').innerText();
+    assert.match(oldFigs, /Buyer equity required\s+\$780,000\.00/);
+    assert.match(oldFigs, /Annual debt service\s+None/);
+    assert(!/Buyer cash at closing|Real estate/.test(oldFigs), oldFigs);
+    assert.equal(await page.locator('#insp .buyer-cash-text, #insp .seller-text').count(), 0);
     assert.deepEqual(
       await reopenDeal(browserDeal.id, 'Browser synthetic target'),
       startsWith({ annual_revenue: '900000', reported_ebitda: '180000', purchase_price: '700000' }),
