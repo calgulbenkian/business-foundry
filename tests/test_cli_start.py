@@ -5,6 +5,7 @@ fixture makes the real opener fail the test if it is ever reached. No test uses 
 beyond 127.0.0.1.
 """
 
+import errno
 import io
 import json
 import os
@@ -69,10 +70,12 @@ class Running:
         self.ready.set()
 
     def _run(self):
-        self.code = cli.start_foundry(
-            self.db, port=self.port, out=self.out, err=self.err, on_started=self._started, **self.options
-        )
-        self.ready.set()
+        try:
+            self.code = cli.start_foundry(
+                self.db, port=self.port, out=self.out, err=self.err, on_started=self._started, **self.options
+            )
+        finally:
+            self.ready.set()  # also when start_foundry raises, so a test fails at once
 
     def __enter__(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -295,6 +298,33 @@ def test_request_lines_are_quiet_but_server_errors_still_appear(tmp_path, monkey
     assert "RuntimeError: synthetic failure for the logging test" in logged
 
 
+class BrokenOutput(Terminal):
+    """An output whose reader has gone: every write fails, as a write to a closed pipe does."""
+
+    def write(self, text):
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+
+def test_a_failed_write_to_the_output_does_not_stop_the_server(tmp_path):
+    with Running(tmp_path / "foundry.db", out=BrokenOutput(), opener=lambda url: None) as run:
+        assert get(run.url + "/api/health")[0] == 200
+    assert run.code == 0
+    assert run.err.getvalue() == ""
+
+
+@pytest.mark.parametrize("words", [["--host", "0.0.0.0"], ["--host=0.0.0.0"]], ids=["separate", "joined"])
+def test_start_has_no_host_option(tmp_path, monkeypatch, capsys, words):
+    """`start` listens on 127.0.0.1 only; an option to choose another address is refused."""
+    calls = []
+    monkeypatch.setattr(cli, "start_foundry", lambda *args, **kwargs: calls.append(args) or 0)
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["--db", str(tmp_path / "ws" / "foundry.db"), "start", *words, "--no-browser"])
+    assert stopped.value.code == 2
+    assert "unrecognized arguments: " + " ".join(words) in capsys.readouterr().err
+    assert calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_port_option_rejects_numbers_outside_the_port_range(tmp_path, capsys):
     for value in ("0", "65536", "web"):
         with pytest.raises(SystemExit) as stopped:
@@ -330,6 +360,8 @@ def test_end_to_end_start_sign_in_and_interrupt(tmp_path):
             time.sleep(0.1)
         status, page = get(origin + "/")
         assert status == 200 and "Finding your key" in page
+        # The hint is true when the output was not a terminal too: the key is then left out.
+        assert "the output names the command that shows it" in " ".join(page.split())
         key = (tmp_path / "owner.key").read_text().strip()
         request = urllib.request.Request(
             origin + "/api/login",
@@ -442,6 +474,15 @@ def child_env(**changes):
     return env
 
 
+# The project that holds the Python running these tests, as `foundry_command` finds it.
+THIS_PROJECT = Path(sys.prefix).resolve().parent
+UV_PROGRAM = (
+    f"uv run --project {shlex.quote(str(THIS_PROJECT))} foundry"
+    if (THIS_PROJECT / "pyproject.toml").is_file()
+    else "uv run foundry"
+)
+
+
 @pytest.mark.parametrize(
     ("uv", "program"), [(None, "foundry"), ("/synthetic/bin/uv", "uv run foundry")], ids=["plain", "uv-run"]
 )
@@ -450,7 +491,38 @@ def test_foundry_command_names_uv_run_only_under_uv(monkeypatch, uv, program):
     monkeypatch.delenv("UV_RUN_RECURSION_DEPTH", raising=False)
     if uv:
         monkeypatch.setenv("UV", uv)
+    monkeypatch.chdir(THIS_PROJECT)
     assert cli.foundry_command() == program
+
+
+@pytest.mark.parametrize(
+    ("where", "named"),
+    [
+        ("project", False),
+        ("project/src", False),
+        ("elsewhere", True),
+        ("other project", True),
+        ("environment kept elsewhere", False),
+    ],
+)
+def test_uv_command_names_the_project_where_uv_would_not_find_it(tmp_path, monkeypatch, where, named):
+    project = tmp_path / "foundry checkout"
+    (project / "src").mkdir(parents=True)
+    (project / "pyproject.toml").write_text('[project]\nname = "synthetic"\n')
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "other project").mkdir()
+    (tmp_path / "other project" / "pyproject.toml").write_text('[project]\nname = "other"\n')
+    environment = project / ".venv"
+    if where == "environment kept elsewhere":
+        environment, where = tmp_path / "environments" / "foundry", "elsewhere"
+    monkeypatch.setattr(cli.sys, "prefix", str(environment))
+    monkeypatch.setenv("UV", "/synthetic/bin/uv")
+    folders = {"project": project, "project/src": project / "src"}
+    monkeypatch.chdir(folders.get(where, tmp_path / where))
+    expected = (
+        f"uv run --project {shlex.quote(str(project.resolve()))} foundry" if named else "uv run foundry"
+    )
+    assert cli.foundry_command() == expected
 
 
 @pytest.mark.skipif(os.name == "nt", reason="stops the server with SIGINT")
@@ -458,10 +530,11 @@ def test_foundry_command_names_uv_run_only_under_uv(monkeypatch, uv, program):
     ("arguments", "env", "program"),
     [
         ([], {}, "foundry"),
-        (["--db", "work space/foundry.db"], {"UV": "/synthetic/bin/uv"}, "uv run foundry"),
-        ([], {"FOUNDRY_DB": "from-env/foundry.db", "UV_RUN_RECURSION_DEPTH": "1"}, "uv run foundry"),
+        (["--db", "work space/foundry.db"], {"UV": "/synthetic/bin/uv"}, UV_PROGRAM),
+        ([], {"FOUNDRY_DB": "from-env/foundry.db", "UV_RUN_RECURSION_DEPTH": "1"}, UV_PROGRAM),
+        (["--db=-workspace/foundry.db"], {}, "foundry"),
     ],
-    ids=["default", "relative-db-under-uv", "db-from-environment"],
+    ids=["default", "relative-db-under-uv", "db-from-environment", "db-starting-with-a-dash"],
 )
 def test_piped_output_prints_a_token_command_that_works_as_printed(tmp_path, arguments, env, program):
     folder = tmp_path / "started here"
@@ -481,7 +554,16 @@ def test_piped_output_prints_a_token_command_that_works_as_printed(tmp_path, arg
     assert command.startswith(program + " ")
     # Run it as printed, in the folder it names, from a terminal that has none of the starting
     # process's settings. Only the program words are replaced, by this checkout's Foundry.
-    words = shlex.split(command)[len(program.split()) :]
+    # Not covered: running `uv` itself. `uv run` may sync this checkout's environment, which
+    # the running tests use, and may need the network, so it is not run here. What it needs
+    # is checked instead: a --project it names is this checkout, and the tests run in a
+    # folder outside it, where plain `uv run foundry` would find no project.
+    program_words = shlex.split(program)
+    if "--project" in program_words:
+        named = Path(program_words[program_words.index("--project") + 1])
+        assert named == THIS_PROJECT and 'name = "business-foundry"' in (named / "pyproject.toml").read_text()
+        assert THIS_PROJECT not in folder.resolve().parents
+    words = shlex.split(command)[len(program_words) :]
     shown = subprocess.run(
         [sys.executable, "-m", "foundry.cli", *words],
         cwd=rest,
@@ -511,6 +593,37 @@ def test_sigterm_stops_start_as_ctrl_c_does(tmp_path):
         last = output.rstrip().splitlines()[-1]
         assert last == f"Foundry has stopped. Your workspace is saved in {tmp_path / name}", (name, output)
         assert "Traceback" not in output and "KeyboardInterrupt" not in output, (name, output)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM ends a Windows process without running handlers")
+def test_a_stop_after_the_output_reader_has_gone_is_clean(tmp_path):
+    """As `foundry start | head -n 1` leaves it: the reader takes one line and closes the pipe."""
+    port = free_port()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "foundry.cli", "--db", str(tmp_path / "foundry.db")]
+        + ["start", "--empty", "--no-browser", "--port", str(port)],
+        cwd=tmp_path,
+        env=child_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        first = process.stdout.readline()
+        assert first.startswith(b"Created a new private workspace."), first
+        process.stdout.close()
+        wait_for_health(process, f"http://127.0.0.1:{port}", [])
+        process.send_signal(signal.SIGTERM)
+        code = process.wait(timeout=8)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    errors = process.stderr.read().decode()
+    process.stderr.close()
+    assert code == 0, errors
+    assert "Exception ignored" not in errors and "Traceback" not in errors, errors
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
 
 
 def workspace_summary(db):

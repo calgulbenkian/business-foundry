@@ -123,11 +123,20 @@ def _open_quietly(opener, url):
 
 def _say(text, stream):
     # A closed or broken output (for example, piped into a program that has exited) must
-    # not stop the server.
+    # not stop the server. The text that could not be written stays in the stream's buffer,
+    # and Python flushes that buffer again at exit; on a broken pipe that flush fails, prints
+    # a warning and changes the exit status to 120. So once a write fails, the stream's file
+    # is pointed at the null device, and the rest of the output, and that last flush, go nowhere.
     try:
         print(text, file=stream, flush=True)
     except (OSError, ValueError):
-        pass
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            fd = stream.fileno()
+            null = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null, fd)
+            finally:
+                os.close(null)
 
 
 def _is_terminal(stream):
@@ -171,11 +180,24 @@ def _stop_as_ctrl_c(signum, frame):
 
 
 def foundry_command():
-    """The command a person types to run Foundry the way this process was started."""
-    # uv sets UV (and UV_RUN_RECURSION_DEPTH) for the programs `uv run` starts.
-    if os.environ.get("UV") or os.environ.get("UV_RUN_RECURSION_DEPTH"):
+    """The command a person types, in the current folder, to run Foundry as this process was started.
+
+    uv sets UV (and UV_RUN_RECURSION_DEPTH) for the programs `uv run` starts. `uv run foundry`
+    finds Foundry's project by looking for pyproject.toml in the current folder and the folders
+    above it. Someone who started Foundry from another folder with `uv run --project <folder>`
+    needs that option too, so it is named when the project that holds this Python environment
+    (the folder above its .venv) is not the one uv would find from here.
+    """
+    if not (os.environ.get("UV") or os.environ.get("UV_RUN_RECURSION_DEPTH")):
+        return "foundry"
+    project = Path(sys.prefix).resolve().parent
+    if not (project / "pyproject.toml").is_file():
+        return "uv run foundry"  # an environment kept elsewhere: its project is not known
+    here = Path.cwd().resolve()
+    found = next((folder for folder in (here, *here.parents) if (folder / "pyproject.toml").is_file()), None)
+    if found == project:
         return "uv run foundry"
-    return "foundry"
+    return f"uv run --project {shlex.quote(str(project))} foundry"
 
 
 def bind_local(port):
@@ -426,9 +448,11 @@ def main(argv=None):
         if args.command == "start":
             # Printed for a person to type in another terminal, which may not share this
             # process's FOUNDRY_DB, so the database is named unless it is the built-in default.
+            # The path is joined to --db with "=", so a path that starts with "-" is still
+            # read as the path and not as another option.
             token_command = f"{foundry_command()} token"
             if args.db != ".foundry/foundry.db":
-                token_command = f"{foundry_command()} --db {shlex.quote(args.db)} token"
+                token_command = f"{foundry_command()} --db={shlex.quote(args.db)} token"
             code = start_foundry(
                 db_path,
                 port=args.port,

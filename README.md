@@ -22,7 +22,7 @@ uv run foundry start
 
 On the first run, uv installs Foundry's dependencies into `.venv` in that folder (downloading them if needed), then Foundry creates a private workspace and owner key in `.foundry/`. When the server is ready, the terminal shows the address to open, **http://127.0.0.1:8765**, your private sign-in key and how to stop (Ctrl+C), and your default browser opens at that address (on Linux, only when a desktop session is running). Paste the key into the sign-in screen. The application works without an AI subscription or API key.
 
-The first run also adds the synthetic example business described below; use `uv run foundry start --empty` for an empty workspace instead. Later runs reuse the same workspace and key and never add the example again. `start` listens on 127.0.0.1 only. `--port` chooses another port and `--no-browser` skips the browser. If the output is not a terminal (for example, piped or captured by a service), the key is not printed; run `uv run foundry token` to see it.
+The first run also adds the synthetic example business described below; use `uv run foundry start --empty` for an empty workspace instead. Later runs reuse the same workspace and key and never add the example again. `start` listens on 127.0.0.1 only. `--port` chooses another port and `--no-browser` skips the browser. If the output is not a terminal (for example, piped or captured by a service), the key is not printed. The output names the command that shows it instead, for example `uv run foundry token`.
 
 The Polymer Geospatial example is **explicitly synthetic**. Its concept, customers, figures, receipts and completed steps are demonstration fixtures. They do not describe or certify Polymer's actual business.
 
