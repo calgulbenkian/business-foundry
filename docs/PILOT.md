@@ -6,7 +6,7 @@ The public repository includes a synthetic Polymer Geospatial demonstration so a
 
 Establish the founders and their residence/working locations; any existing entity, commitments or IP; the first buyer and paid problem; the intended delivery and data sources; available capital; responsibilities and review authority; the actual relevant jurisdictions; and whether acquisition is an active option or only a comparison.
 
-The system should surface missing facts, not manufacture a confident business plan. Record the initial assumptions and the decisions they affect. Select the applicable jurisdiction guide only after a qualified review of the operating footprint; retain the decision and its basis.
+The system should surface missing facts, not manufacture a confident business plan. Record the initial assumptions and the decisions they affect. Select the applicable jurisdiction guide only after a qualified review of the operating footprint; retain the decision and its basis. The jurisdiction change records the reason and reviewed evidence, keeps earlier guide steps as superseded history and reopens completed work.
 
 ## Smallest useful operating cycle
 
@@ -35,7 +35,7 @@ The v0.1 screening model does not implement a full quality-of-earnings engagemen
 | Can the team repeat delivery? | Named responsibilities, source rights, an acceptance standard and a second observed delivery |
 | Does work complete honestly? | Provider receipts and human assessments distinct from prepared drafts |
 | Are the economics credible? | Reconciled actual effort, costs, invoice and bank receipt compared with a saved forecast |
-| Do corrections propagate? | A changed assumption or withdrawn source reopens dependent decisions and marks prior documents stale |
+| Do corrections propagate? | A changed assumption or withdrawn source reopens dependent decisions and marks prior documents stale; a passed due date marks earlier readiness reports; a jurisdiction change also marks earlier deal analyses and forecasts |
 | Can the data be recovered? | A successful restore and integrity check on a separate private database |
 | Can public users reproduce the software? | Fresh installation, synthetic demonstration, automated checks and usable documentation |
 

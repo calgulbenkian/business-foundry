@@ -2,21 +2,47 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, localcontext
+from decimal import (
+    MAX_EMAX,
+    MAX_PREC,
+    MIN_EMIN,
+    ROUND_05UP,
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    localcontext,
+)
 
 from .models import DealInputs, ForecastInputs
 
 D = Decimal
 ZERO = D(0)
 ONE = D(1)
+CENT, BASIS = D("0.01"), D("0.0001")
+FORECAST_VERSION, ACQUISITION_VERSION = "1.1.1", "1.0.1"
+
+
+def _fixed(value: Decimal, places: Decimal) -> str:
+    # A zero of either sign and any exponent is shown as zero; its exponent says nothing about its size.
+    if value.is_zero():
+        return str(ZERO.quantize(places))
+    # The context is sized to the value, so rounding to the fixed places is never refused for lack of digits.
+    # Only a value whose fixed-point form has more than MAX_PREC digits is refused (InvalidOperation).
+    digits = min(max(value.adjusted() - places.as_tuple().exponent + 2, 1), MAX_PREC)
+    context = Context(prec=digits, rounding=ROUND_HALF_EVEN, Emax=MAX_EMAX, Emin=MIN_EMIN)
+    result = value.quantize(places, context=context)
+    return str(result.copy_abs() if result.is_zero() else result)
 
 
 def money(value: Decimal) -> str:
-    return str(value.quantize(D("0.01")))
+    return _fixed(value, CENT)
 
 
 def ratio(value: Decimal | None) -> str | None:
-    return str(value.quantize(D("0.0001"))) if value is not None else None
+    return _fixed(value, BASIS) if value is not None else None
 
 
 def _forecast(a: ForecastInputs, volume_factor=ONE, fixed_factor=ONE):
@@ -144,7 +170,7 @@ def forecast(inputs: ForecastInputs):
         "upside": _forecast(inputs, D("1.25"), D("1.05")),
     }
     return {
-        "model_version": "1.1.0",
+        "model_version": FORECAST_VERSION,
         "inputs": inputs.model_dump(mode="json"),
         "scenarios": cases,
         "scenario_definitions": {
@@ -208,72 +234,250 @@ def period_rollups(rows: list[dict]) -> list[dict]:
     return result
 
 
+# Significant digits of a payment returned by annual_debt_service and total_annual_debt_service. Up to the 1e12
+# money limit a payment, or the total of two, is below 4e12, so 28 digits leave 13 below the cent, and ROUND_05UP
+# keeps the later half-even rounding to cents exact. The acquisition screen displays this rounded total but never
+# calculates with it: cash after debt service and coverage use the exact fraction (_debt_service_fraction).
+DEBT_SERVICE_DIGITS = 28
+
+
+def _exact_context(prec: int) -> Context:
+    # Inexact is trapped, so an undersized precision raises instead of silently rounding.
+    return Context(
+        prec=max(prec, 1), Emax=MAX_EMAX, Emin=MIN_EMIN, traps=[Inexact, InvalidOperation, Overflow]
+    )
+
+
+def _payment(principal: Decimal, rate: Decimal, years: int) -> tuple[Decimal, Decimal]:
+    """The exact annual payment as numerator / denominator: principal × rate × s^n / (s^n − 12^n), s = 12 + rate.
+
+    The equivalent form principal × m / (1 − (1 + m)^−n) × 12, with m = rate / 12, needs 1 + m, which has
+    no exact decimal. Here both parts are exact Decimals; only their quotient needs rounding.
+    """
+    if not rate:
+        return principal, D(years)
+    n = years * 12
+    exact_digits = len(principal.as_tuple().digits) + 8
+    # A validated rate has at most 12 decimal places, so s has at most 14 digits and s^n at most 14n.
+    rate = rate.normalize(Context(prec=len(rate.as_tuple().digits)))
+    s_digits = max(rate.adjusted() + 2, 3) + max(-rate.as_tuple().exponent, 0)
+    ctx = _exact_context(exact_digits + len(rate.as_tuple().digits) + s_digits * n)
+    growth = ctx.power(ctx.add(D(12), rate), n)
+    numerator = ctx.multiply(ctx.multiply(principal, rate), growth)
+    return numerator, ctx.subtract(growth, ctx.power(D(12), n))
+
+
+def _rounded(numerator: Decimal, denominator: Decimal) -> Decimal:
+    # Round once, keeping at least 28 digits and two below the cent, so money() of the result equals the
+    # exact quotient rounded half-even to cents.
+    magnitude = numerator.adjusted() - denominator.adjusted() + 2
+    digits = max(DEBT_SERVICE_DIGITS, magnitude + 3)
+    context = Context(prec=digits, rounding=ROUND_05UP, Emax=MAX_EMAX, Emin=MIN_EMIN)
+    return context.divide(numerator, denominator)
+
+
+def _times(a: Decimal, b: Decimal) -> Decimal:
+    return _exact_context(len(a.as_tuple().digits) + len(b.as_tuple().digits)).multiply(a, b)
+
+
+def _plus(a: Decimal, b: Decimal) -> Decimal:
+    # Enough digits to span both values from the highest digit to the lowest, plus one for a carry.
+    top, bottom = max(a.adjusted(), b.adjusted()), min(a.as_tuple().exponent, b.as_tuple().exponent)
+    return _exact_context(top - bottom + 2).add(a, b)
+
+
 def annual_debt_service(principal: Decimal, rate: Decimal, years: int) -> Decimal:
+    """Level monthly payment of one loan, annualized, rounded once from its exact value."""
     if not principal:
         return ZERO
-    n, monthly = years * 12, rate / 12
-    if monthly == 0:
-        return principal / n * 12
-    return principal * monthly / (1 - (1 + monthly) ** -n) * 12
+    return _rounded(*_payment(principal, rate, years))
+
+
+def total_annual_debt_service(*loans: tuple[Decimal, Decimal, int]) -> Decimal:
+    """Total annualized level payment of several (principal, rate, years) loans.
+
+    The loans' exact payments are added as one exact fraction and rounded once, as annual_debt_service rounds
+    one payment, so money() of the total equals the exact total rounded half-even to cents.
+    """
+    parts = [_payment(p, r, y) for p, r, y in loans if p]
+    if not parts:
+        return ZERO
+    return _rounded(*_sum_of_fractions(parts))
+
+
+def _sum_of_fractions(parts: list[tuple[Decimal, Decimal]]) -> tuple[Decimal, Decimal]:
+    numerator, denominator = parts[0]
+    for num, den in parts[1:]:
+        numerator = _plus(_times(numerator, den), _times(num, denominator))
+        denominator = _times(denominator, den)
+    return numerator, denominator
+
+
+def _debt_service_fraction(*loans: tuple[Decimal, Decimal, int]) -> tuple[Decimal, Decimal]:
+    """The exact total annual payment of the loans as numerator / denominator, with a positive denominator.
+
+    Each loan's denominator is its term in years (zero rate) or s^n − 12^n with s = 12 + rate > 12 (a positive
+    rate), so it is positive for every accepted loan, and the total's denominator is their product. A rate that
+    validation would refuse can give a negative denominator; both parts are then negated, which leaves the
+    quotient unchanged. With no loan that has a principal the fraction is 0 / 1.
+    """
+    parts = [_payment(p, r, y) for p, r, y in loans if p]
+    if not parts:
+        return ZERO, ONE
+    numerator, denominator = _sum_of_fractions(parts)
+    if denominator < 0:
+        numerator, denominator = numerator.copy_negate(), denominator.copy_negate()
+    return numerator, denominator
+
+
+# Exact arithmetic for the acquisition screen. Every sum, difference and product is formed in a context sized to
+# its operands with Inexact trapped, so no intermediate value is ever rounded; the digit counts an accepted input
+# can reach at each step are listed in docs/FINANCE.md and checked in tests/test_finance_bounds.py.
+
+
+def _sized(prec: int) -> Context:
+    # A precision beyond the decimal module's limit is only reachable by inputs that bypass validation.
+    if prec > MAX_PREC:
+        raise InvalidOperation("An exact result would need more digits than Decimal supports.")
+    return _exact_context(prec)
+
+
+def _mul(a: Decimal, b: Decimal) -> Decimal:
+    if a.is_zero() or b.is_zero():
+        return ZERO
+    return _sized(len(a.as_tuple().digits) + len(b.as_tuple().digits)).multiply(a, b)
+
+
+def _add(a: Decimal, b: Decimal) -> Decimal:
+    # A zero is skipped, so a zero written with an extreme exponent never sizes the context.
+    if a.is_zero():
+        return b
+    if b.is_zero():
+        return a
+    top, bottom = max(a.adjusted(), b.adjusted()), min(a.as_tuple().exponent, b.as_tuple().exponent)
+    return _sized(top - bottom + 2).add(a, b)
+
+
+def _sub(a: Decimal, b: Decimal) -> Decimal:
+    return _add(a, b.copy_negate())
+
+
+def _quotient(numerator: Decimal, denominator: Decimal, places: Decimal) -> Decimal:
+    """numerator / denominator for display at `places`: _fixed(result, places) is the exact quotient rounded
+    half-even once.
+
+    The precision is sized to the quotient's own magnitude and places, keeping at least two digits below the
+    last displayed place, whatever the size of the quotient (a coverage ratio can exceed 1E+25). ROUND_05UP
+    leaves a final 0 or 5 only on an exact result, so the later half-even rounding sees ties only where the exact
+    quotient has one.
+    """
+    if numerator.is_zero():
+        return ZERO
+    # The quotient's adjusted exponent is at most numerator.adjusted() − denominator.adjusted().
+    digits = numerator.adjusted() - denominator.adjusted() - places.as_tuple().exponent + 3
+    if digits > MAX_PREC:
+        raise InvalidOperation("The quotient is too large to display.")
+    context = Context(prec=max(digits, 1), rounding=ROUND_05UP, Emax=MAX_EMAX, Emin=MIN_EMIN)
+    return context.divide(numerator, denominator)
+
+
+def _accepted(item, verified_evidence: set[str]) -> bool:
+    return bool(item.evidence_id and item.evidence_id in verified_evidence)
+
+
+SCENARIOS = (("base", ZERO, ZERO), ("downside", D("0.10"), ZERO), ("upside", ZERO, D("0.05")))
+
+
+def _deal_values(a: DealInputs, verified_evidence: set[str]) -> dict:
+    """The exact value of every acquisition figure and of each step that forms it (docs/FINANCE.md).
+
+    Nothing here is rounded. Each figure that depends on debt service is kept over the exact debt-service
+    denominator: cash after debt service is after_numerator / denominator and coverage is
+    scaled_available / numerator, where scaled_available = available × denominator.
+    """
+    normalized = _sub(a.reported_ebitda, a.replacement_management)
+    for item in a.adjustments:
+        if _accepted(item, verified_evidence):
+            normalized = _add(normalized, item.amount)
+    uses = _add(_add(_add(a.purchase_price, a.fees), a.working_capital), a.integration_cost)
+    numerator, denominator = _debt_service_fraction(
+        (a.senior_debt, a.debt_rate, a.debt_years), (a.seller_note, a.seller_rate, a.seller_years)
+    )
+    interest = _add(_mul(a.senior_debt, a.debt_rate), _mul(a.seller_note, a.seller_rate))
+    values = {
+        "normalized": normalized,
+        "uses": uses,
+        "buyer_equity": _sub(_sub(uses, a.senior_debt), a.seller_note),
+        "interest": interest,
+        "numerator": numerator,
+        "denominator": denominator,
+        "scenarios": {},
+    }
+    for name, cut, lift in SCENARIOS:
+        earnings = _add(_sub(normalized, _mul(a.annual_revenue, cut)), _mul(a.annual_revenue, lift))
+        taxable = _sub(earnings, interest)
+        tax = _mul(max(taxable, ZERO), a.tax_rate)
+        available = _sub(_sub(_sub(earnings, tax), a.annual_capex), a.annual_working_capital_growth)
+        scaled = _mul(available, denominator)
+        values["scenarios"][name] = {
+            "earnings": earnings,
+            "taxable": taxable,
+            "tax": tax,
+            "available": available,
+            "scaled_available": scaled,
+            "after_numerator": _sub(scaled, numerator),
+        }
+    if normalized > 0:
+        low, high = _mul(normalized, a.multiple_low), _mul(normalized, a.multiple_high)
+        bridge = _sub(a.cash_acquired, a.debt_assumed)
+        values["value_range"] = (low, high)
+        values["equity_range"] = (_add(low, bridge), _add(high, bridge))
+    return values
 
 
 def acquisition(inputs: DealInputs, verified_evidence: set[str]):
     a = inputs
     accepted, excluded = [], []
-    normalized = a.reported_ebitda - a.replacement_management
     for item in a.adjustments:
         row = item.model_dump(mode="json")
-        if item.evidence_id and item.evidence_id in verified_evidence:
+        if _accepted(item, verified_evidence):
             accepted.append(row)
-            normalized += item.amount
         else:
             excluded.append({**row, "reason": "A reviewed evidence record is required."})
-    uses = a.purchase_price + a.fees + a.working_capital + a.integration_cost
-    senior_service = annual_debt_service(a.senior_debt, a.debt_rate, a.debt_years)
-    seller_service = annual_debt_service(a.seller_note, a.seller_rate, a.seller_years)
-    service = senior_service + seller_service
-    debt_interest = a.senior_debt * a.debt_rate + a.seller_note * a.seller_rate
+    v = _deal_values(a, verified_evidence)
+    numerator, denominator = v["numerator"], v["denominator"]
     scenarios = {}
-    for name, earnings in [
-        ("base", normalized),
-        ("downside", normalized - a.annual_revenue * D("0.10")),
-        ("upside", normalized + a.annual_revenue * D("0.05")),
-    ]:
-        tax = max(earnings - debt_interest, ZERO) * a.tax_rate
-        available = earnings - tax - a.annual_capex - a.annual_working_capital_growth
-        after = available - service
+    for name, s in v["scenarios"].items():
         scenarios[name] = {
-            "ebitda": money(earnings),
-            "cash_available_for_debt_service": money(available),
-            "cash_after_debt_service": money(after),
-            "coverage_ratio": ratio(available / service) if service else None,
-            "cash_shortfall": after < 0,
+            "ebitda": money(s["earnings"]),
+            "cash_available_for_debt_service": money(s["available"]),
+            "cash_after_debt_service": money(_quotient(s["after_numerator"], denominator, CENT)),
+            "coverage_ratio": ratio(_quotient(s["scaled_available"], numerator, BASIS))
+            if not numerator.is_zero()
+            else None,
+            # The denominator is positive, so the numerator's sign is the sign of the exact cash after debt service.
+            "cash_shortfall": s["after_numerator"] < 0,
         }
-    low, high = normalized * a.multiple_low, normalized * a.multiple_high
     return {
-        "model_version": "1.0.0",
+        "model_version": ACQUISITION_VERSION,
         "inputs": a.model_dump(mode="json"),
-        "normalized_ebitda": money(normalized),
+        "normalized_ebitda": money(v["normalized"]),
         "accepted_adjustments": accepted,
         "excluded_adjustments": excluded,
-        "enterprise_value_range": [money(low), money(high)] if normalized > 0 else None,
-        "equity_value_range": [
-            money(low + a.cash_acquired - a.debt_assumed),
-            money(high + a.cash_acquired - a.debt_assumed),
-        ]
-        if normalized > 0
-        else None,
+        "enterprise_value_range": [money(x) for x in v["value_range"]] if "value_range" in v else None,
+        "equity_value_range": [money(x) for x in v["equity_range"]] if "equity_range" in v else None,
         "sources_and_uses": {
             "purchase_price": money(a.purchase_price),
             "fees": money(a.fees),
             "working_capital": money(a.working_capital),
             "integration_cost": money(a.integration_cost),
-            "total_uses": money(uses),
+            "total_uses": money(v["uses"]),
             "senior_debt": money(a.senior_debt),
             "seller_note": money(a.seller_note),
-            "buyer_equity_required": money(uses - a.senior_debt - a.seller_note),
+            "buyer_equity_required": money(v["buyer_equity"]),
         },
-        "annual_debt_service": money(service),
+        # Displayed only: the exact fraction rounded once to cents, as total_annual_debt_service rounds it.
+        "annual_debt_service": money(_rounded(numerator, denominator)),
         "scenarios": scenarios,
         "limitations": [
             "Multiples are user assumptions, not licensed transaction comparables.",

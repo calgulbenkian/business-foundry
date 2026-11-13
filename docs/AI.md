@@ -2,9 +2,11 @@
 
 The core application is deterministic and works without AI. There are two optional paths, with different account and data-sharing boundaries.
 
+The MCP path needs a server at a fixed address, `foundry start` or `foundry serve`: the desktop app picks a new port at every launch, so an MCP adapter has no fixed address to reach. The direct provider review also works in the desktop window, which builds the same adviser, but only when the app inherits the provider settings below, for example when `foundry-desktop` is started from a terminal in which they are exported. An app opened from Finder or the Start menu does not inherit the settings exported in your shell, so for that use `foundry start` or `foundry serve`.
+
 ## 1. Compatible AI client through MCP
 
-Run the Foundry server. In **Access & AI**, create a key with the **agent** role and explicitly select its businesses. Alternatively:
+Run the Foundry server. In **Access & assistants**, create a key with the **agent** role and explicitly select its businesses. Alternatively:
 
 ```sh
 uv run foundry key --name "Planning assistant" --role agent --business BUSINESS_ID
@@ -35,7 +37,7 @@ A typical stdio client configuration has this shape; adapt it to the client's do
 }
 ```
 
-The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote URLs. Tools list businesses, read the workspace, create or update assumption and reported records, attach unverified evidence, prepare work, run financial/deal analyses and generate working documents. Human approvals, evidence verification, external-submission attestations and payment reconciliation are not agent tools; the service also rejects those actions for the agent role even if a caller bypasses MCP.
+The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote URLs. Tools list businesses, read the workspace, create or update assumption and reported records, attach unverified evidence, prepare work, run financial/deal analyses and generate working documents. Human approvals, evidence verification, external-submission attestations, payment reconciliation and planning-jurisdiction changes are not agent tools; the service also rejects those actions for the agent role even if a caller bypasses MCP.
 
 ### Updating records
 
@@ -45,11 +47,11 @@ The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote U
 
 The adapter registers three MCP prompts, each taking a `business_id`:
 
-- `founder_intake` — interview for starting from a concept: intended buyer, concrete problem, offer/pricing/acceptance, delivery assets and third-party rights, unit economics and cash timing (`build_forecast`), and source evidence (`add_evidence`).
+- `founder_intake` — interview for starting from a concept: intended buyer, concrete problem, offer/pricing/acceptance, delivery assets and third-party rights, unit economics and cash timing (`build_forecast`), source evidence (`add_evidence`), and the operating footprint a human needs to select the planning jurisdiction.
 - `acquisition_intake` — target and thesis, reported revenue/EBITDA and replacement management, evidence-backed earnings adjustments, then valuation multiples, uses and debt or seller financing (`analyze_acquisition`).
-- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals or documents; summarizes gaps and asks before changing anything.
+- `readiness_review` — audit of tasks and blockers, unsupported assumptions, and stale deals, forecasts or documents (each stale deal, forecast or document lists its reasons in `stale_reasons`). It starts from the latest readiness report when one is current, offers to generate one otherwise, summarizes gaps and asks before changing anything.
 
-Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, and use `prepare_task` only to prepare work. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
+Prompts are static instructions. They make no API calls and never embed stored business content; workspace data reaches the client only through tool results, which the prompts tell the model to treat as untrusted. Text an agent writes into records, evidence or step notes is printed literally in generated documents, so it cannot add images, HTML or structure to a document a reviewer reads, or a link that hides its address behind other words. A viewer that strikes through text between single tildes (GitHub does) will strike it through, with the words still present. A web or email address it types in full stays visible as typed, and some viewers make it clickable. Every prompt restates the same boundaries: record only assumption or reported certainty, refine with `update_record` instead of duplicating, use `prepare_task` only to prepare work, and leave the planning jurisdiction to a human. A human owner or reviewer still approves tasks, verifies evidence and records, and attests external submissions and payments.
 
 If your client does not surface MCP prompts, follow the same sequence manually: ask the assistant to call `get_business` for the business ID, then interview you one topic at a time in the order above, saving each answer with `add_record` (new) or `update_record` (existing) and attaching sources with `add_evidence`, before running `build_forecast` or `analyze_acquisition` and reviewing the results yourself.
 
@@ -70,7 +72,7 @@ uv run foundry serve
 
 The `.env.example` file documents settings. The application does not automatically load arbitrary `.env` files; use your shell, process manager or container secret configuration.
 
-From **Access & AI**, request a review and explicitly agree to sharing. Each request sends the business profile, up to 200 record summaries (titles, states, details limited to 2,000 characters, evidence-reference IDs), workspace totals and the question. Original evidence bodies, generated documents, full financial tables, access keys and credentials are omitted. Titles, details and totals may still be confidential. Review the workspace before sharing.
+From **Access & assistants**, request a review and explicitly agree to sharing. Each request sends the business profile, up to 200 record summaries (titles, states, details limited to 2,000 characters, evidence-reference IDs), workspace totals and the question. Original evidence bodies, generated documents, full financial tables, access keys and credentials are omitted. Titles, details and totals may still be confidential. Review the workspace before sharing.
 
 The request uses the [Responses API Structured Outputs format](https://developers.openai.com/api/docs/guides/structured-outputs), `store: false`, a bounded output-token budget and no execution tools. `store: false` is a provider setting, not a claim of zero provider retention; applicable account terms and controls still govern processing. The server-wide request limit counts reservations, including failures and unknown outcomes. It is a call limit, not a currency-denominated spending cap; set provider-side budgets as appropriate. `FOUNDRY_AI_DAILY_CALLS` must be a whole number of 0 or greater and at most 100000 (default 20 when unset; 0 blocks all reviews). After surrounding whitespace is removed, it must be written in plain ASCII digits with no sign, separator, exponent or leading zero: `0`, `20` and `100000` are accepted; `020`, `00`, `+5`, `5_0`, `1e3`, an empty value and anything above 100000 are refused. Any other value, such as a negative, decimal, padded or oversized number, fails closed: review requests are refused with HTTP 503, the same status used when the provider is not configured, and no provider request is made or reserved, and no event is recorded. A review refused this way can be retried with the same idempotency key once the setting is corrected. The automated tests check this with a mocked transport only; they make no live provider call.
 

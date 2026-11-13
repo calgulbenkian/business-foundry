@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import get_args
 from uuid import uuid4
 
 from . import models
@@ -18,21 +20,50 @@ from .service import Service
 from .store import DomainError, Store
 
 
-def backup_database(source: Path, destination: Path):
+def not_foundry_database(source: Path) -> str:
+    return f"{source.resolve()} is not a Foundry database."
+
+
+def backup_database(source: Path, destination: Path) -> int:
+    """Copy the Foundry database at ``source`` to the new file ``destination``.
+
+    The source database file is opened read-only and never created or changed; SQLite may add its
+    own ``-wal`` and ``-shm`` working files beside a source in WAL mode. A source that is a folder, is
+    not an SQLite database, or has no Foundry tables is refused, and the destination file is
+    removed. Returns the number of businesses in the finished copy, counted from the copy.
+    """
     if source.resolve() == destination.resolve():
         raise ValueError("Source and destination must differ.")
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     try:
+        if source.is_dir():
+            raise ValueError(not_foundry_database(source))
         src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)
         dst = sqlite3.connect(destination)
         try:
-            if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            try:
+                check = src.execute("PRAGMA integrity_check").fetchone()[0]
+            except sqlite3.DatabaseError as exc:
+                if exc.sqlite_errorcode == sqlite3.SQLITE_NOTADB:
+                    raise ValueError(not_foundry_database(source)) from None
+                raise
+            if check != "ok":
                 raise ValueError("Source database failed its integrity check.")
-            if src.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0] != "1":
+            tables = {row[0] for row in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"metadata", "businesses"} <= tables:
+                raise ValueError(not_foundry_database(source))
+            try:
+                version = src.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+            except sqlite3.OperationalError:  # a metadata table that is not Foundry's
+                version = None
+            if version is None:
+                raise ValueError(not_foundry_database(source))
+            if version[0] != "1":
                 raise ValueError("Unsupported source database version.")
             src.backup(dst)
+            return dst.execute("SELECT COUNT(*) FROM businesses").fetchone()[0]
         finally:
             src.close()
             dst.close()
@@ -292,6 +323,23 @@ def main(argv=None):
         ],
     )
     document.add_argument("--deal-id")
+    jurisdiction = commands.add_parser(
+        "jurisdiction",
+        help="Change the planning jurisdiction as the local owner: supersede the old guide's steps, "
+        "add the new guide's steps and reopen completed work (not legal advice; no entity is moved)",
+    )
+    jurisdiction.add_argument("business_id")
+    jurisdiction.add_argument("jurisdiction", choices=get_args(models.Jurisdiction))
+    jurisdiction.add_argument("--reason", help="Why the human decision was made (required to change)")
+    jurisdiction.add_argument(
+        "--evidence", action="extend", nargs="+", default=[], metavar="ID", help="Reviewed evidence IDs"
+    )
+    jurisdiction.add_argument(
+        "--expected-version", type=int, help="Business version the decision was based on (default: current)"
+    )
+    jurisdiction.add_argument(
+        "--preview", action="store_true", help="Show the effect without changing anything"
+    )
     for name in ("export", "verify"):
         command = commands.add_parser(
             name,
@@ -334,6 +382,28 @@ def main(argv=None):
                 f"Restored {db_path}. Existing credentials remain valid; retain the original owner.key securely."
             )
             return
+        if args.command == "backup":
+            # Checked before anything is opened: naming no database must not create one.
+            if not db_path.exists():
+                raise ValueError(f"No database at {db_path}. Name the database to back up with --db.")
+            # Folders this backup creates for its destination are removed again if it fails.
+            created, folder = [], args.destination.resolve().parent
+            while not folder.exists() and folder != folder.parent:
+                created.append(folder)
+                folder = folder.parent
+            try:
+                count = backup_database(db_path, args.destination)
+            except BaseException:
+                for folder in created:  # the deepest first; a folder that is not empty stays
+                    with contextlib.suppress(OSError):
+                        folder.rmdir()
+                raise
+            print(
+                f"Saved {args.destination.resolve()}: a copy of {db_path} holding {count} "
+                f"{'business' if count == 1 else 'businesses'}. "
+                "This private backup includes credential hashes and business data."
+            )
+            return
         store = Store(db_path)
         service = Service(store)
         if args.command in {"init", "demo", "serve"}:
@@ -354,11 +424,6 @@ def main(argv=None):
                 file=sys.stderr,
             )
             uvicorn.run(create_app(db_path), host=args.host, port=args.port, log_level="info")
-        elif args.command == "backup":
-            backup_database(db_path, args.destination)
-            print(
-                f"Saved {args.destination}. This private backup includes credential hashes and business data."
-            )
         else:
             actor = store.authenticate(token_path.read_text().strip())
             if args.command == "demo":
@@ -389,6 +454,23 @@ def main(argv=None):
                 payload = model.model_validate_json(args.configuration.read_text()).model_dump(mode="json")
                 fn = service.save_forecast if args.command == "forecast" else service.save_deal
                 print(json.dumps(fn(actor, args.business_id, str(uuid4()), payload), indent=2))
+            elif args.command == "jurisdiction":
+                if args.preview:
+                    result = service.preview_jurisdiction(actor, args.business_id, args.jurisdiction)
+                else:
+                    if args.reason is None:
+                        raise ValueError("Give --reason for the jurisdiction decision, or use --preview.")
+                    version = args.expected_version
+                    if version is None:
+                        version = service.snapshot(actor, args.business_id)["business"]["version"]
+                    payload = models.JurisdictionChange(
+                        expected_version=version,
+                        jurisdiction=args.jurisdiction,
+                        reason=args.reason,
+                        evidence_ids=args.evidence,
+                    ).model_dump(mode="json")
+                    result = service.change_jurisdiction(actor, args.business_id, str(uuid4()), payload)
+                print(json.dumps(result, indent=2))
             elif args.command == "document":
                 payload = models.DocumentCreate(template=args.template, deal_id=args.deal_id).model_dump(
                     mode="json"

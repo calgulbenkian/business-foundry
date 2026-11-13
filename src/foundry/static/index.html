@@ -2,8 +2,9 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#153d38" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#26282c" media="(prefers-color-scheme: dark)" />
     <title>Business Foundry</title>
     <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/style.css" />
@@ -11,96 +12,138 @@
   </head>
   <body>
     <section id="login" class="login-screen" hidden>
-      <div class="login-story">
-        <div class="brand"><span class="mark">bf</span> Business Foundry</div>
-        <div>
-          <p class="eyebrow">A FOUNDATION FOR WHAT COMES NEXT</p>
-          <h1>From an idea<br />to a business<br />you can run.</h1>
+      <div class="login-panel">
+        <p class="login-app"><span class="appname">Business Foundry</span></p>
+        <h1>Open your workspace</h1>
+        <p class="login-lede">
+          Start something new, or buy something worth building on. Keep the decisions, evidence and
+          work connected.
+        </p>
+        <form id="login-form">
+          <label class="field"
+            >Access key<input
+              name="token"
+              type="password"
+              required
+              autocomplete="current-password"
+              placeholder="Paste your access key"
+          /></label>
+          <button class="btn primary" type="submit">Open workspace</button>
+          <p id="login-error" role="alert" class="error"></p>
+          <p id="login-note" role="status" class="fine"></p>
+        </form>
+        <details class="login-help">
+          <summary>Finding your key</summary>
           <p>
-            Start something new. Buy something worth building on.<br />Keep the decisions, evidence
-            and work connected.
+            If you started Foundry with <code>foundry start</code>, the key is shown in the terminal
+            where you started it. Otherwise, run <code>uv run foundry token</code> in the repository
+            folder. Keep this key private. For shared access, ask the workspace owner for a scoped
+            key.
           </p>
-        </div>
-        <p class="small">Open source · Local first · Built for human judgment</p>
-      </div>
-      <div class="login-form">
-        <div>
-          <p class="eyebrow">YOUR PRIVATE WORKSPACE</p>
-          <h2>Welcome to the Foundry.</h2>
-          <p>Sign in with the access key from your local setup.</p>
-          <form id="login-form">
-            <label
-              >Access key<input
-                name="token"
-                type="password"
-                required
-                autocomplete="current-password"
-                placeholder="Paste your access key" /></label
-            ><button class="primary" type="submit">
-              Open workspace <span aria-hidden="true">↗</span>
-            </button>
-            <p id="login-error" role="alert" class="error"></p>
-          </form>
-          <details>
-            <summary>Finding your key</summary>
-            <p>
-              If you started Foundry with <code>foundry start</code>, the key is shown in the
-              terminal window where you started it. Otherwise, run
-              <code>uv run foundry token</code> in the repository folder. Keep this key private. For
-              shared access, ask the workspace owner for a scoped key.
-            </p>
-          </details>
-          <p class="small">
-            Business records stay on this server. AI sharing is optional and requires a separate
-            action.
-          </p>
-        </div>
+        </details>
+        <p class="fine">
+          Business records stay on this server. Sharing with an assistant is optional and needs a
+          separate action each time.
+        </p>
       </div>
     </section>
-    <div id="app" hidden>
-      <aside class="sidebar">
-        <a class="brand" href="/" aria-label="Business Foundry home"
-          ><span class="mark">bf</span><span>Business <br />Foundry</span></a
-        ><label class="workspace-label" for="business-select">WORKSPACE</label
-        ><select id="business-select" aria-label="Choose business"></select>
-        <nav aria-label="Business sections" id="nav"></nav>
-        <div class="sidebar-bottom">
-          <span class="local-dot"></span> Your data. Your decisions.
-          <p>v0.1 · Open operating foundation</p>
-          <button class="text-button" data-action="logout">Sign out</button>
+
+    <div class="app" id="app" data-level="list" hidden>
+      <header class="toolbar">
+        <div class="tb-brand">
+          <span class="appname">Business Foundry</span
+          ><span class="tb-div" aria-hidden="true"></span>
+          <label class="ws-pick"
+            ><span class="vh">Choose business</span
+            ><select id="business-select" aria-label="Choose business"></select
+          ></label>
+          <span class="tag" id="demo-tag" hidden>Synthetic<span class="tag-long"> demo</span></span>
         </div>
-      </aside>
-      <main>
-        <header class="topbar">
-          <span id="breadcrumb">Workspace / Overview</span>
-          <div>
-            <span id="actor-name" class="small"></span
-            ><button class="secondary compact" data-action="new-business">+ New business</button>
+        <label class="search">
+          <span class="vh">Search the current list</span>
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+            <circle cx="5" cy="5" r="3.8" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <path d="M8 8l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+          </svg>
+          <input id="q" type="search" placeholder="Search Today" autocomplete="off" />
+        </label>
+        <div class="tb-meta">
+          <span id="tb-date"></span><b id="actor-name"></b
+          ><button type="button" class="btn small" data-action="new-business" hidden>
+            + New business</button
+          ><button type="button" class="btn small" data-action="logout">Sign out</button>
+        </div>
+      </header>
+
+      <div class="outdated" id="outdated" hidden>
+        <p id="outdated-text" role="alert"></p>
+        <div class="outdated-actions">
+          <button type="button" class="btn small primary" data-action="reload">
+            Load current records</button
+          ><button type="button" class="btn small" data-action="dismiss-outdated">Dismiss</button>
+        </div>
+      </div>
+
+      <div class="panes">
+        <nav class="pane sources" aria-label="Sources">
+          <div class="src-nav" id="src-nav"></div>
+          <div class="src-foot" id="src-foot"></div>
+        </nav>
+
+        <section class="pane list" aria-labelledby="list-title">
+          <div class="pane-head">
+            <button class="back" id="back-src" type="button" aria-label="Back to sources">
+              <svg width="10" height="16" viewBox="0 0 10 16" aria-hidden="true">
+                <path
+                  d="M8 2 2 8l6 6"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                /></svg
+              >Sources
+            </button>
+            <h1 id="list-title">Today</h1>
+            <span class="ph-right" id="list-right"></span>
           </div>
-        </header>
-        <div id="demo-banner" class="demo-banner" hidden>
-          SYNTHETIC DEMO
-          <span
-            >This workspace uses fictional figures and receipts. No real legal or commercial action
-            has occurred.</span
-          >
-        </div>
-        <section id="content" aria-live="polite"></section>
-        <footer>
-          Built on records, evidence and accountable decisions.
-          <a
-            href="https://github.com/calgulbenkian/business-foundry"
-            target="_blank"
-            rel="noopener noreferrer"
-            >View the open source project ↗</a
-          >
-        </footer>
-      </main>
+          <div class="list-body" id="list"></div>
+        </section>
+
+        <section class="pane inspector" aria-labelledby="insp-title">
+          <div class="pane-head">
+            <button class="back" id="back-list" type="button">
+              <svg width="10" height="16" viewBox="0 0 10 16" aria-hidden="true">
+                <path
+                  d="M8 2 2 8l6 6"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                /></svg
+              ><span id="back-list-lbl">Today</span>
+            </button>
+            <span class="crumb" id="crumb"></span>
+          </div>
+          <div id="insp"></div>
+        </section>
+      </div>
     </div>
-    <dialog id="dialog">
+
+    <dialog id="dialog" aria-labelledby="dialog-title">
       <div class="dialog-heading">
         <h2 id="dialog-title"></h2>
-        <button class="icon-button" data-action="close-dialog" aria-label="Close dialog">×</button>
+        <button type="button" class="icon-btn" data-action="close-dialog" aria-label="Close dialog">
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+            <path
+              d="M2 2l8 8M10 2l-8 8"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
       </div>
       <div id="dialog-content"></div>
     </dialog>

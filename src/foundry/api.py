@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import MutableHeaders
@@ -152,7 +152,17 @@ def validation_message(error, route=None):
     return where + ": " + ("an unexpected field was sent" if extra else error["msg"])
 
 
-def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
+def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=None):
+    """Build the web application.
+
+    ``desktop`` is the desktop app's launch sign-in (``foundry.desktop.LaunchSignIn``). When it
+    is given, only its exact ``host`` (127.0.0.1 and the port) is accepted, writes are judged
+    against its exact ``origin`` (``FOUNDRY_PUBLIC_ORIGIN`` is ignored), the window signs in at
+    ``/desktop/start`` with the launch code, and a page opened without that session gets a plain
+    instruction page instead of the sign-in form. An owner's ``/api/me`` then also holds
+    ``desktop``: the path of the database this server opened and the command that backs it up
+    (``foundry.desktop.backup_command``). No other role, and no ordinary server, gets that field.
+    """
     store = Store(db_path or os.getenv("FOUNDRY_DB", ".foundry/foundry.db"))
     service, app = (
         Service(store),
@@ -171,6 +181,14 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
     hosts = allowed_hosts or os.getenv("FOUNDRY_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
     failed_logins = defaultdict(deque)
+    desktop_database = None
+    if desktop is not None:
+        from .desktop import backup_command
+
+        # The database this server opened, told to the window's owner so the settings page can
+        # name it in the backup command.
+        database = str(store.path)
+        desktop_database = {"database": database, "backup_command": backup_command(database, os.name)}
 
     @app.exception_handler(DomainError)
     async def domain_error(request, exc):
@@ -189,6 +207,10 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
 
     @app.middleware("http")
     async def boundaries(request: Request, call_next):
+        # The host middleware ignores the port. The desktop server accepts only its own exact
+        # 127.0.0.1:<port>, so a web page reaching it through a rebound DNS name is refused.
+        if desktop is not None and request.headers.getlist("host") != [desktop.host]:
+            return PlainTextResponse("Invalid host header", status_code=400)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             # Two Origin (or Sec-Fetch-Site) headers are ambiguous: a browser never sends them,
             # and judging by whichever comes first would let one value hide the other.
@@ -201,7 +223,12 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
                     status_code=403,
                 )
             origin = request.headers.get("origin")
-            expected = os.getenv("FOUNDRY_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
+            if desktop is not None:
+                # The window's origin is known exactly. FOUNDRY_PUBLIC_ORIGIN describes a server
+                # deployment; left over in the environment, it would silently refuse every save.
+                expected = desktop.origin
+            else:
+                expected = os.getenv("FOUNDRY_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
             if origin and origin != expected:
                 return JSONResponse({"detail": "Cross-origin writes are not accepted."}, status_code=403)
             fetch_site = request.headers.get("sec-fetch-site")
@@ -304,7 +331,10 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
 
     @app.get("/api/me")
     def me(who=Depends(actor)):
-        return {**who, "ai_configured": adviser.configured()}
+        answer = {**who, "ai_configured": adviser.configured()}
+        if desktop_database is not None and who["role"] == "owner":
+            answer["desktop"] = dict(desktop_database)
+        return answer
 
     @app.get("/api/catalog")
     def get_catalog(who=Depends(actor)):
@@ -325,6 +355,16 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
     @app.put("/api/businesses/{bid}")
     def update_business(bid: str, body: models.BusinessUpdate, who=Depends(actor), command=Depends(key)):
         return service.update_business(who, bid, command, body.model_dump(mode="json"))
+
+    @app.get("/api/businesses/{bid}/jurisdiction/preview")
+    def preview_jurisdiction(bid: str, to: models.Jurisdiction, who=Depends(actor)):
+        return service.preview_jurisdiction(who, bid, to)
+
+    @app.post("/api/businesses/{bid}/jurisdiction")
+    def change_jurisdiction(
+        bid: str, body: models.JurisdictionChange, who=Depends(actor), command=Depends(key)
+    ):
+        return service.change_jurisdiction(who, bid, command, body.model_dump(mode="json"))
 
     @app.post("/api/businesses/{bid}/records", status_code=201)
     def create_record(bid: str, body: models.RecordCreate, who=Depends(actor), command=Depends(key)):
@@ -422,8 +462,36 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None):
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 
-    @app.get("/")
-    def index():
-        return FileResponse(static / "index.html")
+    if desktop is not None:
+        from .desktop import BROWSER_PAGE
+
+        def signed_in(request):
+            try:
+                store.authenticate(request.cookies.get("foundry_session", ""), session=True)
+                return True
+            except DomainError:
+                return False
+
+        @app.get("/desktop/start", include_in_schema=False)
+        def desktop_start(code: str = ""):
+            token = desktop.redeem(code)
+            if not token:
+                return HTMLResponse(BROWSER_PAGE, status_code=403)
+            # Redirect so the code leaves the address. No max_age: the cookie ends with the window.
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie("foundry_session", token, httponly=True, samesite="strict")
+            return response
+
+        @app.get("/")
+        def desktop_index(request: Request):
+            if not signed_in(request):
+                return HTMLResponse(BROWSER_PAGE, status_code=403)
+            return FileResponse(static / "index.html")
+
+    else:
+
+        @app.get("/")
+        def index():
+            return FileResponse(static / "index.html")
 
     return app
