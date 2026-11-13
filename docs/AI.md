@@ -37,7 +37,7 @@ A typical stdio client configuration has this shape; adapt it to the client's do
 }
 ```
 
-The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote URLs. Tools list businesses, read the workspace, create or update assumption and reported records, attach unverified evidence, prepare work, run financial/deal analyses and generate working documents. Human approvals, evidence verification, external-submission attestations, payment reconciliation and planning-jurisdiction changes are not agent tools; the service also rejects those actions for the agent role even if a caller bypasses MCP.
+The adapter refuses owner/reviewer/operator keys and requires HTTPS for remote URLs. Tools list businesses, read the workspace, read where to start (`get_guide`: the guided path, what each line is, why each step waits, what unlocks it and the next action for this agent key, the same guide the page shows, worked out with no AI), create or update assumption and reported records, attach unverified evidence, prepare work, run financial/deal analyses and generate working documents. Human approvals, evidence verification, external-submission attestations, payment reconciliation and planning-jurisdiction changes are not agent tools; the service also rejects those actions for the agent role even if a caller bypasses MCP.
 
 ### Updating records
 

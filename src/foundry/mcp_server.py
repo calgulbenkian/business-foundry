@@ -58,6 +58,11 @@ def build_server():
         return request("GET", path(business_id))
 
     @server.tool()
+    def get_guide(business_id: str) -> dict:
+        """Read where to start: the guided path, what each line is, why each step waits, what unlocks it and the next action for this agent key. Read-only; it changes nothing."""
+        return request("GET", path(business_id) + "/guide")
+
+    @server.tool()
     def add_record(business_id: str, command_key: str, record: dict) -> dict:
         """Add customer, offer, asset, contract, obligation, role, decision or risk. Fields: kind, title, details, certainty=assumption/reported, owner, evidence_ids, related_ids, due_date, properties. Agents cannot assert verified certainty."""
         return request("POST", path(business_id) + "/records", record, command_key)

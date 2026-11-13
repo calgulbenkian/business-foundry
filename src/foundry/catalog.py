@@ -273,6 +273,175 @@ DEAL_TASKS = [
     ),
 ]
 
+# What each line is, in one sentence, versioned with the steps above. A line is a step's category.
+LINES = {
+    "Market": "Who buys, what problem they pay to solve, and what you will offer them.",
+    "Finance": "How much cash the business needs and when, what happens if things go worse, "
+    "and a bank account that can take payments.",
+    "Setup": "Where the business is based, its legal and tax shape, and the registrations, permits and "
+    "insurance it needs.",
+    "Rights": "Who owns what: the founders' arrangements, intellectual property, data and assets.",
+    "Delivery": "How you will do the work the same way every time.",
+    "Sales to cash": "From a signed agreement to money in the bank.",
+    "Operate": "Looking back at actual results, and the taxes, renewals and other deadlines still to meet.",
+    "Acquisition": "Buying a business: the decision to pursue it, the checks on its books and contracts, "
+    "the price, closing, the handover and a look back at results.",
+}
+
+# The lines of the start-up guide, read on a business that is being bought. Every business has them;
+# these say what they mean when the work is buying rather than starting.
+ON_ACQUISITION = {
+    "Market": "When you buy a business, this is about its customers: who they are, why they pay, "
+    "and what it offers them.",
+    "Finance": "When you buy a business, this is the cash it needs once it is yours, and the bank "
+    "account it will be paid into.",
+    "Setup": "When you buy a business, this is the legal and tax shape you will own it through, and "
+    "the registrations and permits that must be in your name.",
+    "Rights": "When you buy a business, this is who owns what after the sale: your own arrangements, "
+    "and the data, software and assets that pass to you.",
+    "Delivery": "When you buy a business, the work already happens. This line is where you write down "
+    "how, so it runs the same way after the handover.",
+    "Sales to cash": "When you buy a business, this follows one sale after you take over: the "
+    "agreement, the delivery, the invoice and the payment, so you see money arrive while you own it.",
+    "Operate": "When you buy a business, this is looking back at its results once it is yours, and the "
+    "deadlines you take on with it.",
+}
+ACQUISITION_ORDER = (
+    "You are buying this business, so the Acquisition line comes first. The other lines come from the "
+    "start-up guide. Most of their work happens once the business is yours."
+)
+ACQUISITION_LATER = "This line appears when you save your first acquisition analysis."
+
+# The guided path for each entry path: five or six stops, each tied to real records and steps, so the
+# guide works out whether it is done. Which records and steps decide that is in guide.py, by stop key.
+PATHS = {
+    "acquire": {
+        "name": "Buying a business",
+        "stops": [
+            {
+                "key": "workspace",
+                "done_when": "Done once the workspace exists.",
+                "title": "Say you are buying, and name the business",
+                "detail": "You made this workspace with the entry path Acquire a business.",
+                "why": "Every step, record and piece of evidence about this purchase lives in this "
+                "workspace.",
+                "line": None,
+                "steps": [],
+            },
+            {
+                "key": "evidence",
+                "done_when": "Done when at least one piece of evidence is attached and not withdrawn.",
+                "title": "Attach the listing and anything the seller sent",
+                "detail": "Paste each item in as text. It is kept exactly as you add it.",
+                "why": "Every later check leans on what the seller said. Keeping the original text "
+                "lets you show where each figure came from.",
+                "line": "Acquisition",
+                "steps": ["financial_diligence", "legal_diligence"],
+                "action": "Add the listing or a document from the seller",
+            },
+            {
+                "key": "reviewed",
+                "done_when": "Done when at least one piece of evidence is reviewed and none is waiting for review.",
+                "title": "Check what you attached",
+                "detail": "Read each item and record that you reviewed it.",
+                "why": "Only reviewed evidence can support an approval, and the acquisition analysis "
+                "counts an add-back only when reviewed evidence supports it.",
+                "line": "Acquisition",
+                "steps": ["financial_diligence", "legal_diligence"],
+            },
+            {
+                "key": "deal",
+                "done_when": "Done when an acquisition analysis is saved and the newest one is not out of date.",
+                "title": "Screen the deal",
+                "detail": "An acquisition analysis needs the price, the revenue and the earnings. Any "
+                "other figure you leave out takes an example value, and the analysis lists each one.",
+                "why": "Screening shows whether the price can make sense before you spend money on "
+                "checks. Saving it lays out the Acquisition line.",
+                "line": "Acquisition",
+                "steps": ["mandate", "investment"],
+                "action": "Screen the deal in an acquisition analysis",
+            },
+            {
+                "key": "decide",
+                "done_when": "Done when Approve the acquisition thesis, for the newest analysis, is approved or further along.",
+                "title": "Decide whether to keep going",
+                "detail": "Approve the acquisition thesis. It is the first real decision.",
+                "why": "The checks on the books and the contracts wait on this step, so nothing is "
+                "spent on them before you decide.",
+                "line": "Acquisition",
+                "steps": ["mandate"],
+            },
+        ],
+    },
+    "start": {
+        "name": "Starting a business",
+        "stops": [
+            {
+                "key": "workspace",
+                "done_when": "Done once the workspace exists.",
+                "title": "Say you are starting, and name the business",
+                "detail": "You made this workspace with the entry path Start a business.",
+                "why": "Every step, record and piece of evidence about this business lives in this "
+                "workspace.",
+                "line": None,
+                "steps": [],
+            },
+            {
+                "key": "customer",
+                "done_when": "Done when the business has a customer record.",
+                "title": "Describe the buyer and their problem",
+                "detail": "Add a customer record: who buys, the problem they have, and what they use today.",
+                "why": "The offer, the price and the forecast all follow from who buys and why.",
+                "line": "Market",
+                "steps": ["demand"],
+                "action": "Add a customer record",
+            },
+            {
+                "key": "reviewed",
+                "done_when": "Done when at least one piece of evidence is reviewed and none is waiting for review.",
+                "title": "Talk to buyers and attach the notes",
+                "detail": "Keep what buyers said, word for word, and record that you reviewed it.",
+                "why": "A stated interest is not a paid commitment. Reviewed notes are what lets "
+                "Establish customer demand be approved.",
+                "line": "Market",
+                "steps": ["demand"],
+                "action": "Add your notes from a buyer conversation",
+            },
+            {
+                "key": "offer",
+                "done_when": "Done when the business has an offer record.",
+                "title": "Define the offer",
+                "detail": "Add an offer record: what you deliver, the price, and how the buyer accepts it.",
+                "why": "Delivery, the customer agreement and the invoice all wait on the offer.",
+                "line": "Market",
+                "steps": ["offer"],
+                "action": "Add an offer record",
+            },
+            {
+                "key": "forecast",
+                "done_when": "Done when a forecast is saved and the newest one is not out of date.",
+                "title": "Review cash needs",
+                "detail": "Build a forecast: what the business earns and spends each month, and what "
+                "happens if things go worse.",
+                "why": "It shows how much more cash the business needs, in a base case and in a worse case.",
+                "line": "Finance",
+                "steps": ["economics"],
+                "action": "Build a forecast",
+            },
+            {
+                "key": "structure",
+                "done_when": "Done when Decide the entity and ownership structure is approved or further along.",
+                "title": "Decide the structure",
+                "detail": "Decide the entity and ownership structure, with a decision record.",
+                "why": "Registrations, tax, banking, permits and the founders' arrangements all wait "
+                "on this decision.",
+                "line": "Setup",
+                "steps": ["structure"],
+            },
+        ],
+    },
+}
+
 
 def catalog(jurisdiction):
     return [dict(x) for x in BASE + JURISDICTIONS[jurisdiction]]
@@ -286,4 +455,5 @@ def description():
         "jurisdictions": list(JURISDICTIONS),
         "sources": SOURCES,
         "provider_execution": "External filings, bank transfers and signatures are recorded with receipts; this release does not execute them.",
+        "lines": LINES,
     }

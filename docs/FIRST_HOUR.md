@@ -55,11 +55,11 @@ If the terminal instead says the port is already in use, Foundry may already be 
 
 ## Ten minutes in the example business
 
-You start in **Polymer Geospatial · demo**. The **Synthetic demo** tag in the toolbar is a reminder that its customers, figures and receipts are invented. Try anything; unless you set up the optional AI features, nothing in Foundry sends your records anywhere.
+You start in **Polymer Geospatial · demo**. The **Synthetic demo** tag in the toolbar is a reminder that its customers, figures and receipts are invented. Try anything; unless you set up the optional AI features, nothing in Foundry sends your records anywhere. The example has already been through its first path, so it opens on **Today**. A business of your own opens on **Start here** until its first path is done.
 
 The page has three panes side by side. On a phone they stack: you see one at a time, and a back button at the top returns to the one before.
 
-- **On the left, the sources.** **Journey** and **Today** come first. Under **Lines** is one entry for each group of steps, such as **Market**, **Setup** or **Sales to cash**, with how many of its steps are verified. Under **Records** are **Evidence**, **Business records**, **Money**, **Acquisition analyses**, **Documents** and **Invoices & payments**, then **History** and **Access & assistants**. At the bottom, **Key** explains the mark used for each state of a step.
+- **On the left, the sources.** **Start here**, **Journey** and **Today** come first. Under **Lines** is one entry for each group of steps, such as **Market**, **Setup** or **Sales to cash**, with how many of its steps are verified, and a small **?** that says what the line is and where it stands. The **?** opens with a tap, a click, Enter or Space, and Escape closes it. Under **Records** are **Evidence**, **Business records**, **Money**, **Acquisition analyses**, **Documents** and **Invoices & payments**, then **History** and **Access & assistants**. At the bottom, **Key** explains the mark used for each state of a step.
 - **In the middle, the list** for the source you chose, grouped under headings.
 - **On the right, the inspector.** It shows the item you chose in the list, with its buttons.
 
@@ -67,9 +67,10 @@ The toolbar along the top holds **Choose business**, which switches between busi
 
 What each source shows:
 
-- **Today**: a count of steps that are verified, with an outside body, waiting on you and not started, then the steps that need you, grouped as **Needs review**, **Waiting on you**, **Waiting on someone else** and **Ready to start**. Below them are the money figures Foundry calculated.
+- **Start here**: your first path, five or six stops chosen by the entry path, such as **Attach the listing and anything the seller sent** when you are buying. Each stop is tied to real records and steps, so it ticks itself off as you do the work; nobody marks it by hand. The stop to do next has a **Do this next** button that opens the form or step for it. Below the path, **The lines, explained** gives one sentence for each line, and what it means on a business you are buying.
+- **Today**: a count of steps that are verified, with an outside body, waiting on you and not started, then **Do this next**, the same next action Start here gives, then the steps that need you, grouped as **Needs review**, **Waiting on you**, **Waiting on someone else** and **Ready to start**. On a business you are buying, the Acquisition line's steps come first in **Ready to start**. Below them are the money figures Foundry calculated.
 - **Journey**: a map of every step. Each line is a colour, its stops are its steps, and every line runs to the same stop, **Open for business**. Choose a stop on the map, or in the list of stops, to see it in the inspector. The inspector also has **Edit business**.
-- **A line**, such as **Setup**: that line's steps in order. Choose a step to see what it is, who acts, its **Stages** (**Prepared**, **Approved**, **Submitted**, **Verified**) and its history. Its buttons record your decision, for example **Start work…**, **Mark prepared…**, **Approve…** or **Not applicable…**. Each opens a short form with **Next state**, **Evidence for this decision** and **Decision note**; **Record decision** saves it.
+- **A line**, such as **Setup**: what the line is, where it stands, then its steps in order. Choose a step to see **Where it stands** (why it is waiting, what unlocks it and your next action), what it is, who acts, its **Stages** (**Prepared**, **Approved**, **Submitted**, **Verified**) and its history. Its buttons record your decision, for example **Start work…**, **Mark prepared…**, **Approve…** or **Not applicable…**. On a step nobody has started, **Start work…** is the main button. Each opens a short form with **Next state**, **Evidence for this decision** and **Decision note**; **Record decision** saves it.
 - **Evidence**: the original text behind the records and decisions. **+ Add evidence** adds an item. An owner or reviewer can **Record human review**.
 - **Business records**: what you know or assume about customers, offers, assets, contracts, roles and more, each with its evidence status, for example **Reported**. **+ Add record** adds one.
 - **Money**: the financial model, with monthly income, cash and balance sheet under base, downside and upside cases. **+ New version** saves a revised model.
@@ -77,7 +78,7 @@ What each source shows:
 - **Documents**: drafts such as a business plan, written from your records. **Read draft** opens one; **+ Generate document** makes a new one.
 - **Invoices & payments**: **+ Draft invoice**, **Record issue** and **Record payment** record what you did with your invoicing provider and bank. Foundry does not send invoices.
 - **History**: every change, who made it and when, and an **Integrity check** that history and current records agree. **Export business records** downloads a copy.
-- **Access & assistants**: access keys for other people (**+ Create access key**), **Backup and restore**, and the optional assistant review, which works only after it is set up (see [AI setup](AI.md)).
+- **Access & assistants**: access keys for other people (**+ Create access key**), **Backup and restore**, and the optional assistant review, which works only after it is set up (see [AI setup](AI.md)). The page says how to set it up for the way you opened Foundry: from a terminal with `foundry start`, or in the desktop window, which cannot be given a provider key when it is opened from Finder or the Start menu.
 
 ## Create your own business
 
@@ -92,7 +93,7 @@ Choose **+ New business** in the toolbar. (If you started with `--empty`, the pa
 - **Model currency**: a three-letter code such as USD, EUR or GBP. The financial model uses this one currency.
 - **This workspace contains synthetic demonstration data.**: leave this unticked for a real business.
 
-**Create workspace** makes the business and its steps, and opens it on **Today**. Unknowns can stay unknown until you have evidence.
+**Create workspace** makes the business and its steps, and opens it on **Start here**, at the first stop not done. Once every stop of its path is done, the business opens on **Today**. Unknowns can stay unknown until you have evidence.
 
 ### Changing the planning jurisdiction later
 

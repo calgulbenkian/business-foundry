@@ -895,7 +895,8 @@ code {
   color: var(--ink);
 }
 
-.today-head {
+.today-head,
+.start-head {
   padding: var(--s4) var(--s4) var(--s3);
   border-bottom: 1px solid var(--sep);
 }
@@ -1929,6 +1930,14 @@ dialog::backdrop {
     margin: 0;
     height: 30px;
   }
+  .src-row {
+    margin: 0;
+  }
+  /* a line's help, when open, takes a row of its own under the wrapped sources */
+  .src-nav .pop {
+    flex-basis: 100%;
+    margin: var(--s1) 0;
+  }
   .list-key {
     display: block;
   }
@@ -2279,5 +2288,126 @@ dialog::backdrop {
     flex-wrap: wrap;
     justify-content: flex-end;
     padding-bottom: var(--s1);
+  }
+}
+
+/* ---------- Start here and the lines, explained ---------- */
+/* A line's name in the source list, with its ? beside it as a button of its own. */
+.src-row {
+  display: flex;
+  align-items: center;
+  margin-right: var(--s2);
+}
+.src-row .src {
+  flex: 1;
+  min-width: 0;
+  margin-right: 2px;
+}
+.qm {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--sep-strong);
+  border-radius: 50%;
+  background: var(--raised);
+  color: var(--ink-2);
+  font-size: var(--fs-s);
+  font-weight: 600;
+  line-height: 18px;
+  padding: 0;
+  text-align: center;
+  cursor: default;
+}
+.qm:hover {
+  color: var(--ink);
+  border-color: var(--ink-2);
+}
+.qm[aria-expanded='true'] {
+  background: var(--sel-soft);
+  color: var(--ink);
+  border-color: var(--focus);
+}
+.qm:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.i-kicker .qm {
+  margin-left: 2px;
+}
+/* What the ? opens: the line's sentence and where it stands, in the flow after its ?. */
+.pop {
+  margin: var(--s1) var(--s2) var(--s2);
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--sep-strong);
+  border-radius: var(--r);
+  background: var(--raised);
+  font-size: var(--fs-s);
+  line-height: 16px;
+  color: var(--ink);
+  max-width: 62ch;
+}
+.pop p + p {
+  margin-top: var(--s1);
+  color: var(--ink-2);
+}
+.pop b {
+  font-weight: 600;
+}
+.i-wrap .pop {
+  margin: var(--s2) 0 0;
+}
+/* Under a line's heading: what it is, then where it stands here. */
+.grp-note.lx-note {
+  padding-left: 40px;
+}
+.lx-note .lx-now {
+  color: var(--ink);
+}
+/* The next action: one clear thing to do. */
+.next-box {
+  margin-top: var(--s4);
+  padding: var(--s3);
+  border-radius: var(--r);
+  background: var(--hl);
+  --knock: var(--hl);
+}
+.next-box .card-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.next-box p {
+  margin-top: var(--s1);
+  max-width: 60ch;
+}
+.next-box .i-actions {
+  margin-top: var(--s2);
+}
+ul.plain {
+  margin: 0;
+  padding-left: 18px;
+}
+ul.plain li + li {
+  margin-top: 2px;
+}
+/* Rows of Start here wrap rather than cut off: their words are the content. */
+.row.wrap .r-t,
+.row.wrap .r-sub {
+  white-space: normal;
+  overflow: visible;
+}
+.row.wrap .r-l1 {
+  align-items: flex-start;
+}
+.row .r-g .bul {
+  margin-top: -2px;
+}
+.row.lx {
+  grid-template-columns: 20px 1fr;
+}
+@media (max-width: 699px) {
+  .row.lx {
+    grid-template-columns: 24px 1fr;
   }
 }

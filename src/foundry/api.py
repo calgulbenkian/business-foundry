@@ -350,7 +350,12 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
 
     @app.get("/api/businesses/{bid}")
     def snapshot(bid: str, who=Depends(actor)):
-        return service.snapshot(who, bid)
+        return service.snapshot(who, bid, guide=True)
+
+    @app.get("/api/businesses/{bid}/guide")
+    def guide(bid: str, who=Depends(actor)):
+        """Where to start, for the person asking: read-only, worked out from the current records."""
+        return service.guide(who, bid)
 
     @app.put("/api/businesses/{bid}")
     def update_business(bid: str, body: models.BusinessUpdate, who=Depends(actor), command=Depends(key)):

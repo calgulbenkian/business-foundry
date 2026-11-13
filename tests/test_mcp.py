@@ -51,6 +51,7 @@ def test_actual_mcp_stdio_roundtrip_and_agent_authority(setup):
                 assert names == {
                     "list_businesses",
                     "get_business",
+                    "get_guide",
                     "add_record",
                     "update_record",
                     "add_evidence",
@@ -63,6 +64,12 @@ def test_actual_mcp_stdio_roundtrip_and_agent_authority(setup):
                 assert not result.isError
                 body = json.loads(result.content[0].text)
                 assert body["business"]["id"] == bid
+                # The guide is read-only and worked out for the agent key that asks.
+                result = await client.call_tool("get_guide", {"business_id": bid})
+                assert not result.isError
+                guide = json.loads(result.content[0].text)
+                assert (guide["business_id"], guide["role"], guide["route"]) == (bid, "agent", "start")
+                assert guide["next"]["label"] == "Add a customer record"
                 result = await client.call_tool(
                     "add_record",
                     {
