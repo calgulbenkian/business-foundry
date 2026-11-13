@@ -430,7 +430,7 @@ function nextText(s) {
   if (t.state === 'pending')
     return t.blockers?.length
       ? `waiting on ${plural(t.blockers.length, 'prerequisite')}`
-      : 'ready to prepare';
+      : 'ready to start';
   if (t.state === 'in_progress') return 'being prepared';
   if (t.state === 'verified')
     return t.data.external ? 'submitted and verified' : 'all stages recorded';

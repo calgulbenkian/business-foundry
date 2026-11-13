@@ -6,7 +6,7 @@ Turn a concept into a connected business workspace: customers, offers, assets an
 
 **v0.1 is a working local-first alpha.** It prepares and tracks real work with human review. Government filings, bank onboarding, signatures and payments happen with the relevant providers; Foundry records their receipts. It does not certify legal compliance or replace legal, tax, accounting or investment judgment.
 
-![The synthetic Polymer demo workspace: a source list of journey lines and records, Today's list with a strip of the journey map, and a step's inspector](docs/images/workspace.png)
+![The synthetic Polymer demo workspace: a source list with Start here, the journey lines and the records, Today's list with a strip of the journey map and the one next action, and a step's inspector saying where it stands](docs/images/workspace.png)
 
 ## Run it
 
