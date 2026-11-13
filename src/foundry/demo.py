@@ -193,10 +193,13 @@ def seed(service: Service, actor):
         actor,
         bid,
         "demo:deal:v1",
-        # Every figure is given, with the value this demo has always used, so the deal lists no assumed
-        # inputs (the thesis says the figures are illustrative) and its request stays the one the demo
-        # stored before assumed_inputs existed: running `foundry demo` again on a database seeded by
-        # an earlier version replays the stored deal instead of refusing the reused key.
+        # Every figure acquisition 1.0.1 had is given, with the value this demo has always used, so the
+        # deal lists none of them as assumed (the thesis says the figures are illustrative) and its
+        # request stays the one the demo stored before assumed_inputs existed: running `foundry demo`
+        # again on a database seeded by an earlier version replays the stored deal instead of refusing
+        # the reused key. The inputs acquisition 1.1.0 added are left out for the same reason: given,
+        # even at their example values, they would make a different request under the same key. The
+        # deal lists them as assumed: no building, no property loan, no investors and no rent.
         models.DealInputs(
             target="Example Mapping Studio · synthetic",
             thesis="Compare buying a small mapping-services operation with building delivery capacity. All figures are illustrative.",

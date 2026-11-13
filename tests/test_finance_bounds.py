@@ -74,7 +74,7 @@ FORECAST_RATES = [
     "discount_rate",
     "terminal_growth",
 ]
-DEAL_RATES = ["debt_rate", "seller_rate", "tax_rate"]
+DEAL_RATES = ["debt_rate", "property_rate", "seller_rate", "tax_rate"]
 TWELVE_PLACES, THIRTEEN_PLACES = "0.012345678901", "0.0123456789012"
 # On main, base month 1 of this plan displays balance_check as -0.00 (an unrounded residue below zero).
 NEGATIVE_ZERO_PLAN = {
@@ -996,6 +996,7 @@ DEAL_CORNERS = {
     "smallest": {
         **dict.fromkeys(decimal_fields(DealInputs), TINY),
         "debt_years": 30,
+        "property_years": 30,
         "seller_years": 30,
         "adjustments": [{"label": "Synthetic", "amount": TINY, "evidence_id": "reviewed"}] * ADJUSTMENTS,
     },
@@ -1005,9 +1006,11 @@ DEAL_CORNERS = {
         "multiple_low": "100",
         "multiple_high": "100",
         "debt_rate": "1",
+        "property_rate": "1",
         "seller_rate": "1",
         "tax_rate": "1",
         "debt_years": 1,
+        "property_years": 1,
         "seller_years": 1,
         "adjustments": [{"label": "Synthetic", "amount": "1000000000", "evidence_id": "reviewed"}]
         * ADJUSTMENTS,
@@ -1022,10 +1025,22 @@ DEAL_CORNERS = {
         "debt_years": 30,
         "seller_note": "0",
         "seller_rate": "0",
+        "property_debt": "0",
+        "property_rate": "0",
+        "annual_rent": "0",
         "tax_rate": "1",
         "adjustments": [{"label": "Synthetic", "amount": "-1000000000", "evidence_id": "reviewed"}]
         * ADJUSTMENTS,
     },
+}
+# The seller note's other schedules at the corners: the longest deferral of the largest note at the largest
+# rate, whose balloon is 1E+12 × 2^30, and the smallest note at the smallest rate, deferred or interest only.
+DEAL_CORNERS |= {
+    "largest_deferred": DEAL_CORNERS["largest"] | {"seller_schedule": "deferred", "seller_years": 30},
+    "largest_interest_only": DEAL_CORNERS["largest"]
+    | {"seller_schedule": "interest_only", "seller_years": 30},
+    "smallest_deferred": DEAL_CORNERS["smallest"] | {"seller_schedule": "deferred"},
+    "smallest_interest_only": DEAL_CORNERS["smallest"] | {"seller_schedule": "interest_only"},
 }
 
 
@@ -1064,11 +1079,13 @@ def test_deal_corners_evaluate_within_the_stated_magnitudes(corner):
     values = displayed(result)
     assert values and all(abs(v) < 10**46 for v in values) and no_negative_zero(result)
     loans = [(inputs.senior_debt, inputs.debt_rate, inputs.debt_years)]
+    loans.append((inputs.property_debt, inputs.property_rate, inputs.property_years))
     loans.append((inputs.seller_note, inputs.seller_rate, inputs.seller_years))
-    assert result["annual_debt_service"] == half_even(exact_total(*loans))
+    assert result["amortizing_annual_debt_service"] == half_even(exact_total(*loans))
     # The acquisition screen calculates in its own exact contexts, so its steps are checked directly.
     steps = finance._deal_values(inputs, {"reviewed"})
-    linear = [steps[k] for k in ("normalized", "uses", "buyer_equity", "interest")]
+    linear = [steps[k] for k in ("normalized", "uses", "buyer_equity", "buyer_cash", "interest")]
+    linear += [p for p in steps["seller_payments"] if not isinstance(p, tuple)]
     linear += [*steps.get("value_range", ()), *steps.get("equity_range", ())]
     linear += [s[k] for s in steps["scenarios"].values() for k in ("earnings", "taxable", "tax", "available")]
     assert all(v.is_zero() or D("1E-100") <= v.copy_abs() < D("1E+46") for v in linear)
@@ -1266,6 +1283,19 @@ def test_example_files_are_accepted_and_evaluate():
         deal = DealInputs.model_validate_json(f.read())
     assert no_negative_zero(forecast(plan.inputs))
     assert no_negative_zero(acquisition(deal, set()))
+    with open(os.path.join(EXAMPLES, "acquisition-with-building.json")) as f:
+        building = acquisition(DealInputs.model_validate_json(f.read()), set())
+    # Uses 450,000 + 300,000 + 30,000 + 50,000 = 830,000; debt 200,000 + 240,000 + 150,000 = 590,000;
+    # investors 60,000, so the buyer puts in 180,000. The seller note of 150,000 at 5% deferred 5 years
+    # comes due as 150,000 × 1.05^5 = 150,000 × 1.2762815625 = 191,442.234375.
+    assert building["sources_and_uses"]["buyer_cash_at_closing"] == "180000.00"
+    assert building["seller_note_schedule"]["balloon"] == {
+        "year": 5,
+        "amount": "191442.23",
+        "principal": "150000.00",
+        "accrued_interest": "41442.23",
+    }
+    assert no_negative_zero(building)
 
 
 def test_demo_seed_is_accepted(setup):
@@ -1287,9 +1317,27 @@ FIGURES = (
     "equity_value_range",
     "sources_and_uses",
     "annual_debt_service",
+    "debt_service_year",
+    "amortizing_annual_debt_service",
+    "seller_note_schedule",
     "scenarios",
 )
 REVIEWED = frozenset({"reviewed"})
+
+
+def exact_seller_payments(inputs: DealInputs) -> list[Fraction]:
+    """What the seller is due in each year of the note, in exact rationals (docs/FINANCE.md).
+
+    Amortizing: the level payment every year. Interest only: principal × rate a year, and the principal too
+    in the last year. Deferred: nothing until the last year, then principal × (1 + rate)^years, interest
+    compounding once a year.
+    """
+    p, r, n = Fraction(inputs.seller_note), Fraction(inputs.seller_rate), inputs.seller_years
+    if inputs.seller_schedule == "amortizing":
+        return [exact_payment(inputs.seller_note, inputs.seller_rate, n)] * n
+    if inputs.seller_schedule == "interest_only":
+        return [p * r] * (n - 1) + [p * r + p]
+    return [Fraction(0)] * (n - 1) + [p * (1 + r) ** n]
 
 
 def exact_figures(inputs: DealInputs, verified=REVIEWED) -> dict:
@@ -1298,11 +1346,17 @@ def exact_figures(inputs: DealInputs, verified=REVIEWED) -> dict:
     for item in inputs.adjustments:
         if item.evidence_id and item.evidence_id in verified:
             normalized += Fraction(item.amount)
-    service = exact_total(
-        (inputs.senior_debt, inputs.debt_rate, inputs.debt_years),
-        (inputs.seller_note, inputs.seller_rate, inputs.seller_years),
-    )
+    normalized -= f["annual_rent"]
+    senior = (inputs.senior_debt, inputs.debt_rate, inputs.debt_years)
+    building = (inputs.property_debt, inputs.property_rate, inputs.property_years)
+    seller = (inputs.seller_note, inputs.seller_rate, inputs.seller_years)
+    # The lender's view: every loan, the seller note included, amortizing.
+    amortizing = exact_total(senior, building, seller)
+    payments = exact_seller_payments(inputs) if inputs.seller_note else []
+    # What is due in year 1: the bank loans' level payments and the seller note's first-year payment.
+    service = exact_total(senior, building) + (payments[0] if payments else 0)
     interest = f["senior_debt"] * f["debt_rate"] + f["seller_note"] * f["seller_rate"]
+    interest += f["property_debt"] * f["property_rate"]
     revenue = f["annual_revenue"]
     scenarios = {}
     for name, earnings in (
@@ -1319,10 +1373,31 @@ def exact_figures(inputs: DealInputs, verified=REVIEWED) -> dict:
             "cash_after_debt_service": half_even(after),
             "coverage_ratio": half_even(available / service, 4) if service else None,
             "cash_shortfall": after < 0,
+            "amortizing_coverage_ratio": half_even(available / amortizing, 4) if amortizing else None,
         }
     values = [normalized * f["multiple_low"], normalized * f["multiple_high"]]
     bridge = f["cash_acquired"] - f["debt_assumed"]
-    uses = f["purchase_price"] + f["fees"] + f["working_capital"] + f["integration_cost"]
+    uses = f["purchase_price"] + f["real_estate_price"] + f["fees"] + f["working_capital"]
+    uses += f["integration_cost"]
+    equity = uses - f["senior_debt"] - f["property_debt"] - f["seller_note"]
+    cash = equity - f["investor_equity"]
+    schedule = None
+    if payments:
+        balloon = None
+        if inputs.seller_schedule != "amortizing":
+            amount = payments[-1] if inputs.seller_schedule == "deferred" else f["seller_note"]
+            balloon = {
+                "year": inputs.seller_years,
+                "amount": half_even(amount),
+                "principal": half_even(f["seller_note"]),
+                "accrued_interest": half_even(amount - f["seller_note"]),
+            }
+        schedule = {
+            "schedule": inputs.seller_schedule,
+            "years": inputs.seller_years,
+            "payments": [{"year": i, "payment": half_even(p)} for i, p in enumerate(payments, 1)],
+            "balloon": balloon,
+        }
     return {
         "normalized_ebitda": half_even(normalized),
         "enterprise_value_range": [half_even(v) for v in values] if normalized > 0 else None,
@@ -1335,9 +1410,17 @@ def exact_figures(inputs: DealInputs, verified=REVIEWED) -> dict:
             "total_uses": half_even(uses),
             "senior_debt": half_even(f["senior_debt"]),
             "seller_note": half_even(f["seller_note"]),
-            "buyer_equity_required": half_even(uses - f["senior_debt"] - f["seller_note"]),
+            "buyer_equity_required": half_even(equity),
+            "real_estate_price": half_even(f["real_estate_price"]),
+            "property_debt": half_even(f["property_debt"]),
+            "investor_equity": half_even(f["investor_equity"]),
+            "buyer_cash_at_closing": half_even(max(cash, Fraction(0))),
+            "funding_beyond_uses": half_even(max(-cash, Fraction(0))),
         },
         "annual_debt_service": half_even(service),
+        "debt_service_year": 1,
+        "amortizing_annual_debt_service": half_even(amortizing),
+        "seller_note_schedule": schedule,
         "scenarios": scenarios,
     }
 
@@ -1607,7 +1690,8 @@ def random_deal(rng, wide: bool) -> DealInputs:
         }
         for _ in range(rng.randint(0, 4))
     ]
-    uses = [amount(top if wide else 10 * scale) for _ in range(4)]
+    uses = [amount(top if wide else 10 * scale) for _ in range(5)]
+    uses[4] = uses[4] if rng.random() < 0.5 else D(0)  # The real estate price, when there is a building.
     total = sum((Fraction(u) for u in uses), Fraction(0))
     places = 12 if wide else 2
 
@@ -1616,6 +1700,7 @@ def random_deal(rng, wide: bool) -> DealInputs:
 
     senior = share(min(total * Fraction(3, 5), Fraction(10**12)))
     seller = share(min(total - Fraction(senior), Fraction(10**12)))
+    building = share(min(total - Fraction(senior) - Fraction(seller), Fraction(10**12)))
     low = amount(20, rng.choice([0, 2, 12]) if wide else 1)
     return deal_inputs(
         annual_revenue=revenue,
@@ -1628,12 +1713,19 @@ def random_deal(rng, wide: bool) -> DealInputs:
         fees=uses[1],
         working_capital=uses[2],
         integration_cost=uses[3],
+        real_estate_price=uses[4],
         senior_debt=senior,
         debt_rate=rate(25) if rng.random() < 0.8 else D(0),
         debt_years=rng.randint(1, 30),
+        property_debt=building if rng.random() < 0.5 else D(0),
+        property_rate=rate(25) if rng.random() < 0.8 else D(0),
+        property_years=rng.randint(1, 30),
         seller_note=seller,
         seller_rate=rate(25) if rng.random() < 0.8 else D(0),
         seller_years=rng.randint(1, 30),
+        seller_schedule=rng.choice(["amortizing", "interest_only", "deferred"]),
+        investor_equity=share(min(total, Fraction(10**12))) if rng.random() < 0.5 else D(0),
+        annual_rent=amount(scale // 10) if rng.random() < 0.5 else D(0),
         annual_capex=amount(scale // 5),
         annual_working_capital_growth=amount(scale // 20),
         tax_rate=rate(40),
@@ -1830,28 +1922,35 @@ def test_example_requests_give_the_exact_figures(body, expected):
 
 # D3: the largest number of significant digits an accepted input can give each exact step (docs/FINANCE.md).
 # Money inputs are at most 1E+12 and earnings inputs at most 1E+9 in size, rates at most 1, multiples at most 100,
-# each with at most 12 places, so each step's span of digit positions is bounded. Two loans of 30 years, with
-# s = 12 + rate ≤ 13 to 12 places: each denominator s^360 − 12^360 < 10^402 with 4,320 places.
+# each with at most 12 places, so each step's span of digit positions is bounded. Three loans of 30 years, with
+# s = 12 + rate ≤ 13 to 12 places: each denominator s^360 − 12^360 < 10^402 with 4,320 places. When the seller
+# note is interest only or deferred, the year-1 fraction has only the two bank loans' denominator, so the
+# amortizing fraction, which has all three, is the larger.
 STEP_DIGITS = {
-    "normalized": 25,  # Below 1.051E+12 in size, 12 places.
-    "uses": 25,
+    "normalized": 25,  # Below 2.051E+12 in size (rent included), 12 places.
+    "uses": 25,  # Below 5E+12, 12 places.
     "buyer_equity": 25,
-    "interest": 37,  # Below 2E+12, 24 places.
-    "earnings": 27,  # Upside: below 1.051E+12 in size, 14 places (5% of revenue).
-    "taxable": 37,  # Below 3.2E+12 in size, 24 places.
+    "buyer_cash": 25,  # Below 5E+12 in size, 12 places.
+    "interest": 37,  # Below 3E+12, 24 places.
+    "earnings": 27,  # Upside: below 2.051E+12 in size, 14 places (5% of revenue).
+    "taxable": 37,  # Below 5.2E+12 in size, 24 places.
     "tax": 48,  # Below 1.01E+11, 36 places.
-    "available": 49,  # Below 3.2E+12 in size, 36 places.
+    "available": 49,  # Below 5.2E+12 in size, 36 places.
     "value_range": 37,  # Below 5.1E+12, 24 places.
     "equity_range": 37,  # Below 6.1E+12, 24 places.
-    "denominator": 9443,  # Below 13^720 < 10^803, 8,640 places.
-    "numerator": 9479,  # Below 2E+12 × 13^720 < 10^815, 8,664 places.
-    "scaled_available": 9491,  # Below 3.2E+12 × 13^720 < 10^815, 8,676 places.
-    "after_numerator": 9491,  # Below 5.2E+12 × 13^720 < 10^815, 8,676 places.
+    "seller_payment": 394,  # Deferred 30 years at a rate below 1: below 1E+12 × 2^30 < 10^22, 372 places.
+    "denominator": 14164,  # Below 13^1080 < 10^1204, 12,960 places.
+    "numerator": 14200,  # Below 3E+12 × 13^1080, 12,984 places.
+    "scaled_available": 14212,  # Below 5.2E+12 × 13^1080, 12,996 places.
+    "after_numerator": 14212,
+    "amortizing_denominator": 14164,
+    "amortizing_numerator": 14200,
+    "amortizing_scaled_available": 14212,
 }
 TWELVE_NINES = "0.999999999999"
 WIDEST = "999999999999.999999999999"
-# Witnesses that reach the bounds: wide negative earnings with two 30-year loans, and wide positive earnings
-# with a tax rate just below 1 and wide capex.
+# Witnesses that reach the bounds: wide negative earnings with three 30-year loans, the same with the seller note
+# deferred, and wide positive earnings with a tax rate just below 1 and wide capex.
 DIGIT_WITNESSES = {
     "negative": {
         "annual_revenue": WIDEST,
@@ -1869,6 +1968,12 @@ DIGIT_WITNESSES = {
         "seller_note": WIDEST,
         "seller_rate": TWELVE_NINES,
         "seller_years": 30,
+        "property_debt": WIDEST,
+        "property_rate": TWELVE_NINES,
+        "property_years": 30,
+        "real_estate_price": "1000000000000",
+        "investor_equity": WIDEST,
+        "annual_rent": WIDEST,
         "annual_capex": WIDEST,
         "annual_working_capital_growth": WIDEST,
         "tax_rate": TWELVE_NINES,
@@ -1887,6 +1992,9 @@ DIGIT_WITNESSES = {
         "seller_note": "0.000000000001",
         "seller_rate": TWELVE_NINES,
         "seller_years": 30,
+        "property_debt": "0.000000000001",
+        "property_rate": TWELVE_NINES,
+        "property_years": 30,
         "annual_capex": WIDEST,
         "annual_working_capital_growth": WIDEST,
         "tax_rate": TWELVE_NINES,
@@ -1896,14 +2004,30 @@ DIGIT_WITNESSES = {
 }
 
 
+DIGIT_WITNESSES["deferred"] = DIGIT_WITNESSES["negative"] | {"seller_schedule": "deferred"}
+
+
 def step_digits(inputs: DealInputs, verified=REVIEWED) -> dict:
     values = finance._deal_values(inputs, set(verified))
-    found = {k: significant(values[k]) for k in ("normalized", "uses", "buyer_equity", "interest")}
-    for k in ("numerator", "denominator"):
+    found = {
+        k: significant(values[k]) for k in ("normalized", "uses", "buyer_equity", "buyer_cash", "interest")
+    }
+    for k in ("numerator", "denominator", "amortizing_numerator", "amortizing_denominator"):
         found[k] = significant(values[k])
+    found["seller_payment"] = max(
+        (significant(p) for p in values["seller_payments"] if not isinstance(p, tuple)), default=0
+    )
     for k in ("value_range", "equity_range"):
         found[k] = max((significant(v) for v in values.get(k, ())), default=0)
-    for k in ("earnings", "taxable", "tax", "available", "scaled_available", "after_numerator"):
+    for k in (
+        "earnings",
+        "taxable",
+        "tax",
+        "available",
+        "scaled_available",
+        "after_numerator",
+        "amortizing_scaled_available",
+    ):
         found[k] = max(significant(s[k]) for s in values["scenarios"].values())
     return found
 

@@ -702,7 +702,17 @@ def test_business_plan_and_memo_render_deterministic_tables(setup):
     assert table_rows(memo, "| Multiple range ") == ["Multiple range", "3.00x – 5.00x"]
     assert table_rows(memo, "| Assumed enterprise value range ")[1].startswith("Not meaningful")
     assert table_rows(memo, "| Assumed equity value range ")[1].startswith("Not meaningful")
-    assert table_rows(memo, "| Buyer equity required ") == ["Sources", "Buyer equity required", "50,000.00"]
+    # From acquisition 1.1.0 the equity after debt can come from investors too; the buyer's cash is its own row.
+    assert table_rows(memo, "| Sources  | Equity required after debt ") == [
+        "Sources",
+        "Equity required after debt",
+        "50,000.00",
+    ]
+    assert table_rows(memo, "| Sources  | Buyer cash at closing ") == [
+        "Sources",
+        "Buyer cash at closing",
+        "50,000.00",
+    ]
     # No loan was given, so the memo says the deal is screened without debt instead of a zero payment.
     assert "Annual debt service" not in memo
     assert (

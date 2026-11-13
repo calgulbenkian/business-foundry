@@ -295,20 +295,30 @@ def fmt_multiple(value) -> str:
     return f"{Decimal(str(value)):.2f}x"
 
 
+# How the memo and the deal page name each seller note schedule.
+SELLER_SCHEDULES = {"amortizing": "amortizing", "interest_only": "interest only", "deferred": "deferred"}
+
 # Every figure of DealInputs that has an example value, with its label in the analysis form.
 DEAL_EXAMPLE_ROWS = {
     "replacement_management": ("Annual replacement management cost", fmt_money),
     "multiple_low": ("Low EBITDA multiple", fmt_multiple),
     "multiple_high": ("High EBITDA multiple", fmt_multiple),
+    "real_estate_price": ("Real estate price", fmt_money),
     "fees": ("Transaction fees", fmt_money),
     "working_capital": ("Working capital funding", fmt_money),
     "integration_cost": ("Integration costs", fmt_money),
     "senior_debt": ("New senior debt", fmt_money),
     "debt_rate": ("Senior annual interest rate", fmt_rate),
     "debt_years": ("Senior term", lambda v: f"{v} years"),
+    "property_debt": ("Property loan", fmt_money),
+    "property_rate": ("Property loan annual interest rate", fmt_rate),
+    "property_years": ("Property loan term", lambda v: f"{v} years"),
     "seller_note": ("Seller financing", fmt_money),
     "seller_rate": ("Seller annual interest rate", fmt_rate),
     "seller_years": ("Seller term", lambda v: f"{v} years"),
+    "seller_schedule": ("Seller note schedule", lambda v: SELLER_SCHEDULES.get(v, str(v))),
+    "investor_equity": ("Investor equity", fmt_money),
+    "annual_rent": ("Annual rent", fmt_money),
     "annual_capex": ("Annual maintenance capex", fmt_money),
     "annual_working_capital_growth": ("Annual working capital increase", fmt_money),
     "tax_rate": ("Assumed tax rate", fmt_rate),
@@ -347,16 +357,141 @@ NO_DEBT = (
 )
 
 
+def has_debt(inputs) -> bool:
+    """Whether the deal has a senior loan, a property loan or a seller note. A deal saved before the
+    property loan existed has none."""
+    return any(Decimal(str(inputs.get(k, 0))) for k in ("senior_debt", "property_debt", "seller_note"))
+
+
 def debt_text(deal, currency) -> str:
-    """The annual debt service, or, for a deal with no senior debt and no seller note, that it has none.
+    """The annual debt service, or, for a deal with no loan, that it has none.
 
     The model's example loans are zero, so a deal with no financing given carries no debt, and its
-    empty coverage reads as intended, not missing.
+    empty coverage reads as intended, not missing. From acquisition 1.1.0 the debt service is what is
+    due in year 1, and a seller note that does not amortize also gets the amortizing figure a lender
+    may use.
     """
     a, inputs = deal["data"]["analysis"], deal["data"]["inputs"]
-    if Decimal(str(inputs["senior_debt"])) or Decimal(str(inputs["seller_note"])):
+    if not has_debt(inputs):
+        return NO_DEBT
+    if "debt_service_year" not in a:
         return f"Annual debt service: {fmt_money(a['annual_debt_service'])} {currency}."
-    return NO_DEBT
+    text = f"Debt service due in year 1, the year screened: {fmt_money(a['annual_debt_service'])} {currency}."
+    if not Decimal(a["annual_debt_service"]):
+        text += " Nothing is due on any loan in year 1, so there is no year-1 coverage ratio."
+    if deferral(a):
+        text += (
+            " A lender may count the seller note as if it amortized over its term: on that basis the "
+            f"annual debt service is {fmt_money(a['amortizing_annual_debt_service'])} {currency}, and the "
+            "coverage on that basis is shown in its own column."
+        )
+    return text
+
+
+def deferral(analysis) -> bool:
+    """Whether the seller note is interest only or deferred, so its year-1 payment is not its amortizing one."""
+    schedule = analysis.get("seller_note_schedule")
+    return bool(schedule) and schedule["schedule"] != "amortizing"
+
+
+def years(n: int) -> str:
+    return "1 year" if n == 1 else f"{n} years"
+
+
+def seller_text(analysis, currency) -> str:
+    """The seller note's payments in plain words, from acquisition 1.1.0; empty without a seller note."""
+    schedule = analysis.get("seller_note_schedule")
+    if not schedule:
+        return ""
+    n, payments, balloon = schedule["years"], schedule["payments"], schedule["balloon"]
+    if schedule["schedule"] == "amortizing":
+        return (
+            f"The seller is paid {fmt_money(payments[0]['payment'])} {currency} a year for {years(n)}: level "
+            "monthly payments of principal and interest, with nothing left to pay at the end."
+        )
+    lent, due = fmt_money(balloon["principal"]), fmt_money(payments[-1]["payment"])
+    if schedule["schedule"] == "interest_only":
+        interest = fmt_money(Decimal(payments[-1]["payment"]) - Decimal(balloon["principal"]))
+        if n == 1:
+            return (
+                f"The seller is paid once, at the end of year 1: {due} {currency}, the {lent} lent plus "
+                f"{interest} of interest."
+            )
+        return (
+            f"The seller is paid {interest} {currency} of interest a year, and in year {n} the {lent} lent "
+            f"is due as well: {due} that year. The year-1 coverage does not include the {lent}."
+        )
+    accrued = fmt_money(balloon["accrued_interest"])
+    if n == 1:
+        return (
+            f"The seller is paid once, at the end of year 1: {due} {currency}, the {lent} lent plus "
+            f"{accrued} of interest."
+        )
+    return (
+        f"The seller is paid nothing until year {n}, when {due} {currency} is due: {lent} lent plus "
+        f"{accrued} of interest. The year-1 coverage does not include it."
+    )
+
+
+def buyer_cash_text(analysis, currency) -> str:
+    """What the buyer puts in at closing, from acquisition 1.1.0; empty for an earlier analysis."""
+    su = analysis["sources_and_uses"]
+    if "buyer_cash_at_closing" not in su:
+        return ""
+    if Decimal(su["funding_beyond_uses"]):
+        return (
+            f"Funding exceeds uses by {fmt_money(su['funding_beyond_uses'])} {currency}: debt and investor "
+            "equity bring in more than the deal uses, so the buyer puts in no cash at closing. Decide where "
+            "the extra goes before relying on this structure."
+        )
+    if not Decimal(su["buyer_cash_at_closing"]):
+        return "The buyer puts in no cash at closing: debt and investor equity cover every use."
+    return (
+        f"The buyer puts in {fmt_money(su['buyer_cash_at_closing'])} {currency} of cash at closing: total "
+        "uses less all debt and investor equity."
+    )
+
+
+# Named only as something to check, never applied: docs/FINANCE.md cites the source.
+LENDER_RULES_NOTE = (
+    "Lender rules are not applied. If a loan here is to be SBA-guaranteed, SBA's SOP 50 10 sets a minimum "
+    "equity injection and limits how far a seller note counts toward it; check the current SOP and the "
+    "lender's own terms (docs/FINANCE.md, Lender rules)."
+)
+
+
+def sources_rows(su) -> list[list[str]]:
+    """The sources and uses table. An analysis from acquisition 1.1.0 adds real estate, the property
+    loan, investor equity and the buyer's cash; an earlier one keeps the rows it always had."""
+    if "buyer_cash_at_closing" not in su:
+        lines = (
+            ("Uses", "purchase_price", "Purchase price"),
+            ("Uses", "fees", "Transaction fees"),
+            ("Uses", "working_capital", "Working capital"),
+            ("Uses", "integration_cost", "Integration cost"),
+            ("Uses", "total_uses", "Total uses"),
+            ("Sources", "senior_debt", "Senior debt"),
+            ("Sources", "seller_note", "Seller note"),
+            ("Sources", "buyer_equity_required", "Buyer equity required"),
+        )
+    else:
+        lines = (
+            ("Uses", "purchase_price", "Business purchase price"),
+            ("Uses", "real_estate_price", "Real estate price"),
+            ("Uses", "fees", "Transaction fees"),
+            ("Uses", "working_capital", "Working capital"),
+            ("Uses", "integration_cost", "Integration cost"),
+            ("Uses", "total_uses", "Total uses"),
+            ("Sources", "senior_debt", "Senior debt"),
+            ("Sources", "property_debt", "Property loan"),
+            ("Sources", "seller_note", "Seller note"),
+            ("Sources", "buyer_equity_required", "Equity required after debt"),
+            ("Sources", "investor_equity", "Investor equity"),
+            ("Sources", "buyer_cash_at_closing", "Buyer cash at closing"),
+        )
+        if Decimal(su["funding_beyond_uses"]):
+            lines += (("Sources", "funding_beyond_uses", "Funding beyond uses"),)
+    return [[group, label, fmt_money(su[key])] for group, key, label in lines]
 
 
 def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> list[str]:
@@ -376,6 +511,8 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
         ]
         for item in a["accepted_adjustments"]
     ]
+    if "annual_rent" in inp:
+        rows.append(["Less: annual rent", fmt_money(inp["annual_rent"]), ""])
     rows.append(["Normalized EBITDA", fmt_money(a["normalized_ebitda"]), ""])
     out += fmt_table(["Item", "Amount", "Evidence"], rows, {1})
     out += ["### Excluded adjustments", ""]
@@ -405,38 +542,44 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
             ["Cash in valuation equity bridge", fmt_money(inp["cash_acquired"])],
             ["Debt in valuation equity bridge", fmt_money(inp["debt_assumed"])],
             ["Assumed equity value range", range_text(a["equity_value_range"])],
-        ],
+        ]
+        + (
+            [
+                [
+                    "Real estate, at its price (not valued)",
+                    fmt_money(a["sources_and_uses"]["real_estate_price"]),
+                ]
+            ]
+            if "real_estate_price" in a["sources_and_uses"]
+            else []
+        ),
         {1},
     )
+    if "real_estate_price" in a["sources_and_uses"]:
+        out += [
+            "The multiples value the business only. Real estate is shown at its entered price; the model "
+            "does not value it.",
+            "",
+        ]
     su = a["sources_and_uses"]
     out += ["### Sources and uses", ""]
-    out += fmt_table(
-        ["Category", "Item", "Amount"],
-        [
-            [group, label, fmt_money(su[key])]
-            for group, key, label in (
-                ("Uses", "purchase_price", "Purchase price"),
-                ("Uses", "fees", "Transaction fees"),
-                ("Uses", "working_capital", "Working capital"),
-                ("Uses", "integration_cost", "Integration cost"),
-                ("Uses", "total_uses", "Total uses"),
-                ("Sources", "senior_debt", "Senior debt"),
-                ("Sources", "seller_note", "Seller note"),
-                ("Sources", "buyer_equity_required", "Buyer equity required"),
-            )
-        ],
-        {2},
-    )
+    out += fmt_table(["Category", "Item", "Amount"], sources_rows(su), {2})
+    if buyer_cash_text(a, currency):
+        out += [buyer_cash_text(a, currency), ""]
     out += ["### Debt service and scenario coverage", "", debt_text(deal, currency), ""]
+    if seller_text(a, currency):
+        out += [seller_text(a, currency), ""]
+    amortizing = deferral(a)
+    headers = [
+        "Case",
+        "EBITDA",
+        "Cash available for debt service",
+        "Cash after debt service",
+        "Coverage ratio",
+        "Cash shortfall",
+    ] + (["Coverage if the seller note amortized"] if amortizing else [])
     out += fmt_table(
-        [
-            "Case",
-            "EBITDA",
-            "Cash available for debt service",
-            "Cash after debt service",
-            "Coverage ratio",
-            "Cash shortfall",
-        ],
+        headers,
         [
             [
                 label,
@@ -446,10 +589,23 @@ def deal_section(deal, snapshot, currency, evidence_name=lambda eid: eid) -> lis
                 coverage(a["scenarios"][c]["coverage_ratio"]),
                 "Yes" if a["scenarios"][c]["cash_shortfall"] else "No",
             ]
+            + ([coverage(a["scenarios"][c]["amortizing_coverage_ratio"])] if amortizing else [])
             for c, label in SCENARIOS
         ],
-        {1, 2, 3, 4},
+        {1, 2, 3, 4, 6},
     )
+    schedule = a.get("seller_note_schedule")
+    if schedule:
+        out += ["### Seller note payments", ""]
+        out += fmt_table(
+            ["Year", "Due to the seller"],
+            [[str(p["year"]), fmt_money(p["payment"])] for p in schedule["payments"]],
+            {0, 1},
+        )
+    if "debt_service_year" in a and any(
+        Decimal(str(inp.get(k, 0))) for k in ("senior_debt", "property_debt")
+    ):
+        out += [LENDER_RULES_NOTE, ""]
     out += ["### Inputs not given", "", inline(assumed_text(deal)), ""]
     out += ["### Screening limitations", ""]
     out += [f"- {inline(x)}" for x in a.get("limitations", [])] + [""]

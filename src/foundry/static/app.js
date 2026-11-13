@@ -2641,14 +2641,57 @@ function inspPlan(p) {
   if (evidence.length) out += sec('Evidence', attList(evidence));
   return out;
 }
-/* What a deal with no senior debt and no seller note says, as the investment memo says it. The model's
+/* What a deal with no loan says, as the investment memo says it. The model's
    example loans are zero, so its empty coverage reads as intended, not missing. */
 const NO_DEBT =
   'No debt was given and none was assumed, so the deal is screened as bought without debt. There is no debt service: cash after debt service equals cash available, and there is no coverage ratio.';
+const dealCoverage = (v) => (v === null || v === undefined ? 'No debt service' : ratio(v) + '×');
+/* Whether the seller note is interest only or deferred, so its year-1 payment is not its amortizing one. */
+const dealDeferral = (a) =>
+  Boolean(a.seller_note_schedule) && a.seller_note_schedule.schedule !== 'amortizing';
+/* The seller note's payments in plain words, as the investment memo says them (documents.seller_text). */
+function dealSellerText(s) {
+  const n = s.years,
+    last = s.payments[s.payments.length - 1].payment,
+    b = s.balloon;
+  const yrs = n === 1 ? '1 year' : `${n} years`;
+  if (s.schedule === 'amortizing')
+    return `The seller is paid ${money(s.payments[0].payment)} a year for ${yrs}: level monthly payments of principal and interest, with nothing left to pay at the end.`;
+  const lent = money(b.principal);
+  const interest =
+    s.schedule === 'interest_only' ? decimalMinus(last, b.principal) : b.accrued_interest;
+  if (n === 1)
+    return `The seller is paid once, at the end of year 1: ${money(last)}, the ${lent} lent plus ${money(interest)} of interest.`;
+  if (s.schedule === 'interest_only')
+    return `The seller is paid ${money(interest)} of interest a year, and in year ${n} the ${lent} lent is due as well: ${money(last)} that year. The year-1 coverage does not include the ${lent}.`;
+  return `The seller is paid nothing until year ${n}, when ${money(last)} is due: ${lent} lent plus ${money(interest)} of interest. The year-1 coverage does not include it.`;
+}
+/* a − b for two decimal strings with two places, exactly, in cents. */
+function decimalMinus(a, b) {
+  const cents = (v) => {
+    const [whole, frac = ''] = String(v).split('.');
+    const sign = whole.startsWith('-') ? -1n : 1n;
+    return sign * (BigInt(whole.replace('-', '')) * 100n + BigInt((frac + '00').slice(0, 2)));
+  };
+  const c = cents(a) - cents(b);
+  const abs = c < 0n ? -c : c;
+  return `${c < 0n ? '-' : ''}${abs / 100n}.${String(abs % 100n).padStart(2, '0')}`;
+}
+/* What the buyer puts in at closing, as the investment memo says it (documents.buyer_cash_text). */
+function dealBuyerCashText(su) {
+  if (decimalKey(su.funding_beyond_uses) !== '0')
+    return `Funding exceeds uses by ${money(su.funding_beyond_uses)}: debt and investor equity bring in more than the deal uses, so the buyer puts in no cash at closing. Decide where the extra goes before relying on this structure.`;
+  if (decimalKey(su.buyer_cash_at_closing) === '0')
+    return 'The buyer puts in no cash at closing: debt and investor equity cover every use.';
+  return `The buyer puts in ${money(su.buyer_cash_at_closing)} of cash at closing: total uses less all debt and investor equity.`;
+}
 function inspDeal(o) {
   const a = o.data.analysis;
   const inputs = o.data.inputs || {};
-  const noDebt = decimalKey(inputs.senior_debt) === '0' && decimalKey(inputs.seller_note) === '0';
+  const noDebt = DEAL_LOANS.every((k) => decimalKey(inputs[k] ?? '0') === '0');
+  const su = a.sources_and_uses;
+  const v11 = 'debt_service_year' in a;
+  const amortizing = dealDeferral(a);
   const line = M.lines.find((l) => l.dealId === o.id);
   let out = head({
     kicker: 'Acquisition analysis',
@@ -2667,20 +2710,33 @@ function inspDeal(o) {
   out += `<p class="prose spaced">${h(o.data.inputs.thesis)}</p>`;
   out += sec(
     'Key figures',
-    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div><div>Buyer equity required</div><div class="v">${money(a.sources_and_uses.buyer_equity_required)}</div><div>Annual debt service</div><div class="v">${noDebt ? 'None' : money(a.annual_debt_service)}</div></div>${noDebt ? `<p class="fine no-debt">${NO_DEBT}</p>` : ''}<p class="fine">${CALC_NOTE}</p>`,
+    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div>${v11 ? `<div>Real estate, at its price (not valued)</div><div class="v">${money(su.real_estate_price)}</div><div>Buyer cash at closing</div><div class="v buyer-cash">${money(su.buyer_cash_at_closing)}</div>` : `<div>Buyer equity required</div><div class="v">${money(su.buyer_equity_required)}</div>`}<div>${v11 ? 'Debt service due in year 1' : 'Annual debt service'}</div><div class="v">${noDebt ? 'None' : money(a.annual_debt_service)}</div>${amortizing ? `<div>Debt service if the seller note amortized</div><div class="v">${money(a.amortizing_annual_debt_service)}</div>` : ''}</div>${noDebt ? `<p class="fine no-debt">${NO_DEBT}</p>` : ''}${v11 ? `<p class="fine buyer-cash-text">${h(dealBuyerCashText(su))}</p>` : ''}${a.seller_note_schedule ? `<p class="fine seller-text">${h(dealSellerText(a.seller_note_schedule))}</p>` : ''}<p class="fine">${CALC_NOTE}</p>`,
   );
   out += sec('Inputs not given', `<p class="fine assumed-inputs">${assumedText(o)}</p>`);
   out += sec(
     'Cases',
-    `<div class="tbl-wrap stack"><table><thead><tr><th>Case</th><th class="num">EBITDA</th><th class="num">Cash after debt service</th><th class="num">Coverage ratio</th></tr></thead><tbody>${Object.entries(
+    `<div class="tbl-wrap stack"><table><thead><tr><th>Case</th><th class="num">EBITDA</th><th class="num">Cash after debt service</th><th class="num">Coverage ratio${v11 ? ', year 1' : ''}</th>${amortizing ? '<th class="num">Coverage if the seller note amortized</th>' : ''}</tr></thead><tbody>${Object.entries(
       a.scenarios,
     )
       .map(
         ([k, v]) =>
-          `<tr><td>${h(label(k))}</td><td class="num" data-l="EBITDA">${money(v.ebitda)}</td><td class="num" data-l="After debt">${money(v.cash_after_debt_service)}</td><td class="num" data-l="Coverage">${v.coverage_ratio === null ? 'No debt service' : ratio(v.coverage_ratio) + '×'}</td></tr>`,
+          `<tr><td>${h(label(k))}</td><td class="num" data-l="EBITDA">${money(v.ebitda)}</td><td class="num" data-l="After debt">${money(v.cash_after_debt_service)}</td><td class="num" data-l="Coverage">${dealCoverage(v.coverage_ratio)}</td>${amortizing ? `<td class="num" data-l="If amortized">${dealCoverage(v.amortizing_coverage_ratio)}</td>` : ''}</tr>`,
       )
-      .join('')}</tbody></table></div>`,
+      .join('')}</tbody></table></div>` +
+      (amortizing
+        ? '<p class="fine">A lender may count the seller note as if it amortized over its term. The last column shows the coverage on that basis.</p>'
+        : ''),
   );
+  if (a.seller_note_schedule)
+    out += sec(
+      'Seller note payments',
+      `<div class="tbl-wrap"><table class="seller-payments"><thead><tr><th class="num">Year</th><th class="num">Due to the seller</th></tr></thead><tbody>${a.seller_note_schedule.payments
+        .map(
+          (p) =>
+            `<tr><td class="num">${h(p.year)}</td><td class="num">${money(p.payment)}</td></tr>`,
+        )
+        .join('')}</tbody></table></div>`,
+    );
   out += sec(
     'Earnings adjustments',
     props([
@@ -4113,10 +4169,34 @@ function forecastDialog() {
    them, and their examples are only placeholder text. Every other field may be left empty: it is then
    left out of the request, the server uses the example value and records the field in assumed_inputs. */
 const DEAL_REQUIRED = ['annual_revenue', 'reported_ebitda', 'purchase_price'];
-const DEAL_WHOLE = ['debt_years', 'seller_years'];
-/* The two loans. Financing is the buyer's choice, so an empty loan is no loan: its example is zero. */
-const DEAL_LOANS = ['senior_debt', 'seller_note'];
-const DEAL_LOAN_TERMS = ['debt_rate', 'debt_years', 'seller_rate', 'seller_years'];
+const DEAL_WHOLE = ['debt_years', 'property_years', 'seller_years'];
+/* The three loans. Financing is the buyer's choice, so an empty loan is no loan: its example is zero. */
+const DEAL_LOANS = ['senior_debt', 'property_debt', 'seller_note'];
+const DEAL_LOAN_TERMS = [
+  'debt_rate',
+  'debt_years',
+  'property_rate',
+  'property_years',
+  'seller_rate',
+  'seller_years',
+  'seller_schedule',
+];
+/* How a seller note is repaid: the values DealInputs.seller_schedule takes, as the page names them. */
+const SELLER_SCHEDULES = {
+  amortizing: 'Amortizing',
+  interest_only: 'Interest only',
+  deferred: 'Deferred',
+};
+const dealSchedule = (v) => h((SELLER_SCHEDULES[v] || String(v)).toLowerCase());
+/* What the form says under a figure that has something particular to say. */
+const DEAL_HINTS = {
+  purchase_price: 'Required. The business only; price a building sold with it below.',
+  real_estate_price:
+    'A building sold with the business. Not valued by the multiples. Leave empty for none.',
+  investor_equity: 'Cash from investors at closing. Leave empty for none.',
+  annual_rent:
+    'Rent the business will pay that reported EBITDA does not already bear. Leave empty for none.',
+};
 const dealYears = (v) => `${h(v)} years`;
 const dealMultiple = (v) => `${ratio(v)}×`;
 const dealRate = (v) =>
@@ -4134,15 +4214,22 @@ const dealFields = [
   ['multiple_low', 'Low EBITDA multiple', 3, dealMultiple],
   ['multiple_high', 'High EBITDA multiple', 5, dealMultiple],
   ['purchase_price', 'Negotiated purchase consideration', 800000, money],
+  ['real_estate_price', 'Real estate price', 0, money],
   ['fees', 'Transaction fees', 30000, money],
   ['working_capital', 'Working capital funding', 50000, money],
   ['integration_cost', 'Integration costs', 0, money],
   ['senior_debt', 'New senior debt', 0, money],
   ['debt_rate', 'Senior annual interest rate', 0.09, dealRate],
   ['debt_years', 'Senior term (years)', 7, dealYears],
+  ['property_debt', 'Property loan', 0, money],
+  ['property_rate', 'Property loan annual interest rate', 0.08, dealRate],
+  ['property_years', 'Property loan term (years)', 25, dealYears],
   ['seller_note', 'Seller financing', 0, money],
   ['seller_rate', 'Seller annual interest rate', 0.06, dealRate],
   ['seller_years', 'Seller term (years)', 5, dealYears],
+  ['seller_schedule', 'Seller note schedule', 'amortizing', dealSchedule],
+  ['investor_equity', 'Investor equity', 0, money],
+  ['annual_rent', 'Annual rent', 0, money],
   ['annual_capex', 'Annual maintenance capex', 15000, money],
   ['annual_working_capital_growth', 'Annual working capital increase', 0, money],
   ['tax_rate', 'Assumed tax rate', 0.25, dealRate],
@@ -4195,8 +4282,11 @@ const DEAL_EXAMPLES_BEFORE_LIST = {
 const DEAL_TERM_LOAN = {
   debt_rate: 'senior_debt',
   debt_years: 'senior_debt',
+  property_rate: 'property_debt',
+  property_years: 'property_debt',
   seller_rate: 'seller_note',
   seller_years: 'seller_note',
+  seller_schedule: 'seller_note',
 };
 /* What the form shows for a field when it is opened again from an earlier analysis. A field that
    analysis gave is filled in. One it recorded as assumed starts empty, so it is not sent as the
@@ -4245,23 +4335,32 @@ function dealDialog(id) {
         : '') +
       dealFields
         .map(([k, t, example]) =>
-          input(
-            k,
-            t,
-            dealStart(d, assumed, k),
-            'number',
-            DEAL_REQUIRED.includes(k)
-              ? 'Required.'
-              : DEAL_LOANS.includes(k)
-                ? 'Leave empty for no loan.'
-                : DEAL_LOAN_TERMS.includes(k)
-                  ? (k.includes('rate') ? 'Decimal rate: 0.09 means 9%. ' : '') +
-                    'Used only when its loan is entered. Leave empty to use the example.'
-                  : k.includes('rate')
-                    ? 'Decimal rate: 0.09 means 9%. Leave empty to use the example.'
-                    : 'Leave empty to use the example.',
-            `step="any" placeholder="${DEAL_LOANS.includes(k) ? 'Empty: no loan' : `Example: ${example}`}"${DEAL_REQUIRED.includes(k) ? ' required' : ''}`,
-          ),
+          k === 'seller_schedule'
+            ? choose(
+                k,
+                t,
+                [['', 'Empty: the example, amortizing'], ...Object.entries(SELLER_SCHEDULES)],
+                dealStart(d, assumed, k),
+                'Amortizing: level payments. Interest only: interest each year, the principal at the end. Deferred: nothing until the end, when the principal and the interest accrued, compounded yearly, are due. Used only when a seller note is entered.',
+              )
+            : input(
+                k,
+                t,
+                dealStart(d, assumed, k),
+                'number',
+                DEAL_HINTS[k] ||
+                  (DEAL_REQUIRED.includes(k)
+                    ? 'Required.'
+                    : DEAL_LOANS.includes(k)
+                      ? 'Leave empty for no loan.'
+                      : DEAL_LOAN_TERMS.includes(k)
+                        ? (k.includes('rate') ? 'Decimal rate: 0.09 means 9%. ' : '') +
+                          'Used only when its loan is entered. Leave empty to use the example.'
+                        : k.includes('rate')
+                          ? 'Decimal rate: 0.09 means 9%. Leave empty to use the example.'
+                          : 'Leave empty to use the example.'),
+                `step="any" placeholder="${DEAL_LOANS.includes(k) ? 'Empty: no loan' : example === 0 ? 'Empty: none' : `Example: ${example}`}"${DEAL_REQUIRED.includes(k) ? ' required' : ''}`,
+              ),
         )
         .join('') +
       `<details class="full"><summary>Earnings adjustments (${d.adjustments?.length || 0} retained from prior analysis)</summary><p class="hint">Existing adjustments are retained. Add another here; only adjustments with reviewed evidence enter normalized earnings. Management replacement is deducted separately.</p>${d.adjustments?.length ? `<pre>${h(JSON.stringify(d.adjustments, null, 2))}</pre>` : ''}<div class="form-grid spaced">${input('adjustment_label', 'New adjustment label')}${input('adjustment_amount', 'Adjustment amount', 0, 'number', 'Positive adds to EBITDA; negative deducts.', 'step="any"')}${evidenceSelect('adjustment_evidence', 'Adjustment evidence', '', false, false)}</div></details>`,
@@ -4289,7 +4388,7 @@ function dealDialog(id) {
       return post(scope.bid, '/deals', body, key);
     },
     'Calculate and create diligence work',
-    'Revenue, reported EBITDA and the purchase consideration are required. An empty loan is no loan: the deal is screened without debt unless you enter one. Any other figure left empty uses the example value shown, and the analysis lists it as not given. Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
+    'Revenue, reported EBITDA and the purchase consideration are required. An empty loan is no loan: the deal is screened without debt unless you enter one. An empty real estate price, investor equity or rent is none. Any other figure left empty uses the example value shown, and the analysis lists it as not given. Multiples and financing terms are your assumptions. Negotiated consideration is a transaction use; the cash/debt valuation bridge is not automatically additional funding or debt service.',
     selectAfter('deals', 'deal:'),
   );
 }
