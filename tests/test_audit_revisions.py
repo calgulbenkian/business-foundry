@@ -1,8 +1,10 @@
 """Integrity verification covers every stored revision, not only the current one."""
 
+import hashlib
 import json
 import sqlite3
 import sys
+from typing import NamedTuple
 from uuid import uuid4
 
 import pytest
@@ -1198,6 +1200,238 @@ def test_event_whose_payload_id_is_not_its_object_id_hides_no_change(setup, whic
     assert_clean(service, actor, other)
 
 
+# An event's object id is text and its payload id is compared with it by value, so a payload id that
+# is not text is never a snapshot, under the record's own id or under that value spelled as text.
+
+NON_TEXT_IDS = {
+    "null": lambda own: None,
+    "false": lambda own: False,
+    "true": lambda own: True,
+    "zero": lambda own: 0,
+    "five": lambda own: 5,
+    "two-point-five": lambda own: 2.5,
+    "list-of-its-id": lambda own: [own],
+    "object-of-its-id": lambda own: {"id": own},
+}
+
+NON_TEXT_OBJECT_IDS = {
+    "own-id": lambda value, own, bid: own,
+    "business-id": lambda value, own, bid: bid,
+    "json-text": lambda value, own, bid: json.dumps(value),
+    "python-text": lambda value, own, bid: str(value),
+}
+
+
+# For these values the JSON text and the Python text are the same text ("0", "5", "2.5"), so the
+# python-text case would repeat the json-text case exactly. It is left out for them.
+SAME_JSON_AND_PYTHON_TEXT = {"zero", "five", "two-point-five"}
+
+NON_TEXT_ID_SPELLINGS = [
+    pytest.param(payload_id, spelling, id=f"{payload_id}-{spelling}")
+    for payload_id in NON_TEXT_IDS
+    for spelling in NON_TEXT_OBJECT_IDS
+    if not (spelling == "python-text" and payload_id in SAME_JSON_AND_PYTHON_TEXT)
+]
+
+
+def with_id(payload, value):
+    return canonical({**payload, "id": value})
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize(("payload_id", "spelling"), NON_TEXT_ID_SPELLINGS)
+def test_event_whose_payload_id_is_not_text_is_no_snapshot(setup, payload_id, spelling, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    value = NON_TEXT_IDS[payload_id](item["id"])
+    object_id = NON_TEXT_OBJECT_IDS[spelling](value, item["id"], bid)
+    append_event(store, bid, object_id, with_id(foreign_snapshot(item, version), value))
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_event_whose_payload_id_is_not_text_hides_no_change(setup, payload_id, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    oid = item["id"]
+    forged = foreign_snapshot(item, version)
+    with store.write() as con:
+        con.execute(
+            "UPDATE objects SET title=?,data=?,version=? WHERE id=?",
+            (forged["title"], canonical(forged["data"]), version, oid),
+        )
+    expected = [f"Current record differs from history: {oid}", f"Revision mismatch: {oid}"]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    append_event(store, bid, oid, with_id(forged, NON_TEXT_IDS[payload_id](oid)))
+    after = integrity(setup)
+    assert after["record_errors"] == expected
+    assert not after["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
+def renamed_profile(profile, version):
+    return {**profile, "data": {**profile["data"], "name": "Never approved"}, "version": version}
+
+
+@pytest.mark.parametrize(
+    "version", [pytest.param(1, id="current-version"), pytest.param(99, id="unrecorded-version")]
+)
+@pytest.mark.parametrize(
+    "which", [pytest.param("business", id="business-id"), pytest.param("record", id="records-id")]
+)
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_business_profile_event_whose_payload_id_is_not_text_is_no_snapshot(
+    setup, payload_id, which, version
+):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    profile = service.audit(actor, bid)["events"][0]["payload"]
+    assert profile["id"] == bid and profile["version"] == 1
+    item = history(setup, versions=2)
+    object_id = bid if which == "business" else item["id"]
+    append_event(
+        store,
+        bid,
+        object_id,
+        with_id(renamed_profile(profile, version), NON_TEXT_IDS[payload_id](bid)),
+        "business.updated",
+    )
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("payload_id", list(NON_TEXT_IDS))
+def test_business_profile_event_whose_payload_id_is_not_text_hides_no_change(setup, payload_id):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    profile = service.audit(actor, bid)["events"][0]["payload"]
+    forged = renamed_profile(profile, 2)
+    with store.write() as con:
+        con.execute("UPDATE businesses SET data=?,version=2 WHERE id=?", (canonical(forged["data"]), bid))
+    expected = [f"Current record differs from history: {bid}"]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    append_event(store, bid, bid, with_id(forged, NON_TEXT_IDS[payload_id](bid)), "business.updated")
+    after = integrity(setup)
+    assert after["record_errors"] == expected
+    assert not after["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
+# The empty text is text like any other: a payload id "" is a snapshot only under the object id "".
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+@pytest.mark.parametrize(
+    "which", [pytest.param("record", id="records-id"), pytest.param("business", id="business-id")]
+)
+def test_event_whose_payload_id_is_empty_text_is_no_snapshot_under_another_id(setup, which, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    object_id = item["id"] if which == "record" else bid
+    append_event(store, bid, object_id, with_id(foreign_snapshot(item, version), ""))
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("version", FOREIGN_VERSIONS)
+def test_event_whose_payload_id_and_object_id_are_empty_text_is_a_snapshot(setup, version):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    append_event(store, bid, "", with_id(foreign_snapshot(item, version), ""))
+    expected = ["Historical record missing: ", f"Historical revision missing:  version {version}"]
+    result = integrity(setup)
+    assert result["record_errors"] == expected
+    assert not result["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
+# Revision rows are attributed to a business through the object id of every event it has, whether
+# or not that event is a snapshot. A row under an id that nothing of the business names is not
+# attributed to it.
+
+UNNAMED_ID = "object_nothing_else_uses"
+
+
+def unnamed_revision(setup):
+    store = setup[0]
+    item = history(setup, versions=2)
+    with store.write() as con:
+        con.execute(
+            "INSERT INTO revisions VALUES(?,?,?,?,?)",
+            (
+                UNNAMED_ID,
+                1,
+                canonical({**item, "id": UNNAMED_ID, "version": 1}),
+                "principal_appender",
+                APPENDED_AT,
+            ),
+        )
+    return item
+
+
+def test_documented_limit_revision_under_an_id_no_event_names_is_not_checked(setup):
+    _, service, actor, bid, _ = setup
+    other = second_business(setup)
+    unnamed_revision(setup)
+    assert_clean(service, actor, bid)
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == []
+    assert exported["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize(
+    "payload_id",
+    [
+        pytest.param(lambda own: own, id="records-id"),
+        pytest.param(lambda own: 5, id="five"),
+        pytest.param(lambda own: None, id="null"),
+        pytest.param(lambda own: [own], id="list-of-records-id"),
+    ],
+)
+def test_event_that_is_no_snapshot_attributes_revisions_under_its_object_id(setup, payload_id):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    item = unnamed_revision(setup)
+    append_event(store, bid, UNNAMED_ID, with_id(foreign_snapshot(item, 1), payload_id(item["id"])))
+    expected = [f"Revision has no recorded history: {UNNAMED_ID} version 1"]
+    result = integrity(setup)
+    assert result["record_errors"] == expected
+    assert not result["valid"]
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == expected
+    assert not exported["valid"]
+    assert_clean(service, actor, other)
+
+
 UNUSABLE_VERSIONS = [
     pytest.param("2.0", id="float-2.0"),
     pytest.param("2e0", id="exponent-2e0"),
@@ -1369,6 +1603,2305 @@ def test_documented_limit_altered_ai_review_with_appended_event_verifies(setup):
         "ai.succeeded",
     )
     assert_clean(service, actor, bid)
+
+
+# Any event counts for an AI review when its payload's run_id and data_sha256 are both truthy,
+# whatever else the payload holds and whatever its action, and the last such event for a run id
+# stands for that run. An event that does not count leaves the one before it standing.
+
+ABSENT = object()
+OTHER_DIGEST = "f" * 64
+
+AI_PAYLOAD_IDS = {
+    "text": lambda own: UNNAMED_ID,
+    "five": lambda own: 5,
+    "null": lambda own: None,
+    "list": lambda own: [own],
+}
+
+AI_OBJECT_IDS = [pytest.param("record", id="records-id"), pytest.param("run", id="runs-id")]
+
+# An event counts whatever its action: one the AI service writes and one it never writes.
+AI_ACTIONS = [
+    pytest.param("ai.succeeded", id="action-ai-succeeded"),
+    pytest.param("record.updated", id="action-record-updated"),
+]
+
+
+def stored_ai_digest(store, run_id):
+    with store.read() as con:
+        data = con.execute("SELECT data FROM ai_calls WHERE id=?", (run_id,)).fetchone()[0]
+    return digest(canonical(json.loads(data)))
+
+
+def append_ai_event(setup, item, run, payload_id, which="record", action="ai.succeeded", **fields):
+    """Append an event that is no snapshot, carrying ``fields`` and no key whose value is ABSENT."""
+    store, _, _, bid, _ = setup
+    object_id = item["id"] if which == "record" else run
+    payload = {"id": AI_PAYLOAD_IDS[payload_id](item["id"]), "version": 2, "data": item["data"]}
+    payload.update({name: value for name, value in fields.items() if value is not ABSENT})
+    assert payload["id"] != object_id
+    append_event(store, bid, object_id, canonical(payload), action)
+
+
+def ai_audit(setup, item, payload_id, which, run_id, data_sha256, state, action="ai.succeeded"):
+    store, _, actor, bid, _ = setup
+    run = add_ai_review(store, actor, bid)
+    right = stored_ai_digest(store, run)
+    run_id = run if run_id == "run" else run_id
+    append_ai_event(
+        setup,
+        item,
+        run,
+        payload_id,
+        which,
+        action,
+        run_id=run_id,
+        data_sha256=data_sha256(right),
+        state=state,
+    )
+    return integrity(setup)
+
+
+def assert_export_and_other_business(setup, other, result):
+    """The export reports what the audit reported, and the second business audits clean."""
+    _, service, actor, _, _ = setup
+    exported = export_integrity(setup)
+    assert exported["record_errors"] == result["record_errors"]
+    assert exported["valid"] is result["valid"]
+    assert_clean(service, actor, other)
+
+
+@pytest.mark.parametrize("action", AI_ACTIONS)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_that_is_no_snapshot_stands_for_its_ai_review(setup, payload_id, which, action):
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, "run", lambda right: right, "unknown", action)
+    assert result["record_errors"] == []
+    assert result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+@pytest.mark.parametrize("action", AI_ACTIONS)
+@pytest.mark.parametrize(
+    ("data_sha256", "state"),
+    [
+        pytest.param(lambda right: OTHER_DIGEST, "unknown", id="another-digest"),
+        pytest.param(lambda right: right, "succeeded", id="another-state"),
+        pytest.param(lambda right: 1, "unknown", id="digest-one"),
+        pytest.param(lambda right: True, "unknown", id="digest-true"),
+        pytest.param(lambda right: [right], "unknown", id="digest-list-of-the-right-digest"),
+    ],
+)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_that_is_no_snapshot_and_differs_from_its_ai_review_is_reported(
+    setup, payload_id, which, data_sha256, state, action
+):
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, "run", data_sha256, state, action)
+    assert result["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert not result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+@pytest.mark.parametrize(
+    ("run_id", "data_sha256"),
+    [
+        pytest.param("run", lambda right: "", id="digest-empty-text"),
+        pytest.param("run", lambda right: 0, id="digest-zero"),
+        pytest.param("run", lambda right: False, id="digest-false"),
+        pytest.param("run", lambda right: None, id="digest-null"),
+        pytest.param("run", lambda right: [], id="digest-empty-list"),
+        pytest.param("run", lambda right: {}, id="digest-empty-object"),
+        pytest.param("run", lambda right: ABSENT, id="digest-absent"),
+        pytest.param("", lambda right: OTHER_DIGEST, id="run-id-empty-text"),
+        pytest.param(0, lambda right: OTHER_DIGEST, id="run-id-zero"),
+        pytest.param(False, lambda right: OTHER_DIGEST, id="run-id-false"),
+        pytest.param(None, lambda right: OTHER_DIGEST, id="run-id-null"),
+        pytest.param(ABSENT, lambda right: OTHER_DIGEST, id="run-id-absent"),
+    ],
+)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_with_a_falsy_run_id_or_digest_does_not_count_for_an_ai_review(
+    setup, payload_id, which, run_id, data_sha256
+):
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, run_id, data_sha256, "succeeded")
+    assert result["record_errors"] == []
+    assert result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+@pytest.mark.parametrize(
+    ("run_id", "shown"),
+    [
+        pytest.param("review_never_stored", "review_never_stored", id="text"),
+        pytest.param(5, "5", id="five"),
+        pytest.param(True, "True", id="true"),
+    ],
+)
+@pytest.mark.parametrize("which", AI_OBJECT_IDS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_that_is_no_snapshot_for_an_ai_review_never_stored_is_reported(
+    setup, payload_id, which, run_id, shown
+):
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    result = ai_audit(setup, item, payload_id, which, run_id, lambda right: OTHER_DIGEST, "succeeded")
+    assert result["record_errors"] == [f"Historical AI review missing: {shown}"]
+    assert not result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+AI_RUNS = [pytest.param(True, id="altered"), pytest.param(False, id="no-history")]
+
+
+def unrecorded_ai_review(setup, chained):
+    """A stored run whose current row no chained event matches, with the state an event would need."""
+    store, _, actor, bid, _ = setup
+    run = add_ai_review(store, actor, bid, chained=chained)
+    if not chained:
+        return run, "unknown"
+    with store.write() as con:
+        con.execute(
+            "UPDATE ai_calls SET data=?,state='succeeded' WHERE id=?",
+            (canonical({"note": "Advice that was never returned."}), run),
+        )
+    return run, "succeeded"
+
+
+@pytest.mark.parametrize("chained", AI_RUNS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_documented_limit_ai_review_verifies_through_an_event_that_is_no_snapshot(setup, payload_id, chained):
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    run, state = unrecorded_ai_review(setup, chained)
+    before = integrity(setup)
+    assert before["record_errors"] == [f"AI review differs from history: {run}"]
+    assert not before["valid"]
+    assert_export_and_other_business(setup, other, before)
+    right = stored_ai_digest(setup[0], run)
+    append_ai_event(setup, item, run, payload_id, run_id=run, data_sha256=right, state=state)
+    result = integrity(setup)
+    assert result["record_errors"] == []
+    assert result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+@pytest.mark.parametrize(
+    "data_sha256", [pytest.param("", id="digest-empty-text"), pytest.param(ABSENT, id="digest-absent")]
+)
+@pytest.mark.parametrize("chained", AI_RUNS)
+@pytest.mark.parametrize("payload_id", list(AI_PAYLOAD_IDS))
+def test_event_with_an_empty_or_absent_digest_does_not_hide_an_ai_review_change(
+    setup, payload_id, chained, data_sha256
+):
+    other = second_business(setup)
+    item = history(setup, versions=2)
+    run, state = unrecorded_ai_review(setup, chained)
+    expected = [f"AI review differs from history: {run}"]
+    before = integrity(setup)
+    assert before["record_errors"] == expected
+    assert not before["valid"]
+    assert_export_and_other_business(setup, other, before)
+    append_ai_event(setup, item, run, payload_id, run_id=run, data_sha256=data_sha256, state=state)
+    result = integrity(setup)
+    assert result["record_errors"] == expected
+    assert not result["valid"]
+    assert_export_and_other_business(setup, other, result)
+
+
+# One business's AI reviews are invisible to another's audit and export. The audit reads only this
+# business's AI review rows and only this business's events, and the export carries only this
+# business's AI review rows.
+
+SECOND_RUN = "review_second_business"
+SYNTHETIC_RUN_ENTRY = {
+    "id": "review_synthetic",
+    "state": "unknown",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "data": {"note": "Synthetic run written for this test."},
+}
+SECOND_RUN_ENTRY = {**SYNTHETIC_RUN_ENTRY, "id": "review_second_business"}
+
+
+def alter_ai_review(store, run_id):
+    """Change a stored run by SQL to a state and data its chained event does not carry."""
+    changed = {"note": "Advice that was never returned."}
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET data=?,state='succeeded' WHERE id=?", (canonical(changed), run_id)
+            ).rowcount
+            == 1
+        )
+    return changed
+
+
+def audited(service, actor, bid, export=False):
+    return service.audit(actor, bid, export)["integrity"]
+
+
+def assert_audit_and_export(service, actor, bid, expected):
+    for export in (False, True):
+        result = audited(service, actor, bid, export)
+        assert result["record_errors"] == expected
+        assert result["valid"] is (expected == [])
+
+
+# Which business holds the only AI review: the first-created one (the fixture's) or the
+# second-created one. A version that picked rows by position, not by business id, would pass
+# whenever the business under test was the first created and its row the first inserted.
+
+
+class Holder(NamedTuple):
+    first_created: bool
+    run_id: str
+    differs: list
+    missing: list
+    entry: dict
+
+
+HOLDERS = [
+    pytest.param(
+        Holder(
+            True,
+            "review_synthetic",
+            ["AI review differs from history: review_synthetic"],
+            ["Historical AI review missing: review_synthetic"],
+            SYNTHETIC_RUN_ENTRY,
+        ),
+        id="first-created-business-holds-it",
+    ),
+    pytest.param(
+        Holder(
+            False,
+            "review_second_business",
+            ["AI review differs from history: review_second_business"],
+            ["Historical AI review missing: review_second_business"],
+            SECOND_RUN_ENTRY,
+        ),
+        id="second-created-business-holds-it",
+    ),
+]
+
+
+def holder_and_other(setup, holder):
+    """Create the second business; return the business that holds the review, then the other."""
+    first = setup[3]
+    second = second_business(setup)
+    return (first, second) if holder.first_created else (second, first)
+
+
+def ai_call_ids_in_insertion_order(store):
+    with store.read() as con:
+        return [row[0] for row in con.execute("SELECT id FROM ai_calls ORDER BY rowid")]
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_ai_review_of_one_business_is_not_in_another_business_audit(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    assert_audit_and_export(service, actor, owner, [])
+    assert_audit_and_export(service, actor, other, [])
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_altered_ai_review_of_one_business_is_reported_only_there(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    alter_ai_review(store, holder.run_id)
+    assert_audit_and_export(service, actor, owner, holder.differs)
+    assert_audit_and_export(service, actor, other, [])
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_ai_review_without_history_of_one_business_is_reported_only_there(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, chained=False, run_id=holder.run_id)
+    assert_audit_and_export(service, actor, owner, holder.differs)
+    assert_audit_and_export(service, actor, other, [])
+
+
+# Where both businesses hold a review, either business's row may be inserted first.
+INSERTION_ORDERS = [
+    pytest.param(True, id="first-created-business-row-inserted-first"),
+    pytest.param(False, id="second-created-business-row-inserted-first"),
+]
+
+
+def add_both_ai_reviews(setup, first_inserted_first):
+    """Create the second business and give each business one AI review, in the order asked."""
+    store, _, actor, bid, _ = setup
+    other = second_business(setup)
+    if first_inserted_first:
+        add_ai_review(store, actor, bid)
+        add_ai_review(store, actor, other, run_id=SECOND_RUN)
+        assert ai_call_ids_in_insertion_order(store) == ["review_synthetic", "review_second_business"]
+    else:
+        add_ai_review(store, actor, other, run_id=SECOND_RUN)
+        add_ai_review(store, actor, bid)
+        assert ai_call_ids_in_insertion_order(store) == ["review_second_business", "review_synthetic"]
+    return other
+
+
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+def test_each_business_checks_only_its_own_ai_review(setup, first_inserted_first):
+    store, service, actor, bid, _ = setup
+    other = add_both_ai_reviews(setup, first_inserted_first)
+    assert_audit_and_export(service, actor, bid, [])
+    assert_audit_and_export(service, actor, other, [])
+    alter_ai_review(store, "review_synthetic")
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    assert_audit_and_export(service, actor, other, [])
+    alter_ai_review(store, "review_second_business")
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+    assert_audit_and_export(service, actor, other, ["AI review differs from history: review_second_business"])
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_event_in_another_business_chain_stands_for_nothing_here(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    changed = alter_ai_review(store, holder.run_id)
+    # An event appended to the other business's chain carries the holder's run id and the state
+    # and digest of its altered row: it would make that row verify if it were in the holder's chain.
+    append_event(
+        store,
+        other,
+        holder.run_id,
+        canonical({"run_id": holder.run_id, "state": "succeeded", "data_sha256": digest(canonical(changed))}),
+        "ai.succeeded",
+    )
+    # Rule: a business's AI reviews are compared with its own events only. The event in the other
+    # chain hides nothing here, so the altered row is still reported.
+    assert_audit_and_export(service, actor, owner, holder.differs)
+    # Rule: an AI review a business's own history names must be a row of that business. The other
+    # business holds no row for this run id, whichever business does.
+    assert_audit_and_export(service, actor, other, holder.missing)
+
+
+# A business's export carries its own AI review rows and no other business's.
+
+
+def exported_archive(service, actor, bid):
+    return service.audit(actor, bid, True)
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_export_of_a_business_without_ai_reviews_carries_none_of_another_business(setup, holder):
+    store, service, actor, _, _ = setup
+    owner, other = holder_and_other(setup, holder)
+    add_ai_review(store, actor, owner, run_id=holder.run_id)
+    assert exported_archive(service, actor, other)["ai_runs"] == []
+    assert exported_archive(service, actor, owner)["ai_runs"] == [holder.entry]
+
+
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+def test_export_of_each_business_carries_only_its_own_ai_review(setup, first_inserted_first):
+    _, service, actor, bid, _ = setup
+    other = add_both_ai_reviews(setup, first_inserted_first)
+    assert exported_archive(service, actor, bid)["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
+    assert exported_archive(service, actor, other)["ai_runs"] == [SECOND_RUN_ENTRY]
+
+
+# One business may hold several AI reviews, and every one of them is checked, exported and
+# reported on its own. The two reviews below are alike in state, data and created_at and differ
+# only in their ids. The first-stored has the id that sorts last, so storage order and id order
+# disagree: a version that read one row, or picked rows by id, would show.
+
+FIRST_STORED_RUN = "review_zulu"
+SECOND_STORED_RUN = "review_alpha"
+
+
+def add_two_ai_reviews(setup, first_chained=True, second_chained=True):
+    """Give the fixture's business two AI reviews, stored in this order: zulu, then alpha."""
+    store, _, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, chained=first_chained, run_id=FIRST_STORED_RUN)
+    add_ai_review(store, actor, bid, chained=second_chained, run_id=SECOND_STORED_RUN)
+    assert ai_call_ids_in_insertion_order(store) == ["review_zulu", "review_alpha"]
+
+
+def assert_audit_and_export_in_any_order(service, actor, bid, expected):
+    for export in (False, True):
+        result = audited(service, actor, bid, export)
+        assert sorted(result["record_errors"]) == sorted(expected)
+        assert result["valid"] is False
+
+
+# Rule: every AI review row of a business is compared with its event, not only one of them.
+def test_both_ai_reviews_of_one_business_are_checked(setup):
+    _, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    assert_audit_and_export(service, actor, bid, [])
+
+
+# Rule: the export carries every AI review row of a business, not only one of them.
+def test_both_ai_reviews_of_one_business_are_exported(setup):
+    _, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    # The two rows have the same created_at and the export orders by created_at only, so SQL does
+    # not fix which of them comes first. They are compared sorted by id.
+    assert sorted(runs, key=lambda run: run["id"]) == [
+        {
+            "id": "review_alpha",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+        {
+            "id": "review_zulu",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+    ]
+
+
+# Rule: a changed AI review is reported, whichever of a business's reviews it is.
+@pytest.mark.parametrize(
+    ("run_id", "expected"),
+    [
+        pytest.param(
+            "review_zulu", ["AI review differs from history: review_zulu"], id="first-stored-changed"
+        ),
+        pytest.param(
+            "review_alpha", ["AI review differs from history: review_alpha"], id="second-stored-changed"
+        ),
+    ],
+)
+def test_changed_ai_review_is_reported_whichever_of_two_it_is(setup, run_id, expected):
+    store, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    alter_ai_review(store, run_id)
+    assert_audit_and_export(service, actor, bid, expected)
+
+
+# Rule: when both of a business's AI reviews are changed, both are reported and nothing else.
+def test_both_changed_ai_reviews_of_one_business_are_reported(setup):
+    store, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    alter_ai_review(store, FIRST_STORED_RUN)
+    alter_ai_review(store, SECOND_STORED_RUN)
+    # The audit reads the rows with no ORDER BY, so SQL does not fix the order of these two
+    # messages. They are compared without regard to order.
+    assert_audit_and_export_in_any_order(
+        service,
+        actor,
+        bid,
+        ["AI review differs from history: review_zulu", "AI review differs from history: review_alpha"],
+    )
+
+
+# Rule: an AI review with no event is reported, whichever of a business's reviews it is.
+@pytest.mark.parametrize(
+    ("first_chained", "expected"),
+    [
+        pytest.param(
+            False, ["AI review differs from history: review_zulu"], id="first-stored-without-history"
+        ),
+        pytest.param(
+            True, ["AI review differs from history: review_alpha"], id="second-stored-without-history"
+        ),
+    ],
+)
+def test_ai_review_without_history_is_reported_whichever_of_two_it_is(setup, first_chained, expected):
+    _, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup, first_chained=first_chained, second_chained=not first_chained)
+    assert_audit_and_export(service, actor, bid, expected)
+
+
+# Rule: every run the history names and no row answers is reported, whichever it is, and in the
+# order its event entered the chain. The audit walks the chain to collect them, so that order is
+# fixed by the code: here the first-stored review's event comes first.
+@pytest.mark.parametrize(
+    ("deleted", "expected"),
+    [
+        pytest.param(
+            ["review_zulu"], ["Historical AI review missing: review_zulu"], id="first-stored-missing"
+        ),
+        pytest.param(
+            ["review_alpha"], ["Historical AI review missing: review_alpha"], id="second-stored-missing"
+        ),
+        pytest.param(
+            ["review_zulu", "review_alpha"],
+            ["Historical AI review missing: review_zulu", "Historical AI review missing: review_alpha"],
+            id="both-missing",
+        ),
+    ],
+)
+def test_missing_ai_review_is_reported_whichever_of_two_and_both(setup, deleted, expected):
+    store, service, actor, bid, _ = setup
+    add_two_ai_reviews(setup)
+    with store.write() as con:
+        for run_id in deleted:
+            assert con.execute("DELETE FROM ai_calls WHERE id=?", (run_id,)).rowcount == 1
+    assert_audit_and_export(service, actor, bid, expected)
+
+
+# Rule: the export lists a business's AI reviews by created_at. The review created later is stored
+# first and has the id that sorts first, so neither storage order nor id order gives this list.
+# Rows with equal created_at come in an order the query does not fix, and no test pins that order.
+def test_export_lists_ai_reviews_of_one_business_by_created_at(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, run_id="review_created_later", created_at="2026-03-01T00:00:00+00:00")
+    add_ai_review(store, actor, bid, run_id="review_created_sooner", created_at="2026-02-01T00:00:00+00:00")
+    assert ai_call_ids_in_insertion_order(store) == ["review_created_later", "review_created_sooner"]
+    # The audit does not check created_at.
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_created_sooner",
+            "state": "unknown",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+        {
+            "id": "review_created_later",
+            "state": "unknown",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        },
+    ]
+
+
+# Three businesses, each holding one AI review. Three give every kind of pair: two created one
+# after the other (first and second, second and third) and two that were not (first and third).
+# A version that grouped businesses, for example by odd and even rowid, would mix the first and
+# third. Known limit: a grouping by rowid modulo 3 or more keeps these three apart, and no fixed
+# number of businesses closes that.
+
+
+def three_businesses_with_ai_reviews(setup):
+    store, _, actor, first, _ = setup
+    second = second_business(setup)
+    third = second_business(setup)
+    add_ai_review(store, actor, first, run_id="review_first_business")
+    add_ai_review(store, actor, second, run_id="review_second_of_three")
+    add_ai_review(store, actor, third, run_id="review_third_business")
+    return first, second, third
+
+
+# Rule: each of three businesses checks and exports only its own AI review.
+def test_each_of_three_businesses_checks_and_exports_only_its_own_ai_review(setup):
+    _, service, actor, _, _ = setup
+    first, second, third = three_businesses_with_ai_reviews(setup)
+    for bid in (first, second, third):
+        assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, first)["ai_runs"] == [
+        {
+            "id": "review_first_business",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        }
+    ]
+    assert exported_archive(service, actor, second)["ai_runs"] == [
+        {
+            "id": "review_second_of_three",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        }
+    ]
+    assert exported_archive(service, actor, third)["ai_runs"] == [
+        {
+            "id": "review_third_business",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Synthetic run written for this test."},
+        }
+    ]
+
+
+# Rule: a changed AI review of one of three businesses is reported there and nowhere else.
+def test_changed_ai_reviews_of_three_businesses_are_reported_each_only_in_its_own(setup):
+    store, service, actor, _, _ = setup
+    first, second, third = three_businesses_with_ai_reviews(setup)
+    alter_ai_review(store, "review_third_business")
+    assert_audit_and_export(service, actor, first, [])
+    assert_audit_and_export(service, actor, second, [])
+    assert_audit_and_export(service, actor, third, ["AI review differs from history: review_third_business"])
+    alter_ai_review(store, "review_first_business")
+    assert_audit_and_export(service, actor, first, ["AI review differs from history: review_first_business"])
+    assert_audit_and_export(service, actor, second, [])
+    assert_audit_and_export(service, actor, third, ["AI review differs from history: review_third_business"])
+
+
+# AI reviews that differ from each other in data and state. The reviews above are alike in
+# everything but their ids, which catches an export that drops duplicates but not one that gives a
+# review another review's data or state. Each review below is chained with the event a review
+# ending in its state leaves, so its row matches its own event and no other.
+
+
+# Rule: each AI review is compared with its own event and exported with its own data and state.
+def test_two_ai_reviews_that_differ_are_each_checked_and_exported_with_their_own_fields(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_zulu",
+        state="succeeded",
+        data={"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_alpha",
+        state="failed",
+        data={"error": "Provider output failed schema or citation validation.", "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_zulu", "review_alpha"]
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    # The two rows have the same created_at and the export orders by created_at only, so SQL does
+    # not fix which of them comes first. They are compared sorted by id.
+    assert sorted(runs, key=lambda run: run["id"]) == [
+        {
+            "id": "review_alpha",
+            "state": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"error": "Provider output failed schema or citation validation.", "http_status": 200},
+        },
+        {
+            "id": "review_zulu",
+            "state": "succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+        },
+    ]
+
+
+# Rule: in the created_at order the export fixes, each entry's data and state travel with its own
+# row. The review created later is stored first, so a version that paired a row's place in
+# created_at order with the row at that place in storage would swap the two reviews' fields.
+def test_export_by_created_at_keeps_each_ai_review_with_its_own_data_and_state(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_created_later",
+        created_at="2026-03-01T00:00:00+00:00",
+        state="failed",
+        data={"error": "Provider rejected the request.", "http_status": 403},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_created_sooner",
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_created_later", "review_created_sooner"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_created_sooner",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+        },
+        {
+            "id": "review_created_later",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 403},
+        },
+    ]
+
+
+# Rule: a business's export carries its own AI review's advice and outcome, never another
+# business's, whichever business's row was stored first.
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+def test_export_of_each_business_carries_its_own_ai_review_data_and_state(setup, first_inserted_first):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    reviews = [
+        lambda: add_ai_review(
+            store,
+            actor,
+            bid,
+            state="succeeded",
+            data={"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        ),
+        lambda: add_ai_review(
+            store,
+            actor,
+            other,
+            run_id=SECOND_RUN,
+            state="failed",
+            data={"error": "Provider did not complete a usable answer.", "http_status": 200},
+        ),
+    ]
+    for add in reviews if first_inserted_first else reversed(reviews):
+        add()
+    assert ai_call_ids_in_insertion_order(store) == (
+        ["review_synthetic", "review_second_business"]
+        if first_inserted_first
+        else ["review_second_business", "review_synthetic"]
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    assert_audit_and_export(service, actor, other, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        }
+    ]
+    assert exported_archive(service, actor, other)["ai_runs"] == [
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        }
+    ]
+
+
+# Rule: the export carries a changed AI review as its row stores it, and the same archive reports
+# it. It neither shows the state its history recorded nor leaves the review out.
+def test_export_carries_a_changed_ai_review_as_stored_and_reports_it(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    alter_ai_review(store, "review_synthetic")
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"note": "Advice that was never returned."},
+        }
+    ]
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+
+
+# Rule: the export carries an AI review that has no history, and the same archive reports it.
+def test_export_carries_an_ai_review_without_history_and_reports_it(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        chained=False,
+        state="failed",
+        data={"error": "Provider rejected the request.", "http_status": 429},
+    )
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        }
+    ]
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+
+
+# Rule: each exported review keeps its own data when another review shares its state, and its own
+# state when another review shares its data. The first two reviews share a state and differ in
+# data; the first and third share data and differ in state.
+def test_export_keeps_each_ai_review_fields_when_reviews_share_a_state_or_data(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_first",
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_second",
+        created_at="2026-03-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Delay the second location."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_third",
+        created_at="2026-04-01T00:00:00+00:00",
+        state="failed",
+        data={"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_first", "review_second", "review_third"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "succeeded",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Delay the second location."}, "http_status": 200},
+        },
+        {
+            "id": "review_third",
+            "state": "failed",
+            "created_at": "2026-04-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+    ]
+
+
+# Rule: a review is compared with its own event, and another review's event does not answer for
+# it. A row changed by SQL to the state and data of another review of the same business matches
+# that review's event, not its own, and is reported.
+def test_ai_review_changed_to_another_review_outcome_is_reported(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_zulu",
+        state="succeeded",
+        data={"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_alpha",
+        state="failed",
+        data={"error": "Provider output failed schema or citation validation.", "http_status": 200},
+    )
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET data=?,state='failed' WHERE id='review_zulu'",
+                (
+                    canonical(
+                        {"error": "Provider output failed schema or citation validation.", "http_status": 200}
+                    ),
+                ),
+            ).rowcount
+            == 1
+        )
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_zulu"])
+
+
+# Two businesses whose AI reviews share some fields and not others. The test above with two
+# businesses gives their reviews the same created_at and nothing else in common; the tests with
+# three businesses give theirs everything in common but the id. Neither catches an export or an
+# audit that takes a field from another business's review that shares another field with this one,
+# nor an export that writes another business's review date. Each case below is one way two
+# reviews can share fields, and each expected entry is written out beside the values stored.
+
+SHARED_FIELD_CASES = [
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        },
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        },
+        id="nothing-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Raise the price of the annual plan."}, "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Raise the price of the annual plan."}, "http_status": 200},
+        },
+        {
+            "state": "succeeded",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Sell through two regional wholesalers."}, "http_status": 200},
+        },
+        {
+            "id": "review_second_business",
+            "state": "succeeded",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Sell through two regional wholesalers."}, "http_status": 200},
+        },
+        id="state-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep the first site open on Sundays."}, "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep the first site open on Sundays."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep the first site open on Sundays."}, "http_status": 200},
+        },
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep the first site open on Sundays."}, "http_status": 200},
+        },
+        id="data-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+        id="date-shared",
+    ),
+    pytest.param(
+        {
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider output failed schema or citation validation.", "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider output failed schema or citation validation.", "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider output failed schema or citation validation.", "http_status": 200},
+        },
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider output failed schema or citation validation.", "http_status": 200},
+        },
+        id="state-and-data-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Delay the second location."}, "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Delay the second location."}, "http_status": 200},
+        },
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+        },
+        {
+            "id": "review_second_business",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+        },
+        id="state-and-date-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+        },
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+        },
+        {
+            "id": "review_second_business",
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Price the pilot at cost."}, "http_status": 200},
+        },
+        id="data-and-date-shared",
+    ),
+]
+
+
+# Rule: each business's review is compared with its own event and exported with its own state,
+# data and date, whichever of those it shares with another business's review and whichever
+# business's row was stored first.
+@pytest.mark.parametrize("first_inserted_first", INSERTION_ORDERS)
+@pytest.mark.parametrize(("first_stored", "first_entry", "second_stored", "second_entry"), SHARED_FIELD_CASES)
+def test_each_business_ai_review_keeps_its_own_fields_when_another_business_review_shares_some(
+    setup, first_stored, first_entry, second_stored, second_entry, first_inserted_first
+):
+    store, service, actor, bid, _ = setup
+    other = second_business(setup)
+    reviews = [
+        lambda: add_ai_review(store, actor, bid, **first_stored),
+        lambda: add_ai_review(store, actor, other, run_id=SECOND_RUN, **second_stored),
+    ]
+    for add in reviews if first_inserted_first else reversed(reviews):
+        add()
+    assert ai_call_ids_in_insertion_order(store) == (
+        ["review_synthetic", "review_second_business"]
+        if first_inserted_first
+        else ["review_second_business", "review_synthetic"]
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    assert_audit_and_export(service, actor, other, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [first_entry]
+    assert exported_archive(service, actor, other)["ai_runs"] == [second_entry]
+
+
+# Rule: the audit compares a review's state with its history exactly, and the export writes the
+# state exactly as the row stores it. A state that differs from the recorded one only in letter
+# case or in surrounding space is reported, and exported unchanged.
+@pytest.mark.parametrize(
+    ("stored_state", "expected_entry"),
+    [
+        pytest.param(
+            "Succeeded",
+            {
+                "id": "review_synthetic",
+                "state": "Succeeded",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+            },
+            id="capital-letter",
+        ),
+        pytest.param(
+            "succeeded ",
+            {
+                "id": "review_synthetic",
+                "state": "succeeded ",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+            },
+            id="space-after",
+        ),
+        pytest.param(
+            " succeeded",
+            {
+                "id": "review_synthetic",
+                "state": " succeeded",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+            },
+            id="space-before",
+        ),
+    ],
+)
+def test_ai_review_state_changed_only_in_form_is_reported_and_exported_as_stored(
+    setup, stored_state, expected_entry
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        state="succeeded",
+        data={"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+    )
+    with store.write() as con:
+        assert (
+            con.execute("UPDATE ai_calls SET state=? WHERE id='review_synthetic'", (stored_state,)).rowcount
+            == 1
+        )
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [expected_entry]
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+    assert_audit_and_export(service, actor, bid, ["AI review differs from history: review_synthetic"])
+
+
+# Rule: the export writes the state of a review its history accepts exactly as stored too. The row
+# and its event both carry a state with a capital letter, so the audit is clean and the export
+# keeps the capital.
+def test_ai_review_state_with_a_capital_that_matches_its_history_is_exported_as_stored(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        state="Succeeded",
+        data={"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "Succeeded",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Open a second sales channel."}, "http_status": 200},
+        }
+    ]
+
+
+# Known limit, not wanted behaviour: the audit does not read a review's date. The event a review
+# leaves carries its run id, state and data digest and no date, so a created_at changed in the row
+# by SQL is not reported, and the export writes the date exactly as the row now stores it.
+@pytest.mark.parametrize(
+    ("stored_date", "expected_entry"),
+    [
+        pytest.param(
+            "2026-02-01T00:00:00Z",
+            {
+                "id": "review_synthetic",
+                "state": "succeeded",
+                "created_at": "2026-02-01T00:00:00Z",
+                "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+            },
+            id="zulu-suffix",
+        ),
+        pytest.param(
+            "2026-02-01T00:00:00.250000+00:00",
+            {
+                "id": "review_synthetic",
+                "state": "succeeded",
+                "created_at": "2026-02-01T00:00:00.250000+00:00",
+                "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+            },
+            id="fractional-seconds",
+        ),
+        pytest.param(
+            " 2026-02-01T00:00:00+00:00 ",
+            {
+                "id": "review_synthetic",
+                "state": "succeeded",
+                "created_at": " 2026-02-01T00:00:00+00:00 ",
+                "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+            },
+            id="space-before-and-after",
+        ),
+    ],
+)
+def test_known_limit_ai_review_date_changed_in_the_row_is_exported_as_changed_and_not_reported(
+    setup, stored_date, expected_entry
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        state="succeeded",
+        data={"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+    )
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET created_at=? WHERE id='review_synthetic'", (stored_date,)
+            ).rowcount
+            == 1
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [expected_entry]
+
+
+# Known limit of these tests, not of the code: a read capped at N reviews of a business, in the
+# audit or the export, passes this file whenever N is at least the most reviews any test stores for
+# one business, which is three. A test with more reviews would only move the same gap to a larger
+# cap, so no fixed number of reviews closes it, and no test here tries.
+
+
+# Rule: the export lists reviews by their full created_at, so two reviews created on the same day
+# are listed by time of day. The one created later is stored first, so an order by the day alone
+# would leave them in storage order.
+def test_export_lists_ai_reviews_created_on_the_same_day_by_time(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_afternoon",
+        created_at="2026-02-01T14:00:00+00:00",
+        state="failed",
+        data={"error": "Provider rejected the request.", "http_status": 403},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_morning",
+        created_at="2026-02-01T09:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_afternoon", "review_morning"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_morning",
+            "state": "succeeded",
+            "created_at": "2026-02-01T09:00:00+00:00",
+            "data": {"advice": {"summary": "Call the three largest buyers first."}, "http_status": 200},
+        },
+        {
+            "id": "review_afternoon",
+            "state": "failed",
+            "created_at": "2026-02-01T14:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 403},
+        },
+    ]
+
+
+# Rule: the export orders reviews by the whole created_at text. The application writes dates with
+# microseconds, so two reviews in the same second are ordered by their fractions; and a date's
+# length does not decide its place. The reviews are stored in an order that is neither: 09:00:00.75,
+# then 10:00:00 (shorter, with no fraction), then 09:00:00.25. An order by the date to the second
+# would keep the two 09:00:00 reviews in storage order; an order by length would put 10:00:00 first.
+def test_export_lists_ai_reviews_by_the_whole_date_text_to_the_fraction_of_a_second(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_three_quarters",
+        created_at="2026-02-01T09:00:00.750000+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_ten",
+        created_at="2026-02-01T10:00:00+00:00",
+        state="failed",
+        data={"error": "Provider rejected the request.", "http_status": 429},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_quarter",
+        created_at="2026-02-01T09:00:00.250000+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Delay the second location."}, "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_three_quarters", "review_ten", "review_quarter"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_quarter",
+            "state": "succeeded",
+            "created_at": "2026-02-01T09:00:00.250000+00:00",
+            "data": {"advice": {"summary": "Delay the second location."}, "http_status": 200},
+        },
+        {
+            "id": "review_three_quarters",
+            "state": "succeeded",
+            "created_at": "2026-02-01T09:00:00.750000+00:00",
+            "data": {"advice": {"summary": "Hire a part-time bookkeeper."}, "http_status": 200},
+        },
+        {
+            "id": "review_ten",
+            "state": "failed",
+            "created_at": "2026-02-01T10:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+    ]
+
+
+# Known limit, not wanted behaviour: the export orders reviews by created_at as text. The
+# application writes every date in UTC, where text order is time order; this pins what happens to
+# a row that carries another offset. The first review stored is 10:00 at +05:00 (05:00 UTC), the
+# second 09:00 at +00:00. As text the second sorts first; as instants the first is earlier; in
+# storage order the first comes first. The export lists them in text order.
+def test_known_limit_export_orders_ai_review_dates_with_other_offsets_as_text(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_plus_five",
+        created_at="2026-02-01T10:00:00+05:00",
+        state="succeeded",
+        data={"advice": {"summary": "Delay the second location."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_utc",
+        created_at="2026-02-01T09:00:00+00:00",
+        state="failed",
+        data={"error": "Provider did not complete a usable answer.", "http_status": 200},
+    )
+    assert ai_call_ids_in_insertion_order(store) == ["review_plus_five", "review_utc"]
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_utc",
+            "state": "failed",
+            "created_at": "2026-02-01T09:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        },
+        {
+            "id": "review_plus_five",
+            "state": "succeeded",
+            "created_at": "2026-02-01T10:00:00+05:00",
+            "data": {"advice": {"summary": "Delay the second location."}, "http_status": 200},
+        },
+    ]
+
+
+# Two reviews of one business that share some fields and not others. The two-business matrix above
+# gives each pair of businesses' reviews every way of sharing fields; inside one business the tests
+# above share one field at a time. Neither catches an export or an audit that takes a review's data
+# from the business's other review with the same state and date, or its state from the other review
+# with the same data and date. Each case is one way two reviews of one business can share fields;
+# where their dates differ, review_first is the earlier. Each expected entry is written out beside
+# the values stored.
+
+SAME_BUSINESS_SHARED_FIELD_CASES = [
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Rent a stall at the Saturday market."}, "http_status": 200},
+        },
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Rent a stall at the Saturday market."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 403},
+        },
+        {
+            "id": "review_second",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 403},
+        },
+        id="nothing-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Offer a discount for paying a year ahead."}, "http_status": 200},
+        },
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Offer a discount for paying a year ahead."}, "http_status": 200},
+        },
+        {
+            "state": "succeeded",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Stop selling the lowest-margin product."}, "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "succeeded",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Stop selling the lowest-margin product."}, "http_status": 200},
+        },
+        id="state-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Ask the landlord for a five-year lease."}, "http_status": 200},
+        },
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Ask the landlord for a five-year lease."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Ask the landlord for a five-year lease."}, "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Ask the landlord for a five-year lease."}, "http_status": 200},
+        },
+        id="data-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Train a second person to open the shop."}, "http_status": 200},
+        },
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Train a second person to open the shop."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider did not complete a usable answer.", "http_status": 200},
+        },
+        id="date-shared",
+    ),
+    pytest.param(
+        {
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+        {
+            "id": "review_first",
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+        {
+            "id": "review_second",
+            "state": "failed",
+            "created_at": "2026-03-01T00:00:00+00:00",
+            "data": {"error": "Provider rejected the request.", "http_status": 429},
+        },
+        id="state-and-data-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {
+                "advice": {"summary": "Move the deliveries to a fixed weekly round."},
+                "http_status": 200,
+            },
+        },
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {
+                "advice": {"summary": "Move the deliveries to a fixed weekly round."},
+                "http_status": 200,
+            },
+        },
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Insure the van before the busy season."}, "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Insure the van before the busy season."}, "http_status": 200},
+        },
+        id="state-and-date-shared",
+    ),
+    pytest.param(
+        {
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+        },
+        {
+            "id": "review_first",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+        },
+        {
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+        },
+        {
+            "id": "review_second",
+            "state": "failed",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+        },
+        id="data-and-date-shared",
+    ),
+]
+
+REVIEW_STORAGE_ORDERS = [
+    pytest.param(True, id="review-first-stored-first"),
+    pytest.param(False, id="review-second-stored-first"),
+]
+
+
+# Rule: each review of a business is compared with its own event and exported with its own state,
+# data and date, whichever of those it shares with the business's other review and whichever of the
+# two was stored first.
+@pytest.mark.parametrize("first_stored_first", REVIEW_STORAGE_ORDERS)
+@pytest.mark.parametrize(
+    ("first_stored", "first_entry", "second_stored", "second_entry"), SAME_BUSINESS_SHARED_FIELD_CASES
+)
+def test_each_ai_review_keeps_its_own_fields_when_another_review_of_its_business_shares_some(
+    setup, first_stored, first_entry, second_stored, second_entry, first_stored_first
+):
+    store, service, actor, bid, _ = setup
+    reviews = [
+        lambda: add_ai_review(store, actor, bid, run_id="review_first", **first_stored),
+        lambda: add_ai_review(store, actor, bid, run_id="review_second", **second_stored),
+    ]
+    for add in reviews if first_stored_first else reversed(reviews):
+        add()
+    assert ai_call_ids_in_insertion_order(store) == (
+        ["review_first", "review_second"] if first_stored_first else ["review_second", "review_first"]
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    if first_stored["created_at"] == second_stored["created_at"]:
+        # The two rows have the same created_at and the export orders by created_at only, so SQL
+        # does not fix which of them comes first. They are compared sorted by id.
+        assert sorted(runs, key=lambda run: run["id"]) == [first_entry, second_entry]
+    else:
+        # review_first was created earlier, so in created_at order it comes first.
+        assert runs == [first_entry, second_entry]
+
+
+# Rule: two reviews of one business keep their own data when they share a command key as well as a
+# state and a date. A command key is unique per principal, not per business, so the owner and an
+# agent of one business can each send the same one; the rows are given the same key by SQL.
+def test_ai_reviews_of_two_principals_with_one_command_key_each_keep_their_own_data(setup):
+    store, service, actor, bid, _ = setup
+    agent = store.authenticate(
+        service.add_principal(actor, {"name": "Review agent", "role": "agent", "business_ids": [bid]})[
+            "token"
+        ]
+    )
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        run_id="review_owner",
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Agree payment terms before the first order."}, "http_status": 200},
+    )
+    add_ai_review(
+        store,
+        agent,
+        bid,
+        run_id="review_agent",
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Ask two suppliers for a written quote."}, "http_status": 200},
+    )
+    with store.write() as con:
+        assert con.execute("UPDATE ai_calls SET command_key='shared-command-key'").rowcount == 2
+    with store.read() as con:
+        rows = [
+            tuple(r) for r in con.execute("SELECT id, principal_id, command_key FROM ai_calls ORDER BY rowid")
+        ]
+    assert rows == [
+        ("review_owner", actor["id"], "shared-command-key"),
+        ("review_agent", agent["id"], "shared-command-key"),
+    ]
+    assert actor["id"] != agent["id"]
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    # The two rows have the same created_at and the export orders by created_at only, so SQL does
+    # not fix which of them comes first. They are compared sorted by id.
+    assert sorted(runs, key=lambda run: run["id"]) == [
+        {
+            "id": "review_agent",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Ask two suppliers for a written quote."}, "http_status": 200},
+        },
+        {
+            "id": "review_owner",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {
+                "advice": {"summary": "Agree payment terms before the first order."},
+                "http_status": 200,
+            },
+        },
+    ]
+
+
+# Rule: the audit and the export read a review's data exactly as stored, whatever JSON values it
+# holds: nested objects, lists in their stored order, empty lists, objects and strings, null, true
+# and false, integers large and negative, fractional numbers, and strings with surrounding space or
+# non-ASCII text. The audit's digest and the exported data change if any of them is read in another
+# form.
+def test_ai_review_data_with_every_kind_of_json_value_is_checked_and_exported_exactly(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={
+            "advice": {
+                "recommendations": [
+                    {
+                        "action": "Raise the café lunch price",
+                        "evidence_ids": ["evidence_menu", "evidence_costs"],
+                        "reason": "Food costs rose by a fifth since spring.",
+                    },
+                    {"action": "Delay the second van", "evidence_ids": [], "reason": ""},
+                ],
+                "summary": "  Keep three months of costs in cash.  ",
+                "unknowns": [" Whether the lease renews in March. ", "Supplier terms for 2027"],
+            },
+            "http_status": 200,
+            "note": "Menu prices in € for the café, checked by Zoë.",
+            "response": {
+                "balance_change": -42,
+                "created_at": 1767225600,
+                "id": "resp_synthetic",
+                "incomplete_details": None,
+                "metadata": {},
+                "parallel_tool_calls": False,
+                "score_delta": -12.5,
+                "sequence": 9007199254740993,
+                "status": "completed",
+                "store": True,
+                "temperature": 0.75,
+                "top_p": 0.2,
+                "usage": {
+                    "cached_tokens": 0,
+                    "input_tokens": 1834,
+                    "output_tokens": 412,
+                    "total_tokens": 2246,
+                },
+            },
+            "shared_record_ids": ["record_zeta", "record_alpha", "record_mid"],
+        },
+    )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {
+                "advice": {
+                    "recommendations": [
+                        {
+                            "action": "Raise the café lunch price",
+                            "evidence_ids": ["evidence_menu", "evidence_costs"],
+                            "reason": "Food costs rose by a fifth since spring.",
+                        },
+                        {"action": "Delay the second van", "evidence_ids": [], "reason": ""},
+                    ],
+                    "summary": "  Keep three months of costs in cash.  ",
+                    "unknowns": [" Whether the lease renews in March. ", "Supplier terms for 2027"],
+                },
+                "http_status": 200,
+                "note": "Menu prices in € for the café, checked by Zoë.",
+                "response": {
+                    "balance_change": -42,
+                    "created_at": 1767225600,
+                    "id": "resp_synthetic",
+                    "incomplete_details": None,
+                    "metadata": {},
+                    "parallel_tool_calls": False,
+                    "score_delta": -12.5,
+                    "sequence": 9007199254740993,
+                    "status": "completed",
+                    "store": True,
+                    "temperature": 0.75,
+                    "top_p": 0.2,
+                    "usage": {
+                        "cached_tokens": 0,
+                        "input_tokens": 1834,
+                        "output_tokens": 412,
+                        "total_tokens": 2246,
+                    },
+                },
+                "shared_record_ids": ["record_zeta", "record_alpha", "record_mid"],
+            },
+        }
+    ]
+    # Python compares 200 equal to 200.0 and True equal to 1, so the exported data is also written
+    # out as JSON and compared as text: 200 against 200.0 and true against 1 differ there.
+    assert json.dumps(runs[0]["data"], sort_keys=True, ensure_ascii=False) == (
+        '{"advice": {"recommendations": [{"action": "Raise the café lunch price", '
+        '"evidence_ids": ["evidence_menu", "evidence_costs"], '
+        '"reason": "Food costs rose by a fifth since spring."}, '
+        '{"action": "Delay the second van", "evidence_ids": [], "reason": ""}], '
+        '"summary": "  Keep three months of costs in cash.  ", '
+        '"unknowns": [" Whether the lease renews in March. ", "Supplier terms for 2027"]}, '
+        '"http_status": 200, '
+        '"note": "Menu prices in € for the café, checked by Zoë.", '
+        '"response": {"balance_change": -42, "created_at": 1767225600, "id": "resp_synthetic", '
+        '"incomplete_details": null, "metadata": {}, "parallel_tool_calls": false, '
+        '"score_delta": -12.5, "sequence": 9007199254740993, "status": "completed", "store": true, '
+        '"temperature": 0.75, "top_p": 0.2, '
+        '"usage": {"cached_tokens": 0, "input_tokens": 1834, "output_tokens": 412, "total_tokens": 2246}}, '
+        '"shared_record_ids": ["record_zeta", "record_alpha", "record_mid"]}'
+    )
+
+
+# Documented limit: the audit compares a review's data as a value, not as text, and a stored text
+# that repeats a key is read with that key's last value, by the audit and the export alike. An
+# earlier copy of the key, written by SQL, is seen by neither.
+def test_documented_limit_ai_review_data_repeating_a_key_is_read_with_its_last_value(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+    )
+    repeated = (
+        '{"advice":{"summary":"Advice that was never returned.",'
+        '"summary":"Keep three months of costs in cash."},"http_status":200}'
+    )
+    with store.write() as con:
+        assert (
+            con.execute("UPDATE ai_calls SET data=? WHERE id='review_synthetic'", (repeated,)).rowcount == 1
+        )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == (
+            '{"advice":{"summary":"Advice that was never returned.",'
+            '"summary":"Keep three months of costs in cash."},"http_status":200}'
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == [
+        {
+            "id": "review_synthetic",
+            "state": "succeeded",
+            "created_at": "2026-02-01T00:00:00+00:00",
+            "data": {"advice": {"summary": "Keep three months of costs in cash."}, "http_status": 200},
+        }
+    ]
+
+
+# Rule: the audit and the export read every number in a review's data exactly as stored, with its
+# precision, sign and type. A fractional number keeps every digit, a whole-valued float such as 1.0
+# stays a float, -0.0 keeps its sign, a float stored with an exponent keeps its value, and an integer
+# beyond 2**53, beyond 2**64 or below -2**63 keeps every digit. Python compares 1.0 equal to 1 and
+# -0.0 equal to 0.0, so the exported data is written out as JSON and compared as text.
+def test_ai_review_numbers_are_checked_and_exported_with_their_precision_sign_and_type(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={
+            "advice": {
+                "estimates": {
+                    "markup_percent": 100.0,
+                    "smallest_price_step": 1e-07,
+                    "tray_area_per_radius_squared": 3.141592653589793,
+                    "unit_cost": 2.5,
+                    "upper_bound": 1.5e300,
+                    "weekly_change": -3.75,
+                },
+                "summary": "Price the catering order from the costed menu.",
+            },
+            "http_status": 200,
+            "response": {
+                "frequency_penalty": 0.1,
+                "id": "resp_synthetic_numbers",
+                "max_tool_calls": -1,
+                "presence_penalty": -0.0,
+                "seed": -9223372036854775809,
+                "sequence": 9007199254740993,
+                "status": "completed",
+                "temperature": 1.0,
+                "top_p": 0.123456789,
+                "usage": {"cached_tokens": 0, "lifetime_tokens": 100000000000000000000},
+            },
+        },
+    )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == (
+            '{"advice":{"estimates":{"markup_percent":100.0,"smallest_price_step":1e-07,'
+            '"tray_area_per_radius_squared":3.141592653589793,"unit_cost":2.5,"upper_bound":1.5e+300,'
+            '"weekly_change":-3.75},"summary":"Price the catering order from the costed menu."},'
+            '"http_status":200,'
+            '"response":{"frequency_penalty":0.1,"id":"resp_synthetic_numbers","max_tool_calls":-1,'
+            '"presence_penalty":-0.0,"seed":-9223372036854775809,"sequence":9007199254740993,'
+            '"status":"completed","temperature":1.0,"top_p":0.123456789,'
+            '"usage":{"cached_tokens":0,"lifetime_tokens":100000000000000000000}}}'
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert [(run["id"], run["state"], run["created_at"]) for run in runs] == [
+        ("review_synthetic", "succeeded", "2026-02-01T00:00:00+00:00")
+    ]
+    assert json.dumps(runs[0]["data"], sort_keys=True) == (
+        '{"advice": {"estimates": {"markup_percent": 100.0, "smallest_price_step": 1e-07, '
+        '"tray_area_per_radius_squared": 3.141592653589793, "unit_cost": 2.5, "upper_bound": 1.5e+300, '
+        '"weekly_change": -3.75}, "summary": "Price the catering order from the costed menu."}, '
+        '"http_status": 200, '
+        '"response": {"frequency_penalty": 0.1, "id": "resp_synthetic_numbers", "max_tool_calls": -1, '
+        '"presence_penalty": -0.0, "seed": -9223372036854775809, "sequence": 9007199254740993, '
+        '"status": "completed", "temperature": 1.0, "top_p": 0.123456789, '
+        '"usage": {"cached_tokens": 0, "lifetime_tokens": 100000000000000000000}}}'
+    )
+
+
+# Rule, at the edges of precision: a float that needs all 17 significant digits, a subnormal float
+# and an integer beyond 2**64 that a float cannot hold are read exactly too. The test above holds
+# none of them: its floats need at most 16 digits and are at most 17 characters long, its smallest
+# float is normal, and 10**20 is exact as a float.
+def test_ai_review_numbers_at_the_edges_of_precision_are_checked_and_exported_exactly(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(
+        store,
+        actor,
+        bid,
+        created_at="2026-02-01T00:00:00+00:00",
+        state="succeeded",
+        data={
+            "advice": {"summary": "Price the catering order from the costed menu."},
+            "response": {
+                "id": "resp_synthetic_precision",
+                "smallest_logprob": 5e-324,
+                "top_p": 0.30000000000000004,
+                "usage": {"lifetime_tokens": 123456789012345678901},
+            },
+        },
+    )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == (
+            '{"advice":{"summary":"Price the catering order from the costed menu."},'
+            '"response":{"id":"resp_synthetic_precision","smallest_logprob":5e-324,'
+            '"top_p":0.30000000000000004,"usage":{"lifetime_tokens":123456789012345678901}}}'
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert [(run["id"], run["state"], run["created_at"]) for run in runs] == [
+        ("review_synthetic", "succeeded", "2026-02-01T00:00:00+00:00")
+    ]
+    assert json.dumps(runs[0]["data"], sort_keys=True) == (
+        '{"advice": {"summary": "Price the catering order from the costed menu."}, '
+        '"response": {"id": "resp_synthetic_precision", "smallest_logprob": 5e-324, '
+        '"top_p": 0.30000000000000004, "usage": {"lifetime_tokens": 123456789012345678901}}}'
+    )
+
+
+# Whole review data that is empty or false: null, false, 0, the empty string, the empty list and the
+# empty object. Each case gives the text stored, the value the export carries and that value written
+# as JSON. Python compares False equal to 0, so the exported data is also compared as JSON text.
+EMPTY_OR_FALSE_AI_DATA = [
+    pytest.param("null", None, "null", id="null"),
+    pytest.param("false", False, "false", id="false"),
+    pytest.param("0", 0, "0", id="zero"),
+    pytest.param('""', "", '""', id="empty-string"),
+    pytest.param("[]", [], "[]", id="empty-list"),
+    pytest.param("{}", {}, "{}", id="empty-object"),
+]
+
+
+# Rule: a review whose whole data is changed by SQL to a value that is empty or false is reported,
+# and the export carries that value exactly as stored. Neither the audit nor the export reads it as
+# an empty object, null, an empty list or a string.
+@pytest.mark.parametrize(("stored", "value", "as_json"), EMPTY_OR_FALSE_AI_DATA)
+def test_ai_review_data_changed_to_an_empty_or_false_value_is_reported_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    with store.write() as con:
+        assert con.execute("UPDATE ai_calls SET data=? WHERE id='review_synthetic'", (stored,)).rowcount == 1
+    plain = audited(service, actor, bid)
+    assert plain["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert plain["valid"] is False
+    archive = exported_archive(service, actor, bid)
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+    runs = archive["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is false, 0, the empty string, the empty list or the empty object,
+# with a matching event, is clean, and the export carries that value exactly as stored.
+@pytest.mark.parametrize(
+    ("stored", "value", "as_json"), [p for p in EMPTY_OR_FALSE_AI_DATA if p.id != "null"]
+)
+def test_ai_review_data_that_is_empty_or_false_with_matching_history_is_clean_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, data=value)
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == stored
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is null, with a matching event, is clean, and the export carries
+# null. The application never writes null data; this case pins that the audit compares the data it
+# reads exactly, and does not read null as an empty object. add_ai_review reads data=None as "use
+# the default", so the row and its event are written here the same way that helper writes them.
+def test_ai_review_data_that_is_null_with_matching_history_is_clean_and_exported_as_null(setup):
+    store, service, actor, bid, _ = setup
+    with store.write() as con:
+        con.execute(
+            "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
+            ("review_synthetic", bid, actor["id"], key(), "0" * 64, canonical(None), "unknown", APPENDED_AT),
+        )
+        store.event(
+            con,
+            bid,
+            actor,
+            "ai.unknown",
+            "review_synthetic",
+            {"run_id": "review_synthetic", "state": "unknown", "data_sha256": digest(canonical(None))},
+        )
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == "null"
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": None,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == "null"
+
+
+# Known limit, not wanted behaviour: the export orders reviews by created_at as binary text. The
+# application writes every date in one form, so pairs like these only arise from rows written by
+# SQL; this pins what the export does with them. Each case stores review_stored_first, then
+# review_stored_second, and gives the list the export carries. In binary text order T sorts before
+# t, a date sorts before the same date with a trailing space, a trailing tab sorts before a trailing
+# space, a leading space sorts before any digit, and a space sorts before T. The export does not
+# order the dates ignoring case, ignoring surrounding space, or reading T as a space. Ignoring
+# trailing space, the trailing-space pair ties, so an order that broke ties newest first would list
+# it as binary order does; the tab pair does not tie, and that order lists the space first there.
+BINARY_TEXT_DATE_ORDER_CASES = [
+    pytest.param(
+        "2026-02-01t00:00:00+00:00",
+        "2026-02-01T23:00:00+00:00",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T23:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01t00:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="capital-t-before-small-t",
+    ),
+    pytest.param(
+        "2026-02-01T09:00:00+00:00 ",
+        "2026-02-01T09:00:00+00:00",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00 ",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="date-before-the-same-date-with-a-trailing-space",
+    ),
+    pytest.param(
+        "2026-02-01T09:00:00+00:00 ",
+        "2026-02-01T09:00:00+00:00\t",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00\t",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00 ",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="trailing-tab-before-trailing-space",
+    ),
+    pytest.param(
+        " 2026-03-01T00:00:00+00:00",
+        "2026-02-01T00:00:00+00:00",
+        [
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": " 2026-03-01T00:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01T00:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="leading-space-before-an-earlier-date",
+    ),
+    pytest.param(
+        "2026-02-01T09:00:00+00:00",
+        "2026-02-01 23:00:00+00:00",
+        [
+            {
+                "id": "review_stored_second",
+                "state": "unknown",
+                "created_at": "2026-02-01 23:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+            {
+                "id": "review_stored_first",
+                "state": "unknown",
+                "created_at": "2026-02-01T09:00:00+00:00",
+                "data": {"note": "Synthetic run written for this test."},
+            },
+        ],
+        id="space-before-t",
+    ),
+]
+
+
+@pytest.mark.parametrize(("first_date", "second_date", "expected"), BINARY_TEXT_DATE_ORDER_CASES)
+def test_known_limit_export_orders_ai_review_dates_as_binary_text(setup, first_date, second_date, expected):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, run_id="review_stored_first", created_at=first_date)
+    add_ai_review(store, actor, bid, run_id="review_stored_second", created_at=second_date)
+    assert ai_call_ids_in_insertion_order(store) == ["review_stored_first", "review_stored_second"]
+    # The audit does not check created_at.
+    assert_audit_and_export(service, actor, bid, [])
+    assert exported_archive(service, actor, bid)["ai_runs"] == expected
+
+
+# Whole review data of every other kind: a string with surrounding space and non-ASCII text, true, a
+# fraction, a whole number written as a float, a negative integer, a list with a repeated item and a
+# nested list, and a list of objects. Each case gives the text stored, the value the export carries
+# and that value written as JSON. Python compares True equal to 1 and 1.0 equal to 1, so the exported
+# data is also compared as JSON text.
+WHOLE_AI_DATA_OF_OTHER_KINDS = [
+    pytest.param(
+        '"  Synthetic advice for Zoë\'s café.  "',
+        "  Synthetic advice for Zoë's café.  ",
+        '"  Synthetic advice for Zo\\u00eb\'s caf\\u00e9.  "',
+        id="string",
+    ),
+    pytest.param("true", True, "true", id="true"),
+    pytest.param("1.5", 1.5, "1.5", id="fraction"),
+    pytest.param("1.0", 1.0, "1.0", id="whole-float"),
+    pytest.param("-7", -7, "-7", id="negative-integer"),
+    pytest.param(
+        '["zulu","alpha","zulu",["b","a"]]',
+        ["zulu", "alpha", "zulu", ["b", "a"]],
+        '["zulu", "alpha", "zulu", ["b", "a"]]',
+        id="list",
+    ),
+    pytest.param('[{"b":1},{"a":2}]', [{"b": 1}, {"a": 2}], '[{"b": 1}, {"a": 2}]', id="list-of-objects"),
+]
+
+
+# Rule: a review whose whole data is a string, true, a number or a non-empty list, with a matching
+# event, is clean, and the export carries that value exactly as stored. Neither the audit nor the
+# export strips, cuts or changes the case of a string, reads true as 1, changes a number's type or
+# rounds it, or sorts, reverses, cuts, de-duplicates or flattens a list.
+@pytest.mark.parametrize(("stored", "value", "as_json"), WHOLE_AI_DATA_OF_OTHER_KINDS)
+def test_ai_review_data_of_any_other_kind_with_matching_history_is_clean_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, data=value)
+    with store.read() as con:
+        assert con.execute("SELECT data FROM ai_calls WHERE id='review_synthetic'").fetchone()[0] == stored
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is changed by SQL from ordinary data to a string, true, a number or
+# a non-empty list is reported, and the export carries that value exactly as stored.
+@pytest.mark.parametrize(("stored", "value", "as_json"), WHOLE_AI_DATA_OF_OTHER_KINDS)
+def test_ai_review_data_changed_to_a_value_of_any_other_kind_is_reported_and_exported_as_stored(
+    setup, stored, value, as_json
+):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    with store.write() as con:
+        assert con.execute("UPDATE ai_calls SET data=? WHERE id='review_synthetic'", (stored,)).rowcount == 1
+    plain = audited(service, actor, bid)
+    assert plain["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert plain["valid"] is False
+    archive = exported_archive(service, actor, bid)
+    assert archive["integrity"]["record_errors"] == ["AI review differs from history: review_synthetic"]
+    assert archive["integrity"]["valid"] is False
+    runs = archive["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": value,
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == as_json
+
+
+# Rule: a review whose whole data is a list, rewritten by SQL only in form (other spacing), is clean:
+# the audit compares the value the text holds, not the text. The export carries that value.
+def test_ai_review_data_that_is_a_list_rewritten_only_in_form_is_clean_and_exported_as_its_value(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid, data=["zulu", "alpha", "zulu", ["b", "a"]])
+    with store.write() as con:
+        assert (
+            con.execute(
+                "UPDATE ai_calls SET data=? WHERE id='review_synthetic'",
+                ('[ "zulu" ,"alpha",\n"zulu",[ "b","a" ] ]',),
+            ).rowcount
+            == 1
+        )
+    assert_audit_and_export(service, actor, bid, [])
+    runs = exported_archive(service, actor, bid)["ai_runs"]
+    assert runs == [
+        {
+            "id": "review_synthetic",
+            "state": "unknown",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "data": ["zulu", "alpha", "zulu", ["b", "a"]],
+        }
+    ]
+    assert json.dumps(runs[0]["data"]) == '["zulu", "alpha", "zulu", ["b", "a"]]'
+
+
+def test_export_digest_covers_the_archive_with_its_ai_review(setup):
+    store, service, actor, bid, _ = setup
+    add_ai_review(store, actor, bid)
+    archive = exported_archive(service, actor, bid)
+    assert archive["ai_runs"] == [SYNTHETIC_RUN_ENTRY]
+    body = {name: value for name, value in archive.items() if name != "sha256"}
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    assert archive["sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # Gaps named in review: literals that run back as SQL, number and key spellings, REAL and NaN versions.
@@ -1716,22 +4249,32 @@ def test_null_id_of_a_current_record_is_reported(setup):
     assert export_integrity(setup)["record_errors"] == expected
 
 
-def add_ai_review(store, actor, bid, chained=True):
-    run_id = "review_synthetic"
-    data = {"note": "Synthetic run written for this test."}
+def add_ai_review(
+    store,
+    actor,
+    bid,
+    chained=True,
+    run_id="review_synthetic",
+    created_at=APPENDED_AT,
+    data=None,
+    state="unknown",
+):
+    """Store an AI review row and, when chained, the event a review ending in that state leaves."""
+    if data is None:
+        data = {"note": "Synthetic run written for this test."}
     with store.write() as con:
         con.execute(
             "INSERT INTO ai_calls VALUES(?,?,?,?,?,?,?,?)",
-            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), "unknown", APPENDED_AT),
+            (run_id, bid, actor["id"], key(), "0" * 64, canonical(data), state, created_at),
         )
         if chained:
             store.event(
                 con,
                 bid,
                 actor,
-                "ai.unknown",
+                "ai." + state,
                 run_id,
-                {"run_id": run_id, "state": "unknown", "data_sha256": digest(canonical(data))},
+                {"run_id": run_id, "state": state, "data_sha256": digest(canonical(data))},
             )
     return run_id
 
