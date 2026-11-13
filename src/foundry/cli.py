@@ -240,10 +240,10 @@ def start_foundry(
     # Ctrl+C does: the same message and the same exit status. uvicorn catches SIGTERM while it
     # serves, shuts down, then raises it again, which reaches this handler.
     sigterm = None
-    if threading.current_thread() is threading.main_thread():
-        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
-            sigterm = signal.signal(signal.SIGTERM, _stop_as_ctrl_c)
     try:
+        if threading.current_thread() is threading.main_thread():
+            if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+                sigterm = signal.signal(signal.SIGTERM, _stop_as_ctrl_c)
         with _HoldStops() as held:
             store = Store(db_path)
             created = store.bootstrap("Local owner", token_path)
