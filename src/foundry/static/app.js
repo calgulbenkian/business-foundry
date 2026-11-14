@@ -78,6 +78,10 @@ const state = {
   // the load whose records are on screen
   loaded: 0,
   snapshot: null,
+  // the guide the server worked out from the same read as the snapshot, for the person signed in
+  guide: null,
+  // the popover of line help that is open, by its id
+  help: null,
   runs: [],
   principals: null,
   audit: null,
@@ -323,8 +327,10 @@ function choices(t) {
     .filter((s) => canReview() || !['approved', 'verified', 'not_applicable'].includes(s))
     .filter((s) => state.actor?.role !== 'agent' || s !== 'submitted');
 }
+/* The move each state leads to, offered as the main button. A step nobody has started is started
+   first; preparing comes after. */
 const FORWARD = {
-  pending: 'prepared',
+  pending: 'in_progress',
   in_progress: 'prepared',
   needs_review: 'prepared',
   prepared: 'approved',
@@ -424,7 +430,7 @@ function nextText(s) {
   if (t.state === 'pending')
     return t.blockers?.length
       ? `waiting on ${plural(t.blockers.length, 'prerequisite')}`
-      : 'ready to prepare';
+      : 'ready to start';
   if (t.state === 'in_progress') return 'being prepared';
   if (t.state === 'verified')
     return t.data.external ? 'submitted and verified' : 'all stages recorded';
@@ -476,6 +482,8 @@ const taskGlyph = (t) => (t.state === 'superseded' ? dash : g(stateOf(t).g));
 const bul = (l, sm) =>
   `<span class="bul${sm ? ' sm' : ''} lc-${l.k}" aria-hidden="true">${h(l.code)}</span>`;
 const ICON = {
+  start:
+    '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M3 12.6V1.6"/><path d="M3 2.2h7.6l-1.7 2.6 1.7 2.6H3"/></svg>',
   journey:
     '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M1 3h4l3 3h2M1 11h4l3-3h2M1 7h9"/><rect x="10.2" y="4.2" width="2.8" height="5.6" rx="1.4" stroke-width="1.3"/></svg>',
   today:
@@ -995,6 +1003,7 @@ const fitter = typeof ResizeObserver === 'function' ? new ResizeObserver(() => f
 function sourceList() {
   if (!state.snapshot) return [{ id: 'today', name: 'Today', kind: 'top' }];
   return [
+    ...(state.guide ? [{ id: 'start', name: 'Start here', kind: 'top' }] : []),
     { id: 'journey', name: 'Journey', kind: 'top' },
     { id: 'today', name: 'Today', kind: 'top' },
     ...M.lines.map((l) => ({ id: l.id, name: l.name, kind: 'line', line: l })),
@@ -1024,6 +1033,133 @@ const RECORD_KINDS = [
 ];
 const waitingOnYou = () => M.steps.filter((s) => yourMove(s.task));
 
+/* ---------------- the guide: where to start, and the lines explained ---------------- */
+/* Every sentence here is the server's. It works the guide out from the same read as the records on
+   screen: the path for the business's entry path, what each line is, why each step waits, what
+   unlocks it and the one next action for the person signed in. The page finds a line, step or
+   stop in it and shows its words; it decides nothing itself. */
+const guideLine = (l) =>
+  state.guide?.lines.find(
+    (x) => x.category === l.category && (x.deal_id || null) === (l.dealId || null),
+  ) || null;
+const guideStep = (id) => state.guide?.steps.find((x) => x.id === id) || null;
+const guideStop = (n) => state.guide?.path.stops.find((x) => String(x.n) === String(n)) || null;
+const lineOf = (x) =>
+  M.lines.find((l) => l.category === x.category && (l.dealId || null) === (x.deal_id || null)) ||
+  null;
+/* A row of the lines explained is keyed by the line on screen, or "later" for the line that has
+   no steps yet. */
+const lxKey = (x) => lineOf(x)?.id || 'later';
+function lxFind(id) {
+  if (!state.guide) return null;
+  if (id === 'later') return state.guide.lines.find((x) => x.status === 'later') || null;
+  const l = M.lines.find((x) => x.id === id);
+  return l ? guideLine(l) : null;
+}
+const lineAbout = (x) => [x.about, x.on_acquisition].filter(Boolean).join(' ');
+/* Where a line stands on this business, in one sentence. */
+function lineNow(x) {
+  if (x.status === 'later') return '';
+  if (x.status === 'done') return 'Every step on this line is verified or ruled out.';
+  if (x.next) return `Your next action: ${x.next.label}.`;
+  const f = x.focus;
+  if (!f) return '';
+  return f.why.length ? `${f.title}. ${f.why[0]}` : `${f.title} is ready to start.`;
+}
+/* The ? beside a line's name: a button that shows and hides what the line is. It is a native
+   button, so a tap, a click, Enter and Space all work; it says whether it is open, and the text it
+   opens follows it, so a screen reader reaches it next. Escape closes it again. */
+function lineHelp(l, where) {
+  const x = guideLine(l);
+  if (!x) return null;
+  const id = `help-${where}-${l.id}`;
+  const open = state.help === id;
+  const now = lineNow(x);
+  return {
+    button: `<button type="button" class="qm" data-action="help" data-id="${id}" aria-expanded="${open}" aria-controls="${id}" aria-label="What the ${h(l.name)} line is"><span aria-hidden="true">?</span></button>`,
+    panel: `<div class="pop" id="${id}" role="note"${open ? '' : ' hidden'}><p><b>${h(l.name)}.</b> ${h(lineAbout(x))}</p>${now ? `<p>${h(now)}</p>` : ''}</div>`,
+  };
+}
+function closeHelp() {
+  const id = state.help;
+  if (!id) return null;
+  state.help = null;
+  const panel = document.getElementById(id);
+  if (panel) panel.hidden = true;
+  const button = document.querySelector(`[data-action="help"][data-id="${CSS.escape(id)}"]`);
+  button?.setAttribute('aria-expanded', 'false');
+  return button;
+}
+function toggleHelp(el) {
+  const id = el.dataset.id;
+  const opening = state.help !== id;
+  closeHelp();
+  if (!opening) return;
+  const panel = document.getElementById(id);
+  if (!panel) return;
+  state.help = id;
+  panel.hidden = false;
+  el.setAttribute('aria-expanded', 'true');
+}
+/* The control for a next action the server named. It opens the same form or record the rest of
+   the page does; the server offers only what this person may do, and checks it again. */
+function nextButton(a, primary = true) {
+  if (!a) return '';
+  return btn(
+    a.label,
+    `data-action="do-next" data-do="${h(a.do)}" data-id="${h(a.task_id || a.evidence_id || a.deal_id || '')}" data-to="${h(a.to || '')}" data-kind="${h(a.record_kind || a.source || '')}"`,
+    primary,
+  );
+}
+function doNext(el) {
+  const { id, to, kind } = el.dataset;
+  const what = el.dataset.do;
+  if (what === 'add_evidence') newEvidence();
+  else if (what === 'review_evidence') reviewEvidence(id);
+  else if (what === 'add_record') recordDialog(null, kind);
+  else if (what === 'forecast') forecastDialog();
+  else if (what === 'deal') dealDialog(id || undefined);
+  else if (what === 'open_source') {
+    setSource(kind);
+    setLevel('list');
+  } else if (what === 'open_step' || what === 'transition') {
+    const s = M.byId.get(id);
+    if (!s) return;
+    go(`${s.line.id}|step:${id}`);
+    if (what === 'transition' && !state.accepted[id]) {
+      state.open = { kind: 'tx', id, to, key: crypto.randomUUID() };
+      renderInspector();
+      $('#tx-form textarea')?.focus();
+    }
+  }
+}
+const nextBox = (heading, a, text = '') =>
+  `<div class="next-box"><div class="card-h">${ymIcon}<span>${h(heading)}</span></div>${text ? `<p>${h(text)}</p>` : ''}${a ? `<div class="i-actions">${nextButton(a)}</div>` : ''}</div>`;
+/* A decision stop whose step was ruled out is done, and says so with the step state's own label and
+   glyph, so it reads apart from one that was approved. */
+const stopState = (st) =>
+  st.done
+    ? st.ruled_out
+      ? `Done · ${STATES.not_applicable.label}`
+      : 'Done'
+    : st.n === state.guide.path.next_stop
+      ? st.action
+        ? 'Your next step'
+        : 'Waiting'
+      : 'Not done yet';
+const stopGlyph = (st) =>
+  st.done
+    ? st.ruled_out
+      ? g(STATES.not_applicable.g)
+      : tick
+    : st.n === state.guide.path.next_stop
+      ? ymIcon
+      : g('none');
+const plainList = (items) =>
+  items.length > 1
+    ? `<ul class="plain">${items.map((i) => `<li>${h(i)}</li>`).join('')}</ul>`
+    : h(items[0] || '');
+
 function renderSources() {
   const nav = $('#src-nav');
   let out = '';
@@ -1047,6 +1183,11 @@ function renderSources() {
       title = `${plural(c.total, 'step')}: ${c.verified} verified${c.review ? ', some need review' : ''}`;
     } else {
       lead = `<span class="ico">${ICON[s.id] || ''}</span>`;
+      if (s.id === 'start') {
+        const p = state.guide.path;
+        n = `${p.done} of ${p.total}`;
+        title = `Your first path: ${p.done} of ${plural(p.total, 'stop')} done`;
+      }
       if (s.id === 'journey') {
         n = `${M.toGo} to go`;
         title = `${M.toGo} of ${plural(M.steps.length, 'stop')} still to go`;
@@ -1083,7 +1224,10 @@ function renderSources() {
           inv.length;
       }
     }
-    out += `<button type="button" class="src" data-src="${h(s.id)}" aria-current="${s.id === state.source}"${title ? ` title="${h(title)}"` : ''}>${lead}<span class="lbl">${h(s.name)}</span><span class="n">${n}</span></button>`;
+    const button = `<button type="button" class="src" data-src="${h(s.id)}" aria-current="${s.id === state.source}"${title ? ` title="${h(title)}"` : ''}>${lead}<span class="lbl">${h(s.name)}</span><span class="n">${n}</span></button>`;
+    // a line's name has a ? beside it, a button of its own, that opens what the line is
+    const help = s.kind === 'line' ? lineHelp(s.line, 'src') : null;
+    out += help ? `<div class="src-row">${button}${help.button}</div>${help.panel}` : button;
   }
   nav.innerHTML = out;
   $('#src-foot').innerHTML = keyHTML() + accountHTML();
@@ -1110,8 +1254,18 @@ function accountHTML() {
 /* Each row is a native button inside its own list item, so it is announced as something that can
    be activated, and its list still reports its length and position. groupRows() puts each run of
    rows into a list of its own; headings, notes and empty states stay outside the lists. */
-function row({ key, glyph, num = '', title, right = '', sub = '', fig = false, line = null }) {
-  return `<li class="ri"><button type="button" class="row${sub ? ' two' : ''}${num ? '' : ' nonum'}${line ? ' ln lc-' + line.k : ''}"${line ? ` data-line="${line.k}"` : ''} data-key="${h(key)}" aria-current="${key === state.selected}">
+function row({
+  key,
+  glyph,
+  num = '',
+  title,
+  right = '',
+  sub = '',
+  fig = false,
+  line = null,
+  cls = '',
+}) {
+  return `<li class="ri"><button type="button" class="row${sub ? ' two' : ''}${num ? '' : ' nonum'}${line ? ' ln lc-' + line.k : ''}${cls ? ' ' + cls : ''}"${line ? ` data-line="${line.k}"` : ''} data-key="${h(key)}" aria-current="${key === state.selected}">
     <span class="r-g">${glyph}</span>
     <span class="r-main"><span class="r-l1"><span class="r-num">${h(num)}</span><span class="r-t">${title}</span><span class="r-right${fig ? ' fig' : ''}">${right}</span></span>${sub ? `<span class="r-sub">${sub}</span>` : ''}</span>
   </button></li>`;
@@ -1143,6 +1297,13 @@ const grp = (name, n, note) =>
   `<h2 class="grp"><span>${name}</span>${n !== undefined && n !== '' ? `<span class="grp-n">${n}</span>` : ''}</h2>${note ? `<div class="grp-note">${note}</div>` : ''}`;
 const grpLine = (l, text, n) =>
   `<h2 class="grp ln lc-${l.k}${l.steps.length ? '' : ' bare'}" data-line="${l.k}">${bul(l, true)}<span>${h(text)}</span><span class="grp-n">${h(n)}</span></h2>`;
+/* What a line is, and where it stands here, under its heading. */
+function lineNote(l) {
+  const x = guideLine(l);
+  if (!x) return '';
+  const now = lineNow(x);
+  return `<div class="grp-note lx-note"><span>${h(lineAbout(x))}</span>${now ? ` <span class="lx-now">${h(now)}</span>` : ''}</div>`;
+}
 function evInfo(o) {
   if (o.state === 'rejected')
     return { glyph: g('review'), label: 'Withdrawn', amber: true, short: 'Withdrawn' };
@@ -1192,9 +1353,12 @@ function renderList() {
     const review = M.steps.filter((s) => s.task.state === 'needs_review');
     const decide = mine.filter((s) => s.task.state !== 'needs_review');
     const away = M.steps.filter((s) => s.task.state === 'submitted');
-    const ready = M.steps.filter(
-      (s) => s.task.state === 'pending' && !(s.task.blockers || []).length,
-    );
+    // in the order the server gives: the entry path's own line first, as Start here has it
+    const order = state.guide?.ready || [];
+    const rank = (s) => (order.includes(s.id) ? order.indexOf(s.id) : order.length);
+    const ready = M.steps
+      .filter((s) => s.task.state === 'pending' && !(s.task.blockers || []).length)
+      .sort((a, b) => rank(a) - rank(b));
     right = mine.length ? `${mine.length} need you` : '';
     const counts = [
       `<span><b>${M.verified}</b> verified</span>`,
@@ -1210,6 +1374,27 @@ function renderList() {
       <button type="button" class="mini" id="mini" aria-label="Open the journey map: ${h(toGoText())}, ${M.verified} of ${M.steps.length} verified">${mapMini()}</button>
       <div class="th-counts">${counts.join('')}<span class="inline-g">${ymIcon} your move</span></div>
     </div>`;
+    // the one next action, the same as Start here gives
+    const nx = state.guide?.next;
+    if (nx?.action) {
+      const st = nx.stop ? guideStop(nx.stop) : null,
+        sx = nx.task_id ? M.byId.get(nx.task_id) : null;
+      out += grp('Do this next');
+      out += row({
+        key: st ? `next:stop:${st.n}` : `next:step:${nx.task_id}`,
+        glyph: ymIcon,
+        title: h(nx.label),
+        sub: h(
+          st
+            ? `Start here · stop ${st.n} of ${state.guide.path.total} · ${st.title}`
+            : sx
+              ? `${sx.line.name} line · ${sx.n} ${sx.task.title}`
+              : '',
+        ),
+        cls: 'wrap',
+      });
+    } else if (nx && state.guide.path && !state.guide.path.complete)
+      out += grp('Do this next', '', h([nx.label + '.', nx.why].filter(Boolean).join(' ')));
     if (review.length) {
       out += grp(
         'Needs review',
@@ -1233,7 +1418,19 @@ function renderList() {
         );
     }
     if (ready.length) {
-      out += grp('Ready to start', ready.length, 'Every prerequisite for these is complete.');
+      // said only when it is true: a step with no prerequisite has none to complete
+      const linked = ready.filter((s) =>
+        (s.task.data.depends_on || []).some((d) => find(d) && !replaced(find(d))),
+      ).length;
+      out += grp(
+        'Ready to start',
+        ready.length,
+        !linked
+          ? ''
+          : linked === ready.length
+            ? 'Every prerequisite for these is complete.'
+            : `The prerequisites of ${linked} of these are complete; ${ready.length - linked === 1 ? 'the other has' : 'the others have'} none.`,
+      );
       for (const s of ready) out += stepRow(s, s.task.data.description || '', 'step', true);
     }
     out += moneyRows(true);
@@ -1244,6 +1441,50 @@ function renderList() {
     }
     if (!review.length && !decide.length && !away.length && !ready.length)
       out += `<p class="empty">Nothing is waiting on a decision. Steps that are not started still wait on their prerequisites; they are listed on each line.</p>`;
+  } else if (src.id === 'start') {
+    const gd = state.guide,
+      p = gd.path;
+    right = `${p.done} of ${p.total} done`;
+    // Start here opens on the stop to do next
+    if (!state.selected && p.next_stop) state.selected = 'stop:' + p.next_stop;
+    out += `<div class="start-head">
+      <div class="th-date">${p.complete ? 'Your first path is done' : 'Your first path'}</div>
+      <div class="th-sub">${h(businessName())} · ${h(p.name.toLowerCase())} · ${p.done} of ${plural(p.total, 'stop')} done</div>
+    </div>`;
+    out += grp(
+      h(p.name),
+      `${p.done} of ${p.total}`,
+      'Each stop is tied to real steps and records, so it ticks itself off.',
+    );
+    for (const st of p.stops)
+      out += row({
+        key: 'stop:' + st.n,
+        glyph: stopGlyph(st),
+        num: String(st.n),
+        title: h(st.title),
+        right: h(stopState(st)),
+        sub: h(st.detail),
+        cls: 'wrap',
+      });
+    out += grp(
+      'The lines, explained',
+      plural(gd.lines.length, 'line'),
+      h(
+        gd.order_note ||
+          'Every line ends at Open for business. Choose one to see why it waits and what unlocks it.',
+      ),
+    );
+    for (const x of gd.lines) {
+      const l = lineOf(x);
+      out += row({
+        key: 'lx:' + lxKey(x),
+        glyph: l ? bul(l, true) : dash,
+        title: h(l ? l.name : x.name),
+        right: h(x.steps ? `${x.verified}/${x.steps} verified` : 'No steps yet'),
+        sub: h(lineAbout(x)),
+        cls: 'wrap lx',
+      });
+    }
   } else if (src.id === 'journey') {
     right = toGoText();
     out += row({
@@ -1257,6 +1498,7 @@ function renderList() {
     for (const l of M.lines) {
       const c = lineStats(l);
       out += grpLine(l, l.name, `${c.verified} of ${c.total} verified`);
+      out += lineNote(l);
       for (const s of l.steps) out += stepRow(s, undefined, 'jr');
     }
   } else if (src.kind === 'line') {
@@ -1265,6 +1507,7 @@ function renderList() {
     right = `${c.verified} of ${c.total} verified`;
     out += grpLine(l, `${l.name} line`, plural(c.total, 'step'));
     if (l.deal) out += `<div class="grp-note">Diligence for ${h(l.deal.title)}</div>`;
+    out += lineNote(l);
     for (const s of l.steps) out += stepRow(s);
   } else if (src.id === 'evidence') {
     const ev = objs('evidence');
@@ -1652,7 +1895,10 @@ function ensureSelection() {
 /* A selection reached by a link (say, from Today to a step) is kept even if this list does not
    show it, as long as the record still exists. */
 function selectionExists(key) {
-  const [kind, id] = splitKey(key);
+  let [kind, id] = splitKey(key);
+  if (kind === 'next') [kind, id] = splitKey(id);
+  if (kind === 'stop') return Boolean(guideStop(id));
+  if (kind === 'lx') return Boolean(lxFind(id));
   if (['step', 'jr'].includes(kind))
     return M.byId.has(id) || (kind === 'step' && replaced(find(id)));
   if (['ev', 'rec', 'plan', 'deal', 'doc', 'inv', 'pay'].includes(kind)) return Boolean(find(id));
@@ -1675,8 +1921,17 @@ const props = (rows) =>
     .join('')}</dl>`;
 const sec = (title, body, note = '') =>
   `<section class="i-sec"><h3>${title}${note}</h3>${body}</section>`;
-const head = ({ kicker, title, glyph = '', stateLabel, next, actions = '', extra = '' }) =>
-  `<div class="i-kicker">${kicker}</div><h2 class="i-title" id="insp-title" tabindex="-1">${title}</h2>
+const head = ({
+  kicker,
+  title,
+  glyph = '',
+  stateLabel,
+  next,
+  actions = '',
+  extra = '',
+  help = '',
+}) =>
+  `<div class="i-kicker">${kicker}</div>${help}<h2 class="i-title" id="insp-title" tabindex="-1">${title}</h2>
    ${stateLabel ? `<div class="i-state">${glyph}<span class="st">${stateLabel}</span>${next ? `<span class="nx">${next}</span>` : ''}</div>` : ''}
    ${actions ? `<div class="i-actions">${actions}</div>` : ''}${extra}`;
 const btn = (text, attrs = '', primary = false, small = false, extraCls = '') =>
@@ -1852,7 +2107,9 @@ function attList(items) {
 /* ---------------- inspector ---------------- */
 function renderInspector() {
   const el = $('#insp');
-  const [kind, id] = splitKey(state.selected);
+  // Today's "Do this next" row opens the stop or step it names
+  let [kind, id] = splitKey(state.selected);
+  if (kind === 'next') [kind, id] = splitKey(id);
   const crumb = $('#crumb');
   let out = '',
     wide = false,
@@ -1861,6 +2118,13 @@ function renderInspector() {
     if (!state.snapshot) {
       out = inspStart();
       crumbText = 'Getting started';
+    } else if (kind === 'stop' && guideStop(id)) {
+      out = inspStop(guideStop(id));
+      crumbText = `Start here › ${guideStop(id).title}`;
+    } else if (kind === 'lx' && lxFind(id)) {
+      const x = lxFind(id);
+      out = inspLine(x);
+      crumbText = `Start here › ${lineOf(x)?.name || x.name}`;
     } else if (kind === 'step' && M.byId.has(id)) {
       const s = M.byId.get(id);
       out = inspStep(s);
@@ -1988,7 +2252,8 @@ function stepFlags(s) {
     out += flag(
       `<b>Evidence this step cites has been withdrawn:</b> ${withdrawn.map((e) => h(e.title)).join(', ')}.`,
     );
-  if (!FINISHED.has(t.state) && t.blockers?.length)
+  // with the guide, "Where it stands" says this in full; without it, the blockers are listed here
+  if (!FINISHED.has(t.state) && t.blockers?.length && !guideStep(t.id))
     out += flag(
       `<b>Before it can be approved, submitted or verified:</b><ul>${t.blockers.map((b) => `<li>${h(b)}</li>`).join('')}</ul>`,
       true,
@@ -2101,7 +2366,8 @@ function inspStep(s) {
   const t = s.task,
     l = s.line,
     ext = t.data.external;
-  const kicker = `${bul(l, true)}<span>Step ${h(s.n)} of ${M.steps.length} · ${h(l.name)} · ${ext ? 'outside body' : 'internal review'}</span>`;
+  const help = lineHelp(l, 'insp');
+  const kicker = `${bul(l, true)}<span>Step ${h(s.n)} of ${M.steps.length} · ${h(l.name)} · ${ext ? 'outside body' : 'internal review'}</span>${help ? help.button : ''}`;
   const accepted = state.accepted[t.id];
   const open = state.open?.kind === 'tx' && state.open.id === t.id ? txForm(t) : '';
   // linked steps are live steps only; a replaced prerequisite blocks nothing (the server agrees)
@@ -2129,7 +2395,9 @@ function inspStep(s) {
       next: h(nextText(s)),
       actions: accepted ? '' : transitionButtons(t),
       extra: (accepted ? acceptedNote(accepted) : open) + stepFlags(s),
+      help: help ? help.panel : '',
     }) +
+    stepExplain(s, Boolean(accepted)) +
     sec('Stages', stageLadder(t)) +
     journeySec(s) +
     sec(
@@ -2170,6 +2438,137 @@ function inspStep(s) {
       : '') +
     advice +
     historySec(t)
+  );
+}
+/* Why the step waits, what unlocks it and the one next action for this person, as the server
+   worked them out from the step's blockers and state. */
+function stepExplain(s, accepted) {
+  const x = guideStep(s.id);
+  if (!x) return '';
+  const finished = FINISHED.has(x.state);
+  let next;
+  if (accepted)
+    next = 'Your decision is recorded. Load the current records to see what comes next.';
+  else if (x.next) next = nextButton(x.next, false);
+  else next = h(x.waiting_on || (finished ? 'None. It is finished.' : 'None for you now.'));
+  return sec(
+    'Where it stands',
+    props([
+      [
+        'Why it is waiting',
+        finished
+          ? 'Nothing. It is finished.'
+          : x.why.length
+            ? plainList(x.why)
+            : 'Nothing holds it. It is ready to start.',
+      ],
+      [
+        'What unlocks it',
+        finished
+          ? 'Nothing is needed.'
+          : x.unlocks.length
+            ? plainList(x.unlocks)
+            : 'Nothing is needed first.',
+      ],
+      ['Your next action', next],
+    ]),
+  );
+}
+/* A stop on the guided path: what it is, why it comes here, the steps it feeds, and, until it is
+   done, the one thing to do for it. */
+function inspStop(st) {
+  const p = state.guide.path,
+    isNext = st.n === p.next_stop;
+  const steps = st.steps.map(find).filter(Boolean);
+  let todo = '';
+  if (!st.done && isNext)
+    todo = st.action
+      ? nextBox('Do this next', st.action)
+      : flag(`<b>Waiting.</b> ${h(st.waiting_on || '')}`, true);
+  else if (!st.done) {
+    const first = guideStop(p.next_stop);
+    todo = flag(
+      `Comes after stop ${h(first.n)}, ${h(first.title)}.${st.action ? `<div class="i-actions">${nextButton(st.action, false)}</div>` : ''}`,
+      true,
+    );
+  }
+  return (
+    head({
+      kicker: `${ICON.start}<span>Start here · stop ${h(st.n)} of ${h(p.total)} · ${h(p.name.toLowerCase())}</span>`,
+      title: h(st.title),
+      glyph: stopGlyph(st),
+      stateLabel: stopState(st),
+      next: st.ruled_out ? h(st.ruled_out) : st.done ? 'it ticked itself off' : '',
+      extra: todo,
+    }) +
+    sec(
+      'What it is',
+      `<p class="prose">${h(st.detail)}</p><p class="fine">${h(st.done_when)}</p>`,
+    ) +
+    sec('Why it comes here', `<p class="prose">${h(st.why)}</p>`) +
+    (steps.length
+      ? sec(
+          'Steps it feeds',
+          props([['Steps', steps.map((t) => `${taskGlyph(t)} ${linkTo(t)}`).join('<br>')]]),
+        )
+      : '') +
+    sec(
+      'How a step moves',
+      `<p class="prose">Every step is prepared, then approved by a person, then, if an outside body is involved, submitted by you, and finally verified once the result is on record. Preparing something is not approving it, and sending something is not the same as confirming it worked.</p>`,
+    )
+  );
+}
+/* A line, explained: the catalog's sentence, what it means on a business being bought, and where
+   it stands on this business for this person. */
+function inspLine(x) {
+  const l = lineOf(x),
+    f = x.focus;
+  let why, unlocks;
+  if (x.status === 'done')
+    [why, unlocks] = ['Nothing. Every step is verified or ruled out.', 'Nothing is needed.'];
+  else if (x.stop) {
+    const st = guideStop(x.stop);
+    why = h(`Stop ${st.n} of your first path, ${st.title}, is not done yet.`);
+    unlocks = h(st.done_when);
+  } else if (f) {
+    why = `<b>${h(f.title)}.</b> ${f.why.length ? plainList(f.why) : 'Nothing holds it. It is ready to start.'}`;
+    unlocks = f.unlocks.length ? plainList(f.unlocks) : 'Nothing is needed first.';
+  }
+  const next = x.next
+    ? nextButton(x.next, false)
+    : h(f?.waiting_on || 'Nothing on this line is yours to do now.');
+  return (
+    head({
+      kicker: `${l ? bul(l, true) : ''}<span>The lines, explained${x.deal_title ? ' · ' + h(x.deal_title) : ''}</span>`,
+      title: h(l ? l.name : x.name),
+      stateLabel: x.steps ? `${x.verified} of ${plural(x.steps, 'step')} verified` : 'No steps yet',
+      actions: l ? btn(`Open the ${l.name} line`, goAttr(l.id, '')) : '',
+    }) +
+    sec('What it is', `<p class="prose">${h(x.about || '')}</p>`) +
+    (x.on_acquisition
+      ? sec(
+          x.status === 'later' ? 'When it appears' : 'On a business you are buying',
+          `<p class="prose">${h(x.on_acquisition)}</p>`,
+        )
+      : '') +
+    (x.steps
+      ? sec(
+          'On this business',
+          props([
+            ['Why it is waiting', why],
+            ['What unlocks it', unlocks],
+            ['Your next action', next],
+          ]),
+        )
+      : '') +
+    (l
+      ? sec(
+          'Its steps',
+          props([
+            ['Steps', l.steps.map((s) => `${taskGlyph(s.task)} ${linkTo(s.task)}`).join('<br>')],
+          ]),
+        )
+      : '')
   );
 }
 /* Every decision recorded on a step, newest first. */
@@ -2988,6 +3387,19 @@ function backupHelp() {
     ]),
   };
 }
+/* How to turn on the optional review, true for the way this person reached the workspace. A
+   desktop app opened from Finder or the Start menu cannot be given a provider key, and its address
+   changes at every launch, so both ways in need Business Foundry started from a terminal. */
+function aiSetupText() {
+  if (state.actor.ai_configured)
+    return 'Ask for a structured review of the concept and record summaries. Original evidence bodies and full financial tables are not sent. Each request asks you first.';
+  const none = 'No assistant is configured. The workspace works fully without one.';
+  if (!isOwner())
+    return `${none} Whether to set one up is a decision for the owner of this workspace.`;
+  if (state.actor.desktop)
+    return `${none} A desktop app opened from Finder or the Start menu cannot be given a provider key, and its address changes each time it opens, so your own AI app cannot reach it either. To use either, run Business Foundry from a terminal with <code>foundry start</code>, with <code>OPENAI_API_KEY</code> and <code>FOUNDRY_OPENAI_MODEL</code> set in that terminal for the review. The file docs/AI.md in the project explains how.`;
+  return `${none} To use the optional review, set <code>OPENAI_API_KEY</code> and <code>FOUNDRY_OPENAI_MODEL</code> in the terminal you start Business Foundry from, then start it again, for example with <code>foundry start</code>. To work from your own AI app instead, give it an agent key through the agent adapter, <code>foundry mcp</code>. The file docs/AI.md in the project explains both.`;
+}
 function inspAccess(kind, id) {
   const authority = flag(
     '<b>Assistants advise. They cannot approve, submit, verify or move money.</b> Business Foundry does every sum itself, and every decision stays with a person.',
@@ -3089,7 +3501,7 @@ function inspAccess(kind, id) {
     authority +
     sec(
       'Optional assistant review',
-      `<p class="prose">${state.actor.ai_configured ? 'Ask for a structured review of the concept and record summaries. Original evidence bodies and full financial tables are not sent. Each request asks you first.' : 'No assistant is configured. The workspace works fully without one. To enable reviews, configure a provider key and model on the server, or connect an AI client through the agent adapter with an agent key.'}</p><p class="fine">Provider usage is billed by the provider. Server limits and every request and response are recorded.</p>`,
+      `<p class="prose">${aiSetupText()}</p><p class="fine">Provider usage is billed by the provider. Server limits and every request and response are recorded.</p>`,
     ) +
     sec(
       'Your business records',
@@ -3225,6 +3637,8 @@ function renderAll() {
 }
 function setSource(id, key) {
   state.source = sourceById(id) ? id : 'today';
+  // a line's help closes when the person moves to another source
+  state.help = null;
   state.selected = key || state.remembered[state.source] || null;
   state.open = null;
   q.value = '';
@@ -3374,6 +3788,8 @@ function forget() {
     wantBid: null,
     loaded: 0,
     snapshot: null,
+    guide: null,
+    help: null,
     runs: [],
     principals: null,
     audit: null,
@@ -3481,24 +3897,29 @@ async function refresh() {
   }
   if (stale()) return false;
   let closed = null;
+  // A business opens on Start here until its guided path is done, and on Today after that.
+  const opening = snapshot?.guide && !snapshot.guide.path.complete ? 'start' : 'today';
   if (bid !== state.bid) {
     // another business: nothing about the previous one stays open over it
     closed = closeForeign(bid, snapshot?.business.data.name || '');
-    // and it starts from its Today list
+    // and it starts from where to start
     Object.assign(state, {
-      source: 'today',
+      source: opening,
       selected: null,
       remembered: {},
       open: null,
       scenario: 'base',
+      help: null,
     });
-  }
+  } else if (!state.loaded)
+    Object.assign(state, { source: opening, selected: null, remembered: {} });
   Object.assign(state, {
     businesses,
     bid,
     wantBid: null,
     loaded: load,
     snapshot,
+    guide: snapshot?.guide || null,
     runs: Array.isArray(runs) ? runs : [],
     principals,
     audit: null,
@@ -3976,7 +4397,7 @@ function businessDialog(edit = false) {
     { free: !edit },
   );
 }
-function recordDialog(id) {
+function recordDialog(id, kind = null) {
   const o = id ? find(id) : null,
     d = o?.data || {};
   if (!canWrite()) {
@@ -3985,7 +4406,12 @@ function recordDialog(id) {
   }
   formDialog(
     o ? 'Edit business record' : 'Add business record',
-    choose('kind', 'Record type', o ? [o.kind] : RECORD_KINDS, o?.kind || 'customer') +
+    choose(
+      'kind',
+      'Record type',
+      o ? [o.kind] : RECORD_KINDS,
+      o?.kind || (RECORD_KINDS.includes(kind) ? kind : 'customer'),
+    ) +
       input('title', 'Title', o?.title || '', 'text', '', 'required') +
       area('details', 'Details', d.details || '') +
       choose(
@@ -4788,6 +5214,8 @@ async function handle(a, el) {
       { free: true },
     );
   } else if (a === 'ai-review') aiDialog();
+  else if (a === 'help') toggleHelp(el);
+  else if (a === 'do-next') doNext(el);
 }
 document.addEventListener('click', (event) => {
   const action = event.target.closest('[data-action]');
@@ -4833,6 +5261,17 @@ $('#list').addEventListener('keydown', (e) => {
   e.preventDefault();
   nxt.focus();
   if (!isPhone()) select(nxt.dataset.key);
+});
+/* Escape closes an open line help from its ? or from inside it, and leaves focus on the ?. */
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !state.help) return;
+  const panel = document.getElementById(state.help);
+  const button = document.querySelector(
+    `[data-action="help"][data-id="${CSS.escape(state.help)}"]`,
+  );
+  if (e.target !== button && !panel?.contains(e.target)) return;
+  e.preventDefault();
+  closeHelp()?.focus();
 });
 $('#insp').addEventListener('keydown', (e) => {
   const stn = e.target.closest('.stn');

@@ -1198,6 +1198,7 @@ def test_agent_through_mcp_has_no_jurisdiction_tool_and_cannot_move_superseded_s
                 assert names == {
                     "list_businesses",
                     "get_business",
+                    "get_guide",
                     "add_record",
                     "update_record",
                     "add_evidence",

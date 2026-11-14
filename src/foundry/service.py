@@ -606,22 +606,42 @@ class Service:
         )
 
     def blockers(self, con, bid, item):
+        """What stops a step being approved, submitted or verified, as the messages people read."""
+        return [b["message"] for b in self.blocker_items(con, bid, item)]
+
+    def blocker_items(self, con, bid, item):
+        """The blockers of a step, each with what it is about. The guide explains a step from these,
+        so its reasons are the blockers themselves, in the same order."""
         if not live(item):
             return []
-        messages = []
+        items = []
         if item["data"].get("deal_id"):
             deal = self.store.get(con, bid, item["data"]["deal_id"], "deal")
             if any(
                 self.store.get(con, bid, eid, "evidence")["version"] != version
                 for eid, version in deal["data"].get("evidence_versions", {}).items()
             ):
-                messages.append("Supporting deal evidence changed; create and review a fresh analysis")
+                items.append(
+                    {
+                        "code": "deal_evidence",
+                        "message": "Supporting deal evidence changed; create and review a fresh analysis",
+                        "deal_id": deal["id"],
+                    }
+                )
         for dep_id in item["data"]["depends_on"]:
             dep = self.store.get(con, bid, dep_id, "task")
             # A superseded prerequisite belongs to a planning guide that no longer applies. It can never
             # finish, so it never blocks.
             if live(dep) and dep["state"] not in FINISHED:
-                messages.append(f"Complete: {dep['title']}")
+                items.append(
+                    {
+                        "code": "step",
+                        "message": f"Complete: {dep['title']}",
+                        "task_id": dep["id"],
+                        "title": dep["title"],
+                        "state": dep["state"],
+                    }
+                )
         for kind in item["data"]["required_record_kinds"]:
             records = self.store.objects(con, bid, kind)
             if kind == "deal" and item["data"].get("deal_id"):
@@ -629,10 +649,15 @@ class Service:
             if kind == "invoice":
                 records = [r for r in records if r["state"] in {"issued", "partially_paid", "paid"}]
             if not records:
-                messages.append(
-                    f"Add {'an issued invoice' if kind == 'invoice' else kind.replace('_', ' ') + ' record'}"
+                items.append(
+                    {
+                        "code": "record",
+                        "message": "Add "
+                        + ("an issued invoice" if kind == "invoice" else kind.replace("_", " ") + " record"),
+                        "record_kind": kind,
+                    }
                 )
-        return messages
+        return items
 
     def transition(self, actor, bid, tid, key, payload):
         state = payload["state"]
@@ -861,10 +886,32 @@ class Service:
 
         return self.command(actor, bid, key, "invoice.payment", {**payload, "id": iid}, run, True)
 
-    def snapshot(self, actor, bid):
+    def snapshot(self, actor, bid, guide=False):
+        """The business and its records. With ``guide``, also the guide for this person, worked out
+        in the same read, so the page never shows a guide from other records than it shows."""
         self.access(actor, bid)
         with self.store.read() as con:
-            return self._snapshot(con, bid)
+            snapshot = self._snapshot(con, bid)
+            if guide:
+                snapshot["guide"] = self._guide(con, bid, snapshot, actor)
+            return snapshot
+
+    def guide(self, actor, bid):
+        """Where to start, for this person: the guided path for the business's entry path, each line
+        explained, and why each step waits. Read-only; worked out on every read, never stored."""
+        self.access(actor, bid)
+        with self.store.read() as con:
+            return self._guide(con, bid, self._snapshot(con, bid), actor)
+
+    def _guide(self, con, bid, snapshot, actor):
+        from .guide import build_guide
+
+        items = {
+            o["id"]: self.blocker_items(con, bid, o)
+            for o in snapshot["objects"]
+            if o["kind"] == "task" and live(o)
+        }
+        return build_guide(snapshot, items, actor)
 
     def saved_jurisdictions(self, con, bid):
         """The planning jurisdiction in force when each deal analysis and forecast was calculated, by id.

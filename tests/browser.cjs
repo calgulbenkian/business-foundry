@@ -155,6 +155,9 @@ async function startServer(python, db, logs) {
   }
   return { server, origin };
 }
+/* A workspace has opened: on Today, or on Start here for a business whose guided path is not
+   done yet. */
+const OPENED = '#list .today-head, #list .start-head';
 /* Wait for a promise for at most `ms`; resolves true if it settled in time, fulfilled or not.
    Its timer is cleared either way, so it never keeps this process alive. */
 async function within(promise, ms) {
@@ -192,6 +195,30 @@ async function signIn(page, origin, keyFile) {
   await page.getByRole('button', { name: 'Open workspace' }).click();
 }
 const overflow = (page) => page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
+/* The note under Today's "Ready to start" heading, or null when there is none. */
+const readyNote = (page) =>
+  page.evaluate(() => {
+    const head = [...document.querySelectorAll('#list h2.grp')].find((x) =>
+      x.textContent.startsWith('Ready to start'),
+    );
+    const next = head?.nextElementSibling;
+    return next?.classList.contains('grp-note') ? next.textContent : null;
+  });
+/* A line's ? and what it opens, as a screen reader meets them: its name, whether it says it is
+   open, the text it controls, and whether that text follows it. */
+const helpState = (page, button) =>
+  button.evaluate((b) => {
+    const panel = document.getElementById(b.getAttribute('aria-controls'));
+    const after = panel && b.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING;
+    return {
+      tag: b.tagName,
+      expanded: b.getAttribute('aria-expanded'),
+      shown: Boolean(panel && !panel.hidden && panel.getClientRects().length),
+      text: panel?.textContent || '',
+      follows: Boolean(after),
+      focused: document.activeElement === b,
+    };
+  });
 /* What has keyboard focus: enough to say which control it is and whether a person can see it. */
 const focused = (page) =>
   page.evaluate(() => {
@@ -404,6 +431,512 @@ const lineColours = (page) =>
     return out;
   });
 
+/* Start here and the lines, explained. `page` is signed in as the owner and shows a new start-up
+   business. Every sentence checked here is the server's, from the catalog or the guide; the page
+   adds none. Leaves `page` on that business again, at desktop width in the light theme. */
+async function startHere(page, context, browser, origin, keyFile) {
+  const startBid = await page.locator('#business-select').inputValue();
+  const startName = await page.locator('#business-select option:checked').innerText();
+  const api = (path, method = 'GET', body = null) =>
+    page.evaluate(
+      async ([p, m, b]) => {
+        const r = await fetch('/api' + p, {
+          method: m,
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+          body: b ? JSON.stringify(b) : undefined,
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail);
+        return d;
+      },
+      [path, method, body],
+    );
+  const src = async (id) => {
+    await page.locator(`#src-nav .src[data-src="${id}"]`).click();
+    // on a phone the sources pane gives way to the list once a source is chosen
+    await page
+      .locator(`#src-nav .src[data-src="${id}"][aria-current="true"]`)
+      .waitFor({ state: 'attached' });
+  };
+  const openBusiness = async (id) => {
+    // a business made through the API is in the selector once the page has loaded the list again
+    if (!(await page.locator(`#business-select option[value="${id}"]`).count())) {
+      await page.evaluate(() => refresh());
+      await quiet(page);
+    }
+    await page.locator('#business-select').selectOption(id);
+    await page.locator(`#business-select option[value="${id}"][selected]`).waitFor({
+      state: 'attached',
+    });
+    await page.locator(OPENED).waitFor();
+    await quiet(page);
+  };
+  const current = () => page.locator('#src-nav .src[aria-current="true"]').getAttribute('data-src');
+
+  // "Do this next" opens the form for it: on a new start-up, a customer record.
+  await src('start');
+  const nextBox = page.locator('#insp .next-box');
+  assert.equal(
+    await nextBox.getByRole('button').innerText(),
+    'Add a customer record',
+    'the next action names its action',
+  );
+  await nextBox.getByRole('button').click();
+  await page.locator('#dialog-title', { hasText: 'Add business record' }).waitFor();
+  assert.equal(await page.locator('#dialog select[name="kind"]').inputValue(), 'customer');
+  await page.locator('#dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.locator('#dialog').waitFor({ state: 'hidden' });
+
+  // The ? beside a line's name works from the keyboard, and says what it is to a screen reader.
+  const marketHelp = page.getByRole('button', { name: 'What the Market line is', exact: true });
+  await marketHelp.focus();
+  let help = await helpState(page, marketHelp);
+  assert.deepEqual(
+    [help.tag, help.expanded, help.shown, help.follows],
+    ['BUTTON', 'false', false, true],
+    'a closed ? is a button, followed by the text it controls',
+  );
+  await page.keyboard.press('Enter');
+  help = await helpState(page, marketHelp);
+  assert.deepEqual([help.expanded, help.shown, help.focused], ['true', true, true], 'Enter opens');
+  assert(
+    help.text.includes('Who buys, what problem they pay to solve, and what you will offer them.'),
+    `the catalog's sentence: ${help.text}`,
+  );
+  assert(help.text.includes('Your next action: Add a customer record.'), help.text);
+  await page.keyboard.press('Escape');
+  help = await helpState(page, marketHelp);
+  assert.deepEqual([help.expanded, help.shown, help.focused], ['false', false, true], 'Escape');
+  await page.keyboard.press('Space');
+  assert.equal((await helpState(page, marketHelp)).shown, true, 'Space opens');
+  await page.keyboard.press('Space');
+  assert.equal((await helpState(page, marketHelp)).shown, false, 'Space closes');
+
+  // The lines are explained under each line's heading, and a step says why it waits.
+  await page.locator('#src-nav .src').filter({ hasText: 'Rights' }).first().click();
+  assert.equal(
+    (await page.locator('#list .lx-note').innerText()).split('. ')[0],
+    "Who owns what: the founders' arrangements, intellectual property, data and assets",
+  );
+  await page.locator('#list .row', { hasText: 'Record founder and IP arrangements' }).click();
+  const stands = page
+    .locator('#insp .i-sec')
+    .filter({ has: page.locator('h3', { hasText: 'Where it stands' }) });
+  assert.deepEqual(
+    (await stands.locator('dd').first().locator('li').allInnerTexts()).map((t) => t.trim()),
+    [
+      'It cannot be approved until Decide the entity and ownership structure is finished. That step is not started.',
+      'It cannot be approved until there is a contract record.',
+    ],
+  );
+  // Its next action opens the form for what it needs: a contract record, already chosen.
+  await stands.getByRole('button', { name: 'Add a contract record', exact: true }).click();
+  await page.locator('#dialog-title', { hasText: 'Add business record' }).waitFor();
+  assert.equal(await page.locator('#dialog select[name="kind"]').inputValue(), 'contract');
+  await page.locator('#dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.locator('#dialog').waitFor({ state: 'hidden' });
+  // The step's own ? opens the same text as its line's ? in the source list.
+  const stepHelp = page.locator('#insp .i-kicker [data-action="help"]');
+  await stepHelp.click();
+  const rightsHelp = await helpState(page, stepHelp);
+  assert(rightsHelp.shown && rightsHelp.text.startsWith('Rights.'), rightsHelp.text);
+  // A step nobody has started offers starting it, not preparing it, as its main move.
+  assert.equal(
+    await page.locator('#insp button[data-action="tx"].primary').innerText(),
+    'Start work…',
+  );
+
+  // An acquisition: a new business whose entry path is buying one.
+  const acq = await api('/businesses', 'POST', {
+    name: 'Browser laundry purchase',
+    route: 'acquire',
+    concept: 'Synthetic browser test: buy a small laundromat in a made-up town.',
+    is_demo: true,
+  });
+  await openBusiness(acq.id);
+  assert.equal(await current(), 'start', 'an acquisition opens on Start here');
+  const linesExplained = await page.locator('#list .row.lx .r-t').allInnerTexts();
+  assert.deepEqual(
+    linesExplained.map((t) => t.trim()),
+    ['Acquisition', 'Market', 'Finance', 'Setup', 'Rights', 'Delivery', 'Sales to cash', 'Operate'],
+    'the Acquisition line comes first',
+  );
+  // its stops tick off from its records: attach, review, screen
+  const listing = await api(`/businesses/${acq.id}/evidence`, 'POST', {
+    title: 'Browser listing text',
+    content: 'SYNTHETIC listing: asking price, revenue and earnings.',
+  });
+  await api(`/businesses/${acq.id}/evidence/${listing.id}/review`, 'POST', {
+    note: 'Read the synthetic listing in full.',
+    expected_version: 1,
+  });
+  await api(`/businesses/${acq.id}/deals`, 'POST', {
+    target: 'Browser laundry',
+    thesis: 'Synthetic thesis for the browser test.',
+    annual_revenue: '210000',
+    reported_ebitda: '62000',
+    purchase_price: '180000',
+  });
+  await page.evaluate(() => refresh());
+  await quiet(page);
+  assert.equal(await page.locator('#src-nav .src[data-src="start"] .n').innerText(), '4 of 5');
+  // Start-up lines on an acquisition say what they mean there.
+  await page.locator('#src-nav .src').filter({ hasText: 'Delivery' }).first().click();
+  assert(
+    (await page.locator('#list .lx-note').innerText()).includes(
+      'When you buy a business, the work already happens. This line is where you write down how, so it runs the same way after the handover.',
+    ),
+  );
+  // Today agrees with Start here: the same next action, and the Acquisition line's step first.
+  await src('start');
+  await page.locator('#list .row[data-key="stop:5"]').click();
+  const startNext = await page.locator('#insp .next-box').getByRole('button').innerText();
+  assert.equal(startNext, 'Start work on Approve the acquisition thesis');
+  await src('today');
+  assert.equal(await page.locator('#list .row[data-key^="next:"] .r-t').innerText(), startNext);
+  const readyTitles = await page.evaluate(() => {
+    const head = [...document.querySelectorAll('#list h2.grp')].find((x) =>
+      x.textContent.startsWith('Ready to start'),
+    );
+    return [...document.querySelectorAll(`#list ul[aria-labelledby="${head.id}"] .r-t`)].map(
+      (x) => x.textContent,
+    );
+  });
+  assert.deepEqual(readyTitles, [
+    'Approve the acquisition thesis',
+    'Resolve operating and founder jurisdictions',
+  ]);
+  assert.equal(await readyNote(page), null, 'neither ready step has a prerequisite');
+  // "Do this next" for a step opens the step with its decision form at the move it names.
+  await src('start');
+  await page.locator('#insp .next-box').getByRole('button').click();
+  await page.locator('#insp #tx-form').waitFor();
+  assert.equal(await page.locator('#insp-title').innerText(), 'Approve the acquisition thesis');
+  assert.equal(await page.locator('#tx-form select[name="state"]').inputValue(), 'in_progress');
+  await page.locator('#tx-form').getByRole('button', { name: 'Not yet' }).click();
+
+  // The thesis approved and verified: the diligence steps it unlocks have a prerequisite, the
+  // jurisdiction step has none, and Today says exactly that.
+  const thesisOf = async () =>
+    (await api(`/businesses/${acq.id}`)).objects.find(
+      (o) => o.kind === 'task' && o.data.key === 'mandate',
+    );
+  for (const state of ['prepared', 'approved', 'verified']) {
+    const t = await thesisOf();
+    await api(`/businesses/${acq.id}/tasks/${t.id}/transition`, 'POST', {
+      state,
+      expected_version: t.version,
+      note: 'Synthetic decision for the browser test.',
+      evidence_ids: [listing.id],
+    });
+  }
+  // Its path is done: the business now opens on Today.
+  await openBusiness(startBid);
+  assert.equal(await current(), 'start', 'the start-up path is not done');
+  await openBusiness(acq.id);
+  assert.equal(await current(), 'today', 'a business whose path is done opens on Today');
+  assert.equal(
+    await readyNote(page),
+    'The prerequisites of 2 of these are complete; the other has none.',
+  );
+
+  // A decision ruled out as not applicable finishes its stop: the founder decided not to go ahead.
+  // The business opens on Today, and the stop says it was ruled out, not approved.
+  const dropped = await api('/businesses', 'POST', {
+    name: 'Browser laundry, not pursued',
+    route: 'acquire',
+    concept: 'Synthetic browser test: a purchase the founder decided not to pursue.',
+    is_demo: true,
+  });
+  const droppedListing = await api(`/businesses/${dropped.id}/evidence`, 'POST', {
+    title: 'Browser listing, not pursued',
+    content: 'SYNTHETIC listing: asking price, revenue and earnings.',
+  });
+  await api(`/businesses/${dropped.id}/evidence/${droppedListing.id}/review`, 'POST', {
+    note: 'Read the synthetic listing in full.',
+    expected_version: 1,
+  });
+  await api(`/businesses/${dropped.id}/deals`, 'POST', {
+    target: 'Browser laundry, not pursued',
+    thesis: 'Synthetic thesis for the browser test.',
+    annual_revenue: '210000',
+    reported_ebitda: '62000',
+    purchase_price: '180000',
+  });
+  const droppedThesis = (await api(`/businesses/${dropped.id}`)).objects.find(
+    (o) => o.kind === 'task' && o.data.key === 'mandate',
+  );
+  await api(`/businesses/${dropped.id}/tasks/${droppedThesis.id}/transition`, 'POST', {
+    state: 'not_applicable',
+    expected_version: droppedThesis.version,
+    note: 'Synthetic decision: the founder decided not to go ahead.',
+    evidence_ids: [droppedListing.id],
+  });
+  await openBusiness(dropped.id);
+  assert.equal(await current(), 'today', 'a path whose decision was ruled out is done');
+  await src('start');
+  assert.equal(await page.locator('#src-nav .src[data-src="start"] .n').innerText(), '5 of 5');
+  const decideRow = page.locator('#list .row[data-key="stop:5"]');
+  assert.equal(await decideRow.locator('.r-right').innerText(), 'Done · Not applicable');
+  assert.equal(await decideRow.locator('.r-g svg').getAttribute('data-glyph'), 'na');
+  // an approved or verified decision still reads Done, with the tick
+  assert.equal(
+    await page.locator('#list .row[data-key="stop:4"] .r-right').innerText(),
+    'Done',
+    'a stop done by its records',
+  );
+  await decideRow.click();
+  assert.equal(await page.locator('#insp-title').innerText(), 'Decide whether to keep going');
+  assert.equal(await page.locator('#insp .i-state .st').innerText(), 'Done · Not applicable');
+  assert.equal(
+    await page.locator('#insp .i-state .nx').innerText(),
+    'Approve the acquisition thesis was reviewed and ruled out as not applicable.',
+  );
+  assert(
+    (await page.locator('#insp .fine').first().innerText()).includes(
+      'Done when Approve the acquisition thesis, for the newest analysis, is approved or further along, or ruled out as not applicable.',
+    ),
+  );
+  assert.equal(await page.locator('#insp .next-box').count(), 0, 'nothing to do for a done stop');
+
+  // An older analysis whose evidence changed is ruled out, not saved again: a newer analysis was
+  // saved after it, and saving another can never clear it.
+  const two = await api('/businesses', 'POST', {
+    name: 'Browser laundry, two listings',
+    route: 'acquire',
+    concept: 'Synthetic browser test: a purchase whose first listing was withdrawn.',
+    is_demo: true,
+  });
+  const ofTwo = async () => (await api(`/businesses/${two.id}`)).objects;
+  const reviewedEvidence = async (title, source_type = 'document') => {
+    const e = await api(`/businesses/${two.id}/evidence`, 'POST', {
+      title,
+      content: 'SYNTHETIC evidence for the browser test.',
+      source_type,
+    });
+    return api(`/businesses/${two.id}/evidence/${e.id}/review`, 'POST', {
+      note: 'Read the synthetic item in full.',
+      expected_version: e.version,
+    });
+  };
+  const moveTo = (t, state, evidence) =>
+    api(`/businesses/${two.id}/tasks/${t.id}/transition`, 'POST', {
+      state,
+      expected_version: t.version,
+      note: 'Synthetic decision for the browser test.',
+      evidence_ids: evidence ? [evidence.id] : [],
+    });
+  const closingReceipt = await reviewedEvidence('Browser closing receipt', 'external_receipt');
+  for (const t of await ofTwo())
+    if (t.kind === 'task' && !t.data.deal_id) await moveTo(t, 'not_applicable', closingReceipt);
+  const screen = (target, e) =>
+    api(`/businesses/${two.id}/deals`, 'POST', {
+      target,
+      thesis: 'Synthetic thesis for the browser test.',
+      annual_revenue: '210000',
+      reported_ebitda: '62000',
+      purchase_price: '180000',
+      evidence_ids: [e.id],
+    });
+  const firstListing = await reviewedEvidence('Browser first listing');
+  const firstDeal = await screen('Browser laundry first offer', firstListing);
+  await api(`/businesses/${two.id}/evidence/${firstListing.id}/revoke`, 'POST', {
+    note: 'The seller withdrew the first listing.',
+    expected_version: firstListing.version,
+  });
+  const secondDeal = await screen(
+    'Browser laundry second offer',
+    await reviewedEvidence('Browser second listing'),
+  );
+  // the second analysis's steps up to its closing, which is submitted and waits on its receipt
+  for (const key of [
+    'mandate',
+    'financial_diligence',
+    'legal_diligence',
+    'investment',
+    'closing',
+  ]) {
+    const external = key === 'closing';
+    for (const state of ['prepared', 'approved', external ? 'submitted' : 'verified']) {
+      const t = (await ofTwo()).find(
+        (o) => o.kind === 'task' && o.data.deal_id === secondDeal.id && o.data.key === key,
+      );
+      await moveTo(t, state, closingReceipt);
+    }
+  }
+  const oldThesis = (await ofTwo()).find(
+    (o) => o.kind === 'task' && o.data.deal_id === firstDeal.id && o.data.key === 'mandate',
+  );
+  const ruleOut = 'Rule out Approve the acquisition thesis: its analysis is out of date';
+  const olderWhy =
+    'This step belongs to an acquisition analysis whose evidence changed. A newer analysis was saved after it. Saving another analysis does not clear this step.';
+  await openBusiness(two.id);
+  assert.equal(await current(), 'today', 'its path is done');
+  // Today's "Do this next" row names the rule-out and the older analysis's line.
+  const doNextRow = page.locator('#list .row[data-key^="next:"]');
+  assert.equal(await doNextRow.locator('.r-t').innerText(), ruleOut);
+  assert(
+    (await doNextRow.innerText()).includes(
+      'Acquisition · Browser laundry first offer line · 18 Approve the acquisition thesis',
+    ),
+    await doNextRow.innerText(),
+  );
+  // The step it opens says why, what unlocks it and offers the rule-out.
+  await doNextRow.click();
+  assert.equal(await page.locator('#insp-title').innerText(), 'Approve the acquisition thesis');
+  const where = page
+    .locator('#insp .i-sec')
+    .filter({ has: page.locator('h3', { hasText: 'Where it stands' }) });
+  assert.deepEqual((await where.locator('dd').nth(0).innerText()).trim(), olderWhy, 'why it waits');
+  assert.deepEqual(
+    (await where.locator('dd').nth(1).locator('li').allInnerTexts()).map((t) => t.trim()),
+    [
+      'An owner or reviewer rules it out as not applicable, with reviewed evidence.',
+      'If you still want this deal, a fresh analysis of it is a new analysis with its own steps; these still need ruling out.',
+    ],
+  );
+  // Its button opens the decision form at not applicable, which asks for reviewed evidence.
+  await where.getByRole('button', { name: ruleOut, exact: true }).click();
+  await page.locator('#insp #tx-form').waitFor();
+  assert.equal(await page.locator('#tx-form select[name="state"]').inputValue(), 'not_applicable');
+  assert.equal(
+    await page.locator('#tx-text').innerText(),
+    'Record a reviewed decision that this step does not apply here. Attach reviewed evidence for that decision.',
+  );
+  assert.equal(await page.locator('#tx-form [name="evidence_ids"]').count(), 1);
+  await page.locator('#tx-form').getByRole('button', { name: 'Not yet' }).click();
+  // The older analysis's line heading and its ? give the same next action.
+  const olderLine = 'Acquisition · Browser laundry first offer';
+  await page.locator('#src-nav .src').filter({ hasText: 'Browser laundry first offer' }).click();
+  assert(
+    (await page.locator('#list .lx-note').innerText()).includes(`Your next action: ${ruleOut}.`),
+    await page.locator('#list .lx-note').innerText(),
+  );
+  const olderHelp = page
+    .locator('#src-nav')
+    .getByRole('button', { name: `What the ${olderLine} line is`, exact: true });
+  await olderHelp.click();
+  const olderText = (await helpState(page, olderHelp)).text;
+  assert(olderText.includes(`Your next action: ${ruleOut}.`), olderText);
+  await olderHelp.click();
+  // The lines explained on Start here: the same reasons and the same button, which opens the form.
+  await src('start');
+  const lineRow = page.locator('#list .row.lx').filter({ hasText: olderLine });
+  await lineRow.click();
+  const onBusiness = page
+    .locator('#insp .i-sec')
+    .filter({ has: page.locator('h3', { hasText: 'On this business' }) });
+  assert((await onBusiness.locator('dd').nth(0).innerText()).includes(olderWhy));
+  await onBusiness.getByRole('button', { name: ruleOut, exact: true }).click();
+  await page.locator('#insp #tx-form').waitFor();
+  assert.equal(await page.locator('#insp-title').innerText(), 'Approve the acquisition thesis');
+  assert.equal(await page.locator('#tx-form select[name="state"]').inputValue(), 'not_applicable');
+  await page.locator('#tx-form').getByRole('button', { name: 'Not yet' }).click();
+  // The rule-out the page offers is one the server accepts; then the next older step is next.
+  await moveTo(oldThesis, 'not_applicable', closingReceipt);
+  await page.evaluate(() => refresh());
+  await quiet(page);
+  await src('today');
+  assert.equal(
+    await page.locator('#list .row[data-key^="next:"] .r-t').innerText(),
+    'Rule out Reconcile earnings and working capital: its analysis is out of date',
+  );
+
+  // Start here at three widths and in both themes: nothing wider than the page, every ? a
+  // visible control, and the next stop's action in view.
+  await openBusiness(startBid);
+  for (const scheme of ['light', 'dark']) {
+    await page.emulateMedia({ colorScheme: scheme });
+    for (const [width, height] of [
+      [1440, 1050],
+      [900, 1000],
+      [390, 844],
+    ]) {
+      await page.setViewportSize({ width, height });
+      if (await page.locator('#back-list').isVisible()) await page.locator('#back-list').click();
+      if (await page.locator('#back-src').isVisible()) await page.locator('#back-src').click();
+      await src('start');
+      await page.locator('#list .row[aria-current="true"]').click();
+      await page.locator('#insp .next-box').waitFor();
+      await quiet(page);
+      const at = `${width}px, ${scheme}`;
+      assert.equal(await overflow(page), false, `${at}: horizontal overflow`);
+      assert(await page.locator('#insp .next-box').getByRole('button').isVisible(), at);
+      await page.screenshot({ path: `test-results/start-here-${width}-${scheme}.png` });
+      if (width === 390) await page.locator('#back-list').click();
+      if (await page.locator('#back-src').isVisible()) await page.locator('#back-src').click();
+      const box = await page.getByRole('button', { name: 'What the Setup line is' }).boundingBox();
+      assert(box && box.width >= 20 && box.height >= 20, `${at}: the ? is a visible target`);
+    }
+  }
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.setViewportSize({ width: 1440, height: 1050 });
+
+  // The ? by tap, on a touch phone.
+  const phone = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    isMobile: true,
+  });
+  try {
+    const tapPage = await phone.newPage();
+    await phone.addInitScript((b) => localStorage.setItem('foundry.business', b), startBid);
+    await signIn(tapPage, origin, keyFile);
+    await tapPage.locator('#list .start-head').waitFor();
+    await tapPage.locator('#back-src').tap();
+    const tapHelp = tapPage.getByRole('button', { name: 'What the Finance line is', exact: true });
+    await tapHelp.tap();
+    const tapped = await helpState(tapPage, tapHelp);
+    assert.deepEqual([tapped.expanded, tapped.shown], ['true', true], 'a tap opens');
+    assert(tapped.text.includes('How much cash the business needs and when'), tapped.text);
+    await tapHelp.tap();
+    assert.equal((await helpState(tapPage, tapHelp)).shown, false, 'a second tap closes');
+  } finally {
+    await phone.close();
+  }
+
+  // Access & assistants tells each kind of user what is true for them.
+  await src('access');
+  await page.locator('#list .row[data-key="ai:overview"]').click();
+  const advice = async () =>
+    page
+      .locator('#insp .i-sec')
+      .filter({ has: page.locator('h3', { hasText: 'Optional assistant review' }) })
+      .locator('p.prose')
+      .innerText();
+  const served = await advice();
+  assert(served.includes('in the terminal you start Business Foundry from'), served);
+  assert(!served.includes('on the server'), served);
+  await page.route('**/api/me', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({
+      response,
+      json: { ...body, desktop: { database: '/private/path/foundry.db' } },
+    });
+  });
+  // the page asks again who is signed in and loads the same business, on the same source
+  await page.evaluate(() => start());
+  await quiet(page);
+  await src('access');
+  await page.locator('#list .row[data-key="ai:overview"]').click();
+  const desktop = await advice();
+  assert(
+    desktop.includes(
+      'A desktop app opened from Finder or the Start menu cannot be given a provider key',
+    ),
+    desktop,
+  );
+  assert(desktop.includes('foundry start'), desktop);
+  await page.unroute('**/api/me');
+  // the page asks again who is signed in and loads the same business, on the same source
+  await page.evaluate(() => start());
+  await quiet(page);
+  assert.equal(await page.locator('#business-select').inputValue(), startBid);
+  assert.equal(startName, await page.locator('#business-select option:checked').innerText());
+}
+
 async function main() {
   const temp = mkdtempSync(join(tmpdir(), 'foundry-browser-')),
     db = join(temp, 'foundry.db'),
@@ -438,6 +971,21 @@ async function main() {
     // the checks of what Today does not hold wait until the page has finished loading it
     await quiet(page);
     assert.equal(await page.locator('#list-title').innerText(), 'Today');
+    // The demo's guided path is done, so it opens on Today, which names the one next action that
+    // Start here gives: the first step ready to start. Its only ready step has no prerequisite, so
+    // nothing claims its prerequisites are complete.
+    assert.equal(
+      await page.locator('#src-nav .src[data-src="start"] .n').innerText(),
+      '6 of 6',
+      'the demo has finished its path',
+    );
+    const todayNext = page.locator('#list .row[data-key^="next:"]');
+    assert.equal(await todayNext.count(), 1, 'Today has one next action');
+    assert.equal(
+      await todayNext.locator('.r-t').innerText(),
+      'Start work on Approve the acquisition thesis',
+    );
+    assert.equal(await readyNote(page), null, 'no note on steps that have no prerequisites');
     // Today mixes steps from several lines under shared headings, so each step row names its
     // line in text, matching the source list; the spine's colour is never the only cue.
     const lineNames = await page.evaluate(() =>
@@ -747,8 +1295,17 @@ async function main() {
       .getByText('This workspace contains synthetic demonstration data.', { exact: true })
       .click();
     await submit('Create workspace');
+    // A new business opens on Start here, at the stop to do next.
+    await page.locator('#src-nav .src[data-src="start"][aria-current="true"]').waitFor();
+    assert.equal(await page.locator('#list-title').innerText(), 'Start here');
+    assert.equal(
+      await page.locator('#list .row[aria-current="true"]').getAttribute('data-key'),
+      'stop:2',
+      'Start here opens on the first stop not done',
+    );
     // A new workspace shows every source's empty state; its lists follow the same rule.
     await walkLists(page, 'new workspace');
+    await startHere(page, context, browser, origin, join(temp, 'owner.key'));
     await source('records');
     await page.getByRole('button', { name: '+ Add record', exact: true }).click();
     await page.getByLabel('Title', { exact: true }).fill('Browser customer');
@@ -803,7 +1360,12 @@ async function main() {
     await page.locator('#insp #tx-form').waitFor();
     await page.locator('#insp #tx-form').getByRole('button', { name: 'Not yet' }).click();
     f = await focused(page);
-    assert.deepEqual([f.action, f.to, f.visible], ['tx', 'prepared', true], 'focus after Not yet');
+    // A step nobody has started offers starting it as its main move.
+    assert.deepEqual(
+      [f.action, f.to, f.visible],
+      ['tx', 'in_progress', true],
+      'focus after Not yet',
+    );
     for (const next of ['prepared', 'approved', 'verified']) {
       await rowFor('Establish customer demand').click();
       await page.locator('#insp button[data-action="tx"].primary').click();
@@ -1602,7 +2164,7 @@ async function main() {
     const auditOf = async (id) =>
       (await context.request.get(`${origin}/api/businesses/${id}/audit`)).json();
     await race.goto(origin);
-    await race.locator('#list .today-head').waitFor();
+    await race.locator(OPENED).waitFor();
     await switchTo(demoBid, demoName);
 
     // (a) One business's history never lands in another's inspector.
@@ -1636,7 +2198,7 @@ async function main() {
     // (b) A history requested before a save is not kept as the history after it. A reload
     // starts without a cached history, so opening History has to ask the server.
     await race.reload();
-    await race.locator('#list .today-head').waitFor();
+    await race.locator(OPENED).waitFor();
     await onBusiness(bid, testName);
     const beforeSave = await auditOf(bid);
     await raceSource('records');
@@ -1908,7 +2470,7 @@ async function main() {
     const signInAgain = async () => {
       await race.getByLabel('Access key', { exact: true }).fill(ownerKey());
       await race.getByRole('button', { name: 'Open workspace' }).click();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
     };
     const signOut = async () => {
       await race.locator('.toolbar [data-action="logout"]').click();
@@ -2360,7 +2922,7 @@ async function main() {
         await v.goto(origin);
         await v.getByLabel('Access key', { exact: true }).fill(viewerKey);
         await v.getByRole('button', { name: 'Open workspace' }).click();
-        await v.locator('#list .today-head').waitFor();
+        await v.locator(OPENED).waitFor();
         if ((await v.locator('#business-select').inputValue()) !== bid) {
           await v.locator('#business-select').selectOption(bid);
           await v.locator('#list .th-sub', { hasText: testName }).waitFor();
@@ -2482,7 +3044,7 @@ async function main() {
       const name = 'Browser key revoked over a lost connection';
       const made = await call('/principals', 'POST', { name, role: 'viewer', business_ids: [bid] });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       await raceSource('access');
       await rowIn(name).click();
       await race.locator('#insp').getByRole('button', { name: 'Revoke', exact: true }).click();
@@ -2520,7 +3082,7 @@ async function main() {
         'Connection interrupted. Signing in again is safe.',
       );
       await race.getByRole('button', { name: 'Open workspace' }).click();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
     });
     lateCase('a sign-out refused because the session ended leaves no message', async () => {
       await context.clearCookies();
@@ -2822,7 +3384,7 @@ print(json.dumps({
     // the page on the usage business, after changes made through the API
     const showUsage = async () => {
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       await onBusiness(usageBid, usageName);
     };
     let usageRun = 0;
@@ -2997,7 +3559,7 @@ print(json.dumps({
         });
       });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       await onBusiness(bid, testName);
       await raceSource('evidence');
       assert.match(await evSub(e.id), / · used by 1$/, 'only the approved step counts');
@@ -3026,7 +3588,7 @@ print(json.dumps({
     const newDraft = async () => {
       const doc = await call(`/businesses/${bid}/documents`, 'POST', { template: 'business_plan' });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       await onBusiness(bid, testName);
       return doc;
     };
@@ -3068,7 +3630,7 @@ print(json.dumps({
         related_ids: [doc.id],
       });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       const messages = reasons.map((r) => r.message);
       const pageWords = /made from records|Source records changed|have changed since/;
       const everywhere = async (what) => {
@@ -3116,7 +3678,7 @@ print(json.dumps({
       // today's server: stale, and no reasons
       mode = 'plain';
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       const withoutReasons = await everywhere('without reasons');
       assert.deepEqual(withoutReasons, {
         row: 'Out of date',
@@ -3153,7 +3715,7 @@ print(json.dumps({
     };
     const showBusiness = async (id, name) => {
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       await onBusiness(id, name);
     };
     // a business's records as the server sends them, changed on their way to the page
@@ -3420,7 +3982,7 @@ print(json.dumps({
           );
         });
         await race.reload();
-        await race.locator('#list .today-head').waitFor();
+        await race.locator(OPENED).waitFor();
         await readDraft(doc);
         assert.deepEqual(await viewFlags(), [], 'no reason yet');
         reasons = [reason];
@@ -3443,7 +4005,7 @@ print(json.dumps({
       race.on('pageerror', onError);
       try {
         await race.reload();
-        await race.locator('#list .today-head').waitFor();
+        await race.locator(OPENED).waitFor();
         await onBusiness(bid, testName);
         const shown = {};
         // the page's own notes are neutral flags; the reasons are the others
@@ -3602,7 +4164,7 @@ print(json.dumps({
         field = value;
         withField = on;
         await race.reload();
-        await race.locator('#list .today-head').waitFor();
+        await race.locator(OPENED).waitFor();
         await onBusiness(bid, testName);
         await raceSource('access');
         await race.locator('#list .row[data-key="ai:overview"]').click();
@@ -3790,7 +4352,7 @@ print(json.dumps({
           );
         });
         await race.reload();
-        await race.locator('#list .today-head').waitFor();
+        await race.locator(OPENED).waitFor();
         const held = await saveHeld('Browser record saved while a stale draft is open');
         await readDraft(doc);
         assert.deepEqual(await viewFlags(), [DRAFT_CHANGED]);
@@ -3848,7 +4410,7 @@ print(json.dumps({
         acceptance_evidence_id: receipt.id,
       });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       const held = await saveHeld('Browser record saved while invoice details are open');
       await raceSource('sales');
       await race.locator(`#list .row[data-key="inv:${inv.id}"]`).click();
@@ -3878,7 +4440,7 @@ print(json.dumps({
         if (reasons) d.stale_reasons = reasons;
       });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       const held = await saveHeld('Browser record saved while a draft gains reasons');
       await readDraft(doc);
       assert.deepEqual(await viewFlags(), []);
@@ -3931,9 +4493,9 @@ print(json.dumps({
         await a.goto(origin);
         await a.getByLabel('Access key', { exact: true }).fill(ownerKey());
         await a.getByRole('button', { name: 'Open workspace' }).click();
-        await a.locator('#list .today-head').waitFor();
+        await a.locator(OPENED).waitFor();
         await b.goto(origin);
-        await b.locator('#list .today-head').waitFor();
+        await b.locator(OPENED).waitFor();
         await quiet(a);
         await quiet(b);
         assert.equal(
@@ -3960,7 +4522,7 @@ print(json.dumps({
     const signInAs = async (p, key) => {
       await p.getByLabel('Access key', { exact: true }).fill(key);
       await p.getByRole('button', { name: 'Open workspace' }).click();
-      await p.locator('#list .today-head').waitFor();
+      await p.locator(OPENED).waitFor();
     };
     const keyFormIn = async (p, name) => {
       await p.locator('#src-nav .src[data-src="access"]').click();
@@ -4175,7 +4737,7 @@ print(json.dumps({
           assert.deepEqual(me, { a: 1, b: 0 }, 'the count has settled');
           // and a sign-in: tab B asks as it starts, tab A once when told
           await signInAs(b, ownerKey());
-          await told(a.locator('#list .today-head'), 'tab A did not follow the sign-in in tab B');
+          await told(a.locator(OPENED), 'tab A did not follow the sign-in in tab B');
           await quiet(a);
           await quiet(b);
           await quiet(a);
@@ -4268,7 +4830,7 @@ print(json.dumps({
           const signedIn = await session();
           assert(signedIn, 'the new sign-in has a session cookie');
           // tab B was told, and shows the new sign-in's workspace
-          await told(b.locator('#list .today-head'), 'tab B was not told of the sign-in in tab C');
+          await told(b.locator(OPENED), 'tab B was not told of the sign-in in tab C');
           await held.release();
           assert(held.cancelled(), 'tab B cancelled its sign-out when it was told');
           // compared, never printed
@@ -5176,7 +5738,7 @@ print(json.dumps({
           }
       });
       await race.reload();
-      await race.locator('#list .today-head').waitFor();
+      await race.locator(OPENED).waitFor();
       await onBusiness(bid, testName);
       // the step's view opens and shows its two real entries, newest first
       await showStep(hStep);
@@ -5256,7 +5818,7 @@ print(json.dumps({
             }
         });
         await race.reload();
-        await race.locator('#list .today-head').waitFor();
+        await race.locator(OPENED).waitFor();
         await onBusiness(bid, testName);
         // each evidence item's row and its "Used by" part: the steps, by id, and what each says
         const usedList = () =>
@@ -5356,7 +5918,7 @@ print(json.dumps({
           details: 'Synthetic record for the unchanged-view check.',
         });
         await race.reload();
-        await race.locator('#list .today-head').waitFor();
+        await race.locator(OPENED).waitFor();
         await onBusiness(bid, testName);
         await readDraft(doc);
         assert.deepEqual(await viewFlags(), [SOURCE_CHANGED]);
@@ -5410,7 +5972,7 @@ print(json.dumps({
         await v.goto(origin);
         await v.getByLabel('Access key', { exact: true }).fill(viewerKey);
         await v.getByRole('button', { name: 'Open workspace' }).click();
-        await v.locator('#list .today-head').waitFor();
+        await v.locator(OPENED).waitFor();
         await v.locator('#src-nav .src[data-src="records"]').click();
         await v.locator('#list .row', { hasText: record.title }).click();
         await v.locator('#insp').getByRole('button', { name: 'View', exact: true }).click();
@@ -5526,7 +6088,7 @@ print(json.dumps({
       await quiet(jx);
     };
     const onDemo = async () => {
-      await jx.locator('#list .today-head').waitFor();
+      await jx.locator(OPENED).waitFor();
       if ((await jx.locator('#business-select').inputValue()) !== demoBid) {
         await jx.locator('#business-select').selectOption(demoBid);
         await jx.locator('#list .th-sub', { hasText: demoName }).waitFor();
@@ -6009,7 +6571,7 @@ print(json.dumps({
     };
     await race.route((url) => url.pathname === snapPath, alter);
     await race.reload();
-    await race.locator('#list .today-head').waitFor();
+    await race.locator(OPENED).waitFor();
     const altered = await (await context.request.get(origin + snapPath)).json();
     const [t0, t1] = altered.objects.filter((o) => o.kind === 'task' && !o.data.deal_id);
     const openStep = async (t) => {
@@ -6083,7 +6645,7 @@ print(json.dumps({
       .getByLabel('Access key', { exact: true })
       .fill(readFileSync(join(temp, 'owner.key'), 'utf8').trim());
     await race.getByRole('button', { name: 'Open workspace' }).click();
-    await race.locator('#list .today-head').waitFor();
+    await race.locator(OPENED).waitFor();
     await context.clearCookies();
     await race.locator('#src-nav .src[data-src="history"]').click();
     await race.getByLabel('Access key', { exact: true }).waitFor();
@@ -6114,7 +6676,7 @@ print(json.dumps({
     assert.equal(await page.evaluate(() => Boolean(window.injected)), false);
     assert.deepEqual(errors, []);
     console.log(
-      'Browser checks passed: login, sources, line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition (refused without its three required figures, a refusal caused by an example value naming it in the API’s words, empty loans meaning no loan and the page saying no debt was given, figures left empty not sent and listed as not given, a reopened form filling exactly what each kind of saved analysis gave, every figure read, with assumed figures, the rate and term of a loan it did not have and an earlier analysis’s example values empty, and a loan amount entered alone sending no rate or term, which the page then lists as not given, and a business with its building, a property loan, a deferred seller note and investors: empty figures not sent, the balloon, buyer cash and lender coverage shown, and the form reopened with what was given), after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
+      'Browser checks passed: login, sources, Start here (a new business opening on it and a business whose path is done on Today, a decision ruled out as not applicable finishing its stop and showing Done · Not applicable, Do this next opening its form or the step’s decision form, a line’s ? by keyboard, tap and as a screen reader meets it, why a step waits, the start-up lines explained on an acquisition, Today naming the same next action with the Acquisition line first, an older analysis whose evidence changed offering to rule its steps out in Today’s Do this next, its line’s heading and ?, the lines explained and the step, each opening the decision form at not applicable with its evidence, the note on ready steps true or absent, starting as a step’s main move, the assistant advice for a served and a desktop owner, at three widths in light and dark), line navigation, search, row and list roles, keyboard focus after re-renders and phone pane changes, line colours as computed in light and dark, Journey map (wide, tall, keyboard), workspace creation, records, evidence review and versions, task decisions, four distinct states, forecast, acquisition (refused without its three required figures, a refusal caused by an example value naming it in the API’s words, empty loans meaning no loan and the page saying no debt was given, figures left empty not sent and listed as not given, a reopened form filling exactly what each kind of saved analysis gave, every figure read, with assumed figures, the rate and term of a loan it did not have and an earlier analysis’s example values empty, and a loan amount entered alone sending no rate or term, which the page then lists as not given, and a business with its building, a property loan, a deferred seller note and investors: empty figures not sent, the balloon, buyer cash and lender coverage shown, and the form reopened with what was given), after two jurisdiction changes, the server’s reasons on earlier analyses and replaced steps off the map, out of every count and open read-only, document, invoice, payment, persistence, integrity, evidence withdrawal reopening work, XSS text handling, late responses (another business, a save, overlapping refreshes), saved changes and accepted decisions whose reload fails (out-of-date notice, its reload control, a pending switch let go, the same key on a failed decision), late answers kept to their own session and business (a new access key after sign-out, after a new sign-in or waiting when a 401 ends the session, discarded; a key waiting for an open form, shown once and kept open across a change of business; forms, the decision form and record views of one business closed when another loads, including one that leaves the list; a form sent during a pending switch saving to its own business; saves, decisions and refusals for one business reported by name on another’s page without marking it out of date; the business form sending the version it was filled from), interrupted commands that say what is true (a lost key creation, a closed form, revoke, sign-out and sign-in), a refused sign-out leaving no message, a sign-out answer held past a 401 and a new sign-in leaving the new session signed in, a sign-in changed in another tab (the previous person forgotten and the change followed, a held access key discarded with and without the signal and when someone with the same role signs in, a session ended by the server in one tab ending in the other, a closed form named, no loop, other messages ignored, a held sign-out cancelled by a sign-in elsewhere), two answers to who is signed in in one tab (an earlier answer naming someone else or refusing, arriving after that tab’s own sign-in, before its answer or in order, and an answer for a session the tab ended: only the latest start in its session acts, a closed form still named after a second change, and the sentence dropped by a sign-out of the tab’s own), an owner’s + New business hidden while a tab does not know an owner is signed in, and an owner’s forms opening for no one else, a reviewer and an operator shown none of an owner’s controls and opening none of an owner’s forms, with the record form and step decisions of their role, the check of who is signed in before a new key is shown (shown once, checked again after a dialog opened during it, or a notice that waits its turn), open document and record-data views kept to each reload (a warning gained and lost, scroll and focus kept, closed when the item leaves), evidence used through earlier decisions by the server’s own rule (unreadable histories and replaced steps included), a step’s view whose history holds entries that are not objects, each sentence of that rule told apart by a served history, a new key kept from a second person with the same role and name, a reload that changes nothing leaving an open view’s selection and reasons in place, a viewer’s open record view following a change, a document’s reasons from either server, stale-document reasons from the server (one rule for whether a draft is out of date, the same words in its source, row, inspector, full view, Today and every list that names it, each reason visible and above the draft’s text, plain words when none is listed, and no reason of the page’s own), the reasons on a deal analysis or forecast (one that cannot be read left out, the others in the server’s order and as text, plain words when none can be read), the backup command a desktop owner is shown (the server’s database path and command in the backup panel and the integrity view, the path form when no command is ready, shown as text, and the plain command without the field or with one that cannot be read), focus after Dismiss on a computer and a phone, focus after a dialog closes over a page redrawn behind it (a new key, a key not confirmed, a key that waited behind a form, a form cancelled or saved after a reload, and on a phone), lists that hold only list items on every source at three widths, link schemes, markup-free formatting, sign-out and 401 clearing, phone and medium layout, and the empty first run.',
     );
   } catch (error) {
     console.error(logs.slice(-8).join(''));
