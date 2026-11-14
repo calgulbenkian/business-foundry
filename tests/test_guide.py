@@ -695,8 +695,9 @@ def test_a_second_analysis_moves_the_path_and_the_lines_to_the_newest_deal(setup
     assert step(guide, "Approve the acquisition thesis")["state"] == "pending"
 
 
-def submitted_registration(service, owner, bid):
-    """The demo with one external step submitted and every other unfinished step ruled out."""
+def submitted_registration(service, owner, bid, keep=()):
+    """The demo with one external step submitted and every other unfinished step, but those titled in
+    `keep`, ruled out."""
     receipt = service.add_evidence(
         owner,
         bid,
@@ -717,7 +718,7 @@ def submitted_registration(service, owner, bid):
         for t in service.snapshot(owner, bid)["objects"]:
             if t["kind"] != "task" or not live(t) or t["id"] == registration["id"]:
                 continue
-            if t["state"] in {"verified", "not_applicable"}:
+            if t["state"] in {"verified", "not_applicable"} or t["title"] in keep:
                 continue
             if t["state"] in {"approved", "submitted"}:
                 t = move(service, owner, bid, t, "needs_review")
@@ -727,7 +728,7 @@ def submitted_registration(service, owner, bid):
         for t in service.snapshot(owner, bid)["objects"]
         if t["kind"] == "task" and live(t) and t["state"] not in {"verified", "not_applicable"}
     ]
-    assert left == [registration["id"]]
+    assert sorted(left) == sorted([registration["id"], *(task(service, owner, bid, k)["id"] for k in keep)])
     return registration, receipt
 
 
@@ -803,3 +804,51 @@ def test_a_submitted_step_is_the_next_action_for_whoever_can_add_its_receipt(set
     guide = service.guide(owner, bid)
     assert (guide["next"]["from"], guide["next"]["label"]) == (None, "Nothing is waiting on you")
     assert line(guide, "Setup")["status"] == "done"
+
+
+def test_a_step_ready_to_start_comes_before_a_receipt_that_waits_on_the_outside_body(setup):
+    _, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    registration, _ = submitted_registration(service, owner, bid, keep={"Approve the acquisition thesis"})
+    thesis = task(service, owner, bid, "Approve the acquisition thesis")
+    assert thesis["state"] == "pending"
+    guide = service.guide(owner, bid)
+    assert guide["path"]["complete"]
+    assert guide["ready"] == [thesis["id"]]
+    start = {
+        "do": "transition",
+        "task_id": thesis["id"],
+        "to": "in_progress",
+        "label": "Start work on Approve the acquisition thesis",
+    }
+    verify = {
+        "do": "transition",
+        "task_id": registration["id"],
+        "to": "verified",
+        "label": "Add the receipt for Verify applicable registrations",
+    }
+    # The owner may add the receipt, but it waits on the outside body: the step they can start now is next.
+    assert guide["next"] == {
+        "from": "ready",
+        "stop": None,
+        "task_id": thesis["id"],
+        "action": start,
+        "label": "Start work on Approve the acquisition thesis",
+        "why": None,
+    }
+    assert step(guide, "Verify applicable registrations")["next"] == verify
+    # The receipt is still offered on its own line, which has no step ready to start.
+    lines = {
+        x["category"]: (x["status"], x["focus"]["id"] if x["focus"] else None, x["next"])
+        for x in guide["lines"]
+    }
+    assert lines == {
+        "Market": ("done", None, None),
+        "Finance": ("done", None, None),
+        "Setup": ("waiting", registration["id"], verify),
+        "Rights": ("done", None, None),
+        "Delivery": ("done", None, None),
+        "Sales to cash": ("done", None, None),
+        "Operate": ("done", None, None),
+        "Acquisition": ("ready", thesis["id"], start),
+    }
