@@ -1135,16 +1135,26 @@ function doNext(el) {
 }
 const nextBox = (heading, a, text = '') =>
   `<div class="next-box"><div class="card-h">${ymIcon}<span>${h(heading)}</span></div>${text ? `<p>${h(text)}</p>` : ''}${a ? `<div class="i-actions">${nextButton(a)}</div>` : ''}</div>`;
+/* A decision stop whose step was ruled out is done, and says so with the step state's own label and
+   glyph, so it reads apart from one that was approved. */
 const stopState = (st) =>
   st.done
-    ? 'Done'
+    ? st.ruled_out
+      ? `Done · ${STATES.not_applicable.label}`
+      : 'Done'
     : st.n === state.guide.path.next_stop
       ? st.action
         ? 'Your next step'
         : 'Waiting'
       : 'Not done yet';
 const stopGlyph = (st) =>
-  st.done ? tick : st.n === state.guide.path.next_stop ? ymIcon : g('none');
+  st.done
+    ? st.ruled_out
+      ? g(STATES.not_applicable.g)
+      : tick
+    : st.n === state.guide.path.next_stop
+      ? ymIcon
+      : g('none');
 const plainList = (items) =>
   items.length > 1
     ? `<ul class="plain">${items.map((i) => `<li>${h(i)}</li>`).join('')}</ul>`
@@ -2488,7 +2498,7 @@ function inspStop(st) {
       title: h(st.title),
       glyph: stopGlyph(st),
       stateLabel: stopState(st),
-      next: st.done ? 'it ticked itself off' : '',
+      next: st.ruled_out ? h(st.ruled_out) : st.done ? 'it ticked itself off' : '',
       extra: todo,
     }) +
     sec(

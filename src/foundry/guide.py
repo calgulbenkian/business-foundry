@@ -11,8 +11,11 @@ from __future__ import annotations
 from . import catalog
 from .service import FINISHED, REVIEWERS, WRITERS
 
-# A step whose decision has been made: approved, and anything after it. Used for the path's decision stops.
+# A step whose decision has been made: approved, and anything after it.
 DECIDED = {"approved", "submitted", "verified"}
+# A decision stop is done once its step is decided, or ruled out as not applicable: ruling it out is a
+# reviewed human decision too, and the server counts it as finished.
+DECISION_DONE = DECIDED | {"not_applicable"}
 RECORD_KINDS = {"customer", "offer", "asset", "contract", "obligation", "role", "decision"}
 RECORD_NAMES = {
     "customer": "a customer record",
@@ -122,8 +125,8 @@ def blocker_unlock(item):
 # A step can be ruled out from these states; an approved or submitted step is reopened first.
 RULE_OUT_FROM = {"pending", "in_progress", "prepared", "needs_review"}
 OLDER_WHY = (
-    "This step belongs to an older acquisition analysis whose evidence changed. A newer analysis was "
-    "saved after it, so saving another analysis does not clear it."
+    "This step belongs to an acquisition analysis whose evidence changed. A newer analysis was saved "
+    "after it. Saving another analysis does not clear this step."
 )
 OLDER_UNLOCK = "An owner or reviewer rules it out as not applicable, with reviewed evidence."
 OLDER_REOPEN = "An owner or reviewer reopens it, then rules it out as not applicable, with reviewed evidence."
@@ -134,8 +137,7 @@ OLDER_SAME_DEAL = (
 
 
 def older_analysis(task, items, newest_id):
-    """A step of an analysis a newer one replaced: its evidence changed, and an analysis was saved
-    after it. It keeps the evidence versions it was saved with, so saving another analysis never
+    """A step of an analysis whose evidence changed, with a newer analysis saved after it. It keeps the evidence versions it was saved with, so saving another analysis never
     clears its blocker; ruling it out does. On the newest analysis the same blocker means save a
     fresh analysis."""
     deal_id = task["data"].get("deal_id")
@@ -157,13 +159,13 @@ def older_next(task, actor):
             "do": "transition",
             "task_id": task["id"],
             "to": "not_applicable",
-            "label": f"Rule out {title}: a newer analysis replaced this one",
+            "label": f"Rule out {title}: its analysis is out of date",
         }
     return {
         "do": "transition",
         "task_id": task["id"],
         "to": "needs_review",
-        "label": f"Reopen {title} to rule it out: a newer analysis replaced this one",
+        "label": f"Reopen {title} to rule it out: its analysis is out of date",
     }
 
 
@@ -172,12 +174,12 @@ def older_waiting_on(task, actor):
         return "You can read this step. A person who can write to this business acts on it."
     if task["state"] in RULE_OUT_FROM:
         return (
-            "It waits on an owner or reviewer to rule it out as not applicable: a newer analysis "
-            "replaced this one."
+            "It waits on an owner or reviewer to rule it out as not applicable: its analysis is out of "
+            "date, and a newer analysis was saved after it."
         )
     return (
-        "It waits on an owner or reviewer to reopen it and rule it out as not applicable: a newer "
-        "analysis replaced this one."
+        "It waits on an owner or reviewer to reopen it and rule it out as not applicable: its analysis "
+        "is out of date, and a newer analysis was saved after it."
     )
 
 
@@ -540,17 +542,24 @@ def build_path(route, objects, steps, step_by_key, newest_deal, actor):
         return ({"do": "add_evidence", "label": add_label}, None) if writer(actor) else (None, None)
 
     def decision(task, missing_label):
-        """A stop that is a step's decision: done once the step is approved, verified or later."""
+        """A stop that is a step's decision: done once the step is approved or further along, or ruled
+        out as not applicable. Also says whether it was ruled out, and in what words."""
         if task is None:
             action = {"do": "deal", "label": missing_label} if missing_label and writer(actor) else None
-            return False, [], action, None
+            return False, action, None, None
         step = steps[task["id"]]
-        return task["state"] in DECIDED, [task["id"]], step["next"], step["waiting_on"]
+        done = task["state"] in DECISION_DONE
+        note = (
+            f"{task['title']} was reviewed and ruled out as not applicable."
+            if task["state"] == "not_applicable"
+            else None
+        )
+        return done, step["next"], step["waiting_on"], note
 
     stops = []
     for n, stop in enumerate(spec["stops"], start=1):
         key = stop["key"]
-        action, waiting = None, None
+        action, waiting, ruled_out = None, None, None
         if key == "workspace":
             done = True
         elif key == "evidence":
@@ -569,7 +578,7 @@ def build_path(route, objects, steps, step_by_key, newest_deal, actor):
                     else {"do": "deal", "label": stop["action"]}
                 )
         elif key == "decide":
-            done, _, action, waiting = decision(
+            done, action, waiting, ruled_out = decision(
                 step_by_key("mandate", deal_id) if deal_id else None, "Screen the deal first"
             )
         elif key in {"customer", "offer"}:
@@ -583,7 +592,7 @@ def build_path(route, objects, steps, step_by_key, newest_deal, actor):
                 # An out-of-date forecast's reason says to save a revised forecast; the button says the same.
                 action = {"do": "forecast", "label": "Save a revised forecast" if stale else stop["action"]}
         elif key == "structure":
-            done, _, action, waiting = decision(step_by_key("structure"), None)
+            done, action, waiting, ruled_out = decision(step_by_key("structure"), None)
         else:  # pragma: no cover - every stop in the catalog has a rule above
             raise ValueError(f"No rule for the stop {key}")
         related = [
@@ -603,6 +612,8 @@ def build_path(route, objects, steps, step_by_key, newest_deal, actor):
                 "done_when": stop["done_when"],
                 "line": stop["line"],
                 "done": done,
+                # A decision stop whose step was ruled out: the sentence that says so, or None.
+                "ruled_out": ruled_out,
                 "steps": related,
                 "action": None if done else action,
                 "waiting_on": None if done or action else waiting,

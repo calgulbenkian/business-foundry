@@ -365,7 +365,8 @@ PATHS = {
             },
             {
                 "key": "decide",
-                "done_when": "Done when Approve the acquisition thesis, for the newest analysis, is approved or further along.",
+                "done_when": "Done when Approve the acquisition thesis, for the newest analysis, is approved or "
+                "further along, or ruled out as not applicable.",
                 "title": "Decide whether to keep going",
                 "detail": "Approve the acquisition thesis. It is the first real decision.",
                 "why": "The checks on the books and the contracts cannot be approved until this step "
@@ -433,7 +434,8 @@ PATHS = {
             },
             {
                 "key": "structure",
-                "done_when": "Done when Decide the entity and ownership structure is approved or further along.",
+                "done_when": "Done when Decide the entity and ownership structure is approved or further "
+                "along, or ruled out as not applicable.",
                 "title": "Decide the structure",
                 "detail": "Decide the entity and ownership structure, with a decision record.",
                 "why": "Registrations, tax, banking, permits and the founders' arrangements all wait "

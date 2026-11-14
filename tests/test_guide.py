@@ -965,8 +965,8 @@ DEAL_STEPS = [
     "Review results against the acquisition thesis",
 ]
 OLDER_WHY = (
-    "This step belongs to an older acquisition analysis whose evidence changed. A newer analysis was saved "
-    "after it, so saving another analysis does not clear it."
+    "This step belongs to an acquisition analysis whose evidence changed. A newer analysis was saved after "
+    "it. Saving another analysis does not clear this step."
 )
 RULE_OUT_UNLOCKS = [
     "An owner or reviewer rules it out as not applicable, with reviewed evidence.",
@@ -1054,7 +1054,7 @@ def rule_out(t):
         "do": "transition",
         "task_id": t["id"],
         "to": "not_applicable",
-        "label": f"Rule out {t['title']}: a newer analysis replaced this one",
+        "label": f"Rule out {t['title']}: its analysis is out of date",
     }
 
 
@@ -1169,7 +1169,7 @@ def test_an_older_analysis_whose_evidence_changed_is_ruled_out_not_saved_again(s
             "stop": None,
             "task_id": t["id"],
             "action": rule_out(t),
-            "label": f"Rule out {DEAL_STEPS[n]}: a newer analysis replaced this one",
+            "label": f"Rule out {DEAL_STEPS[n]}: its analysis is out of date",
             "why": OLDER_WHY,
         }, n
         assert acquisition_lines(guide)[0] == (d1["id"], "rule_out", t["id"], rule_out(t)), n
@@ -1224,7 +1224,7 @@ def test_only_an_owner_or_reviewer_is_offered_the_rule_out(setup):
             "stop": None,
             "task_id": thesis1["id"],
             "action": rule_out(thesis1),
-            "label": "Rule out Approve the acquisition thesis: a newer analysis replaced this one",
+            "label": "Rule out Approve the acquisition thesis: its analysis is out of date",
             "why": OLDER_WHY,
         }, role
         explained = by_id(guide, thesis1["id"])
@@ -1245,8 +1245,8 @@ def test_only_an_owner_or_reviewer_is_offered_the_rule_out(setup):
         explained = by_id(guide, thesis1["id"])
         assert (explained["next"], explained["waiting_on"]) == (
             None,
-            "It waits on an owner or reviewer to rule it out as not applicable: a newer analysis replaced "
-            "this one.",
+            "It waits on an owner or reviewer to rule it out as not applicable: its analysis is out of date, "
+            "and a newer analysis was saved after it.",
         ), role
         assert acquisition_lines(guide)[0] == (d1["id"], "rule_out", thesis1["id"], None), role
         # the server agrees: an operator or agent cannot rule a step out
@@ -1289,7 +1289,7 @@ def test_an_approved_step_of_an_older_analysis_is_reopened_then_ruled_out(setup)
         "do": "transition",
         "task_id": thesis1["id"],
         "to": "needs_review",
-        "label": "Reopen Approve the acquisition thesis to rule it out: a newer analysis replaced this one",
+        "label": "Reopen Approve the acquisition thesis to rule it out: its analysis is out of date",
     }
     assert explained["why"] == [OLDER_WHY]
     assert explained["unlocks"] == [
@@ -1299,3 +1299,225 @@ def test_an_approved_step_of_an_older_analysis_is_reopened_then_ruled_out(setup)
     thesis1 = move(service, owner, bid, thesis1, "needs_review")
     assert by_id(service.guide(owner, bid), thesis1["id"])["next"] == rule_out(thesis1)
     move(service, owner, bid, thesis1, "not_applicable", [notes["id"]])
+
+
+STRUCTURE_STOP = {
+    "n": 6,
+    "key": "structure",
+    "title": "Decide the structure",
+    "detail": "Decide the entity and ownership structure, with a decision record.",
+    "why": "Registrations, tax, banking, permits and the founders' arrangements all wait on this decision.",
+    "done_when": "Done when Decide the entity and ownership structure is approved or further along, or ruled "
+    "out as not applicable.",
+    "line": "Setup",
+}
+DECIDE_STOP = {
+    "n": 5,
+    "key": "decide",
+    "title": "Decide whether to keep going",
+    "detail": "Approve the acquisition thesis. It is the first real decision.",
+    "why": "The checks on the books and the contracts cannot be approved until this step is finished: "
+    "verified, or ruled out as not applicable. Decide here before you pay anyone for those checks.",
+    "done_when": "Done when Approve the acquisition thesis, for the newest analysis, is approved or further "
+    "along, or ruled out as not applicable.",
+    "line": "Acquisition",
+}
+
+
+def test_a_structure_decision_ruled_out_finishes_the_start_up_path(setup, client):
+    """The founder already has an entity: the structure decision is ruled out as not applicable, with
+    reviewed evidence. That is a reviewed decision the server counts as finished, so the stop is done,
+    the path is complete and the business opens on Today, and the stop says it was ruled out."""
+    _, service, owner, bid, _ = setup
+    record(service, owner, bid, "customer", "Synthetic buyer")
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Interview notes · synthetic"))
+    record(service, owner, bid, "offer", "Synthetic offer")
+    service.save_forecast(
+        owner,
+        bid,
+        key(),
+        data(
+            models.ForecastCreate, title="Synthetic forecast", inputs=models.ForecastInputs(), evidence_ids=[]
+        ),
+    )
+    structure = task(service, owner, bid, "Decide the entity and ownership structure")
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True, True, True, True, True, False]
+    assert guide["path"]["stops"][5] == STRUCTURE_STOP | {
+        "done": False,
+        "ruled_out": None,
+        "steps": [structure["id"]],
+        "action": {"do": "add_record", "record_kind": "decision", "label": "Add a decision record"},
+        "waiting_on": None,
+    }
+
+    move(service, owner, bid, structure, "not_applicable", [notes["id"]])
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True] * 6
+    assert (guide["path"]["done"], guide["path"]["complete"], guide["path"]["next_stop"]) == (6, True, None)
+    assert guide["path"]["stops"][5] == STRUCTURE_STOP | {
+        "done": True,
+        "ruled_out": "Decide the entity and ownership structure was reviewed and ruled out as not applicable.",
+        "steps": [structure["id"]],
+        "action": None,
+        "waiting_on": None,
+    }
+    # only that stop was decided by a ruling out; the others are done by their records
+    assert [s["ruled_out"] for s in guide["path"]["stops"][:5]] == [None] * 5
+    # the next action is no longer the path's: the stop is not left open
+    assert guide["next"]["from"] != "path" and guide["next"]["stop"] is None
+    # The page opens a business on Start here until its path is complete, and on Today after that: the
+    # business's own read says complete.
+    read = client.get(f"/api/businesses/{bid}").json()["guide"]["path"]
+    assert (read["complete"], read["stops"][5]["done"], read["stops"][5]["ruled_out"]) == (
+        True,
+        True,
+        "Decide the entity and ownership structure was reviewed and ruled out as not applicable.",
+    )
+
+
+def test_an_approved_structure_decision_is_done_and_not_ruled_out(setup):
+    _, service, owner, bid, _ = setup
+    record(service, owner, bid, "decision", "Synthetic structure decision")
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Interview notes · synthetic"))
+    structure = task(service, owner, bid, "Decide the entity and ownership structure")
+    for state in ("prepared", "approved"):
+        structure = move(service, owner, bid, structure, state, [notes["id"]])
+    stop = service.guide(owner, bid)["path"]["stops"][5]
+    assert (stop["done"], stop["ruled_out"]) == (True, None)
+
+
+def test_a_thesis_ruled_out_finishes_the_acquisition_path_and_an_older_one_does_not(setup, client):
+    """The founder decided not to go ahead: the newest analysis's thesis is ruled out as not applicable.
+    A thesis of an older analysis ruled out does not count: the stop follows the newest analysis."""
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    listing = review(service, owner, bid, evidence(service, owner, bid))
+    first = deal(service, owner, bid)
+    second = deal(service, owner, bid)
+    old = deal_steps(service, owner, bid, first["id"])[0]
+    new = deal_steps(service, owner, bid, second["id"])[0]
+
+    # the older analysis's thesis ruled out: the stop still waits on the newest one's
+    move(service, owner, bid, old, "not_applicable", [listing["id"]])
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True, True, True, True, False]
+    assert guide["path"]["stops"][4] == DECIDE_STOP | {
+        "done": False,
+        "ruled_out": None,
+        "steps": [new["id"]],
+        "action": {
+            "do": "transition",
+            "task_id": new["id"],
+            "to": "in_progress",
+            "label": "Start work on Approve the acquisition thesis",
+        },
+        "waiting_on": None,
+    }
+    assert (guide["next"]["from"], guide["next"]["stop"]) == ("path", 5)
+
+    # the newest analysis's thesis ruled out: the stop is done and says how
+    move(service, owner, bid, new, "not_applicable", [listing["id"]])
+    guide = service.guide(owner, bid)
+    assert done(guide) == [True] * 5
+    assert (guide["path"]["done"], guide["path"]["complete"], guide["path"]["next_stop"]) == (5, True, None)
+    assert guide["path"]["stops"][4] == DECIDE_STOP | {
+        "done": True,
+        "ruled_out": "Approve the acquisition thesis was reviewed and ruled out as not applicable.",
+        "steps": [new["id"]],
+        "action": None,
+        "waiting_on": None,
+    }
+    assert [s["ruled_out"] for s in guide["path"]["stops"][:4]] == [None] * 4
+    assert guide["next"]["from"] != "path" and guide["next"]["stop"] is None
+    read = client.get(f"/api/businesses/{bid}").json()["guide"]["path"]
+    assert (read["complete"], read["stops"][4]["done"], read["stops"][4]["ruled_out"]) == (
+        True,
+        True,
+        "Approve the acquisition thesis was reviewed and ruled out as not applicable.",
+    )
+
+    # Reopening the ruled-out thesis takes the stop back: it is not done, and not ruled out.
+    new = deal_steps(service, owner, bid, second["id"])[0]
+    move(service, owner, bid, new, "needs_review")
+    stop = service.guide(owner, bid)["path"]["stops"][4]
+    assert (stop["done"], stop["ruled_out"]) == (False, None)
+
+
+def test_a_submitted_step_of_an_older_analysis_is_reopened_then_ruled_out(setup):
+    """The server refuses submitted to not applicable, so a submitted step of an older analysis whose
+    evidence changed is offered the reopen, and once reopened, the rule-out, which the service accepts."""
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Decision notes · synthetic"))
+    receipt = review(service, owner, bid, external_receipt(service, owner, bid))
+    rule_out_base(service, owner, bid, notes)
+    # Saved citing a listing nobody had reviewed, its closing submitted; then the listing is reviewed,
+    # which changes its version, and a newer analysis is saved. Nothing reopens the closing.
+    listing = evidence(service, owner, bid, "Listing text · synthetic")
+    d1 = deal_citing(service, owner, bid, listing, "Juniper Street Laundry")
+    walk(service, owner, bid, d1["id"], receipt, upto="closing")
+    listing = review(service, owner, bid, listing)
+    deal_citing(service, owner, bid, listing, "Juniper Street Laundry · fresh")
+    closing = deal_steps(service, owner, bid, d1["id"])[4]
+    assert (closing["title"], closing["state"], closing["blockers"]) == (
+        "Verify agreement, funds and closing conditions",
+        "submitted",
+        [DEAL_BLOCKER],
+    )
+    explained = by_id(service.guide(owner, bid), closing["id"])
+    assert explained["next"] == {
+        "do": "transition",
+        "task_id": closing["id"],
+        "to": "needs_review",
+        "label": "Reopen Verify agreement, funds and closing conditions to rule it out: its analysis is out "
+        "of date",
+    }
+    assert explained["why"] == [OLDER_WHY]
+    assert explained["unlocks"] == [
+        "An owner or reviewer reopens it, then rules it out as not applicable, with reviewed evidence.",
+        RULE_OUT_UNLOCKS[1],
+    ]
+    # the server agrees: a submitted step cannot be ruled out directly
+    with pytest.raises(DomainError):
+        move(service, owner, bid, closing, "not_applicable", [notes["id"]])
+    # The offered action, taken through the service, leads to the rule-out, which the service accepts.
+    closing = move(service, owner, bid, closing, explained["next"]["to"])
+    assert closing["state"] == "needs_review"
+    explained = by_id(service.guide(owner, bid), closing["id"])
+    assert explained["next"] == rule_out(closing)
+    closing = move(service, owner, bid, closing, explained["next"]["to"], [notes["id"]])
+    assert closing["state"] == "not_applicable"
+
+
+def test_an_older_analysis_whose_evidence_is_current_keeps_its_normal_work(setup):
+    """Two analyses, neither's evidence changed. The older one's second step waits only on its thesis,
+    another step: it is not offered a rule-out, but its normal work, as on any analysis."""
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    review(service, owner, bid, evidence(service, owner, bid))
+    first = deal(service, owner, bid)
+    deal(service, owner, bid)
+    diligence = deal_steps(service, owner, bid, first["id"])[1]
+    assert (diligence["title"], diligence["state"], diligence["blockers"]) == (
+        "Reconcile earnings and working capital",
+        "pending",
+        ["Complete: Approve the acquisition thesis"],
+    )
+    guide = service.guide(owner, bid)
+    explained = by_id(guide, diligence["id"])
+    assert explained["next"] == {
+        "do": "transition",
+        "task_id": diligence["id"],
+        "to": "in_progress",
+        "label": "Start work on Reconcile earnings and working capital",
+    }
+    assert explained["why"] == [
+        "It cannot be approved until Approve the acquisition thesis is finished. That step is not started."
+    ]
+    assert explained["unlocks"] == [
+        "Finish Approve the acquisition thesis: verify it, or rule it out as not applicable."
+    ]
+    assert explained["waiting_on"] is None
+    # the older analysis's line is ordinary work too, not a rule-out
+    assert acquisition_lines(guide)[0][1] == "ready"
