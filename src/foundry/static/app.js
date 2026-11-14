@@ -3048,8 +3048,11 @@ const dealCoverage = (v) => (v === null || v === undefined ? 'No debt service' :
 /* Whether the seller note is interest only or deferred, so its year-1 payment is not its amortizing one. */
 const dealDeferral = (a) =>
   Boolean(a.seller_note_schedule) && a.seller_note_schedule.schedule !== 'amortizing';
-/* The seller note's payments in plain words, as the investment memo says them (documents.seller_text). */
-function dealSellerText(s) {
+/* The seller note's payments in plain words, as the investment memo says them (documents.seller_text).
+   The interest is never the difference of two amounts already rounded to cents: an interest-only
+   note's is principal × rate from the inputs the analysis used, exact and rounded once to cents, and
+   a deferred note's is the accrued interest the model rounded once. */
+function dealSellerText(s, inputs) {
   const n = s.years,
     last = s.payments[s.payments.length - 1].payment,
     b = s.balloon;
@@ -3058,21 +3061,39 @@ function dealSellerText(s) {
     return `The seller is paid ${money(s.payments[0].payment)} a year for ${yrs}: level monthly payments of principal and interest, with nothing left to pay at the end.`;
   const lent = money(b.principal);
   const interest =
-    s.schedule === 'interest_only' ? decimalMinus(last, b.principal) : b.accrued_interest;
+    s.schedule === 'interest_only'
+      ? decimalTimesCents(inputs.seller_note, inputs.seller_rate)
+      : b.accrued_interest;
   if (n === 1)
     return `The seller is paid once, at the end of year 1: ${money(last)}, the ${lent} lent plus ${money(interest)} of interest.`;
   if (s.schedule === 'interest_only')
     return `The seller is paid ${money(interest)} of interest a year, and in year ${n} the ${lent} lent is due as well: ${money(last)} that year. The year-1 coverage does not include the ${lent}.`;
   return `The seller is paid nothing until year ${n}, when ${money(last)} is due: ${lent} lent plus ${money(interest)} of interest. The year-1 coverage does not include it.`;
 }
-/* a − b for two decimal strings with two places, exactly, in cents. */
-function decimalMinus(a, b) {
-  const cents = (v) => {
-    const [whole, frac = ''] = String(v).split('.');
-    const sign = whole.startsWith('-') ? -1n : 1n;
-    return sign * (BigInt(whole.replace('-', '')) * 100n + BigInt((frac + '00').slice(0, 2)));
+/* a × b for two decimal strings, formed exactly with BigInt and rounded once, half-even, to cents,
+   as the model rounds money (finance.yearly_interest). Neither is ever converted to a binary number. */
+function decimalTimesCents(a, b) {
+  const parse = (v) => {
+    const m = /^\s*([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?\s*$/.exec(String(v ?? ''));
+    if (!m || !(m[2] || m[3])) throw new Error('Not a decimal: ' + v);
+    const digits = BigInt((m[2] || '') + (m[3] || ''));
+    return [m[1] === '-' ? -digits : digits, Number(m[4] || 0) - (m[3] || '').length];
   };
-  const c = cents(a) - cents(b);
+  const [x, xe] = parse(a),
+    [y, ye] = parse(b);
+  // The product is n × 10^shift cents.
+  const n = x * y,
+    shift = xe + ye + 2;
+  let c;
+  if (shift >= 0) c = n * 10n ** BigInt(shift);
+  else {
+    const d = 10n ** BigInt(-shift),
+      abs = n < 0n ? -n : n;
+    let q = abs / d;
+    const twice = 2n * (abs % d);
+    if (twice > d || (twice === d && q % 2n === 1n)) q += 1n;
+    c = n < 0n ? -q : q;
+  }
   const abs = c < 0n ? -c : c;
   return `${c < 0n ? '-' : ''}${abs / 100n}.${String(abs % 100n).padStart(2, '0')}`;
 }
@@ -3109,7 +3130,7 @@ function inspDeal(o) {
   out += `<p class="prose spaced">${h(o.data.inputs.thesis)}</p>`;
   out += sec(
     'Key figures',
-    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div>${v11 ? `<div>Real estate, at its price (not valued)</div><div class="v">${money(su.real_estate_price)}</div><div>Buyer cash at closing</div><div class="v buyer-cash">${money(su.buyer_cash_at_closing)}</div>` : `<div>Buyer equity required</div><div class="v">${money(su.buyer_equity_required)}</div>`}<div>${v11 ? 'Debt service due in year 1' : 'Annual debt service'}</div><div class="v">${noDebt ? 'None' : money(a.annual_debt_service)}</div>${amortizing ? `<div>Debt service if the seller note amortized</div><div class="v">${money(a.amortizing_annual_debt_service)}</div>` : ''}</div>${noDebt ? `<p class="fine no-debt">${NO_DEBT}</p>` : ''}${v11 ? `<p class="fine buyer-cash-text">${h(dealBuyerCashText(su))}</p>` : ''}${a.seller_note_schedule ? `<p class="fine seller-text">${h(dealSellerText(a.seller_note_schedule))}</p>` : ''}<p class="fine">${CALC_NOTE}</p>`,
+    `<div class="figs"><div>Normalized EBITDA</div><div class="v">${money(a.normalized_ebitda)}</div><div>Assumed enterprise value range</div><div class="v">${a.enterprise_value_range ? a.enterprise_value_range.map((v) => money(v)).join(' – ') : 'Not meaningful'}</div>${v11 ? `<div>Real estate, at its price (not valued)</div><div class="v">${money(su.real_estate_price)}</div><div>Buyer cash at closing</div><div class="v buyer-cash">${money(su.buyer_cash_at_closing)}</div>` : `<div>Buyer equity required</div><div class="v">${money(su.buyer_equity_required)}</div>`}<div>${v11 ? 'Debt service due in year 1' : 'Annual debt service'}</div><div class="v">${noDebt ? 'None' : money(a.annual_debt_service)}</div>${amortizing ? `<div>Debt service if the seller note amortized</div><div class="v">${money(a.amortizing_annual_debt_service)}</div>` : ''}</div>${noDebt ? `<p class="fine no-debt">${NO_DEBT}</p>` : ''}${v11 ? `<p class="fine buyer-cash-text">${h(dealBuyerCashText(su))}</p>` : ''}${a.seller_note_schedule ? `<p class="fine seller-text">${h(dealSellerText(a.seller_note_schedule, a.inputs || inputs))}</p>` : ''}<p class="fine">${CALC_NOTE}</p>`,
   );
   out += sec('Inputs not given', `<p class="fine assumed-inputs">${assumedText(o)}</p>`);
   out += sec(
@@ -4670,7 +4691,8 @@ function assumedText(o) {
     inputs = o.data.inputs || {};
   if (!Array.isArray(assumed))
     return "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.";
-  if (!assumed.length) return 'Every input was given. The model used none of its example values.';
+  if (!assumed.length)
+    return 'Every input the calculation used was given. The model used none of its example values.';
   const parts = assumed.map((k) => {
     const f = dealFields.find((x) => x[0] === k);
     const name = f ? f[1].replace(' (years)', '') : String(k);

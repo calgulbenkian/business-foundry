@@ -6,6 +6,7 @@ request gave on main (391b9fb) were calculated by main's own code and written in
 """
 
 import asyncio
+import itertools
 import json
 from fractions import Fraction
 from uuid import uuid4
@@ -626,6 +627,11 @@ def test_the_mcp_tool_and_prompt_name_the_new_inputs(monkeypatch):
         assert name in description, name
     for words in ("real estate", "rent", "investor", "interest only", "deferred"):
         assert words in prompt, words
+    # Buyer cash at closing is floored at zero, and the excess has its own figure.
+    assert (
+        "buyer_cash_at_closing is uses less all debt and investor equity, and never below zero: when debt and "
+        "investor equity bring in more than the uses, it is 0.00 and funding_beyond_uses is the excess."
+    ) in description
 
 
 # 9. A deal saved under acquisition 1.0.1 keeps rendering as it did.
@@ -663,3 +669,147 @@ def test_a_memo_for_a_deal_saved_under_1_0_1_shows_only_the_figures_it_has(setup
         "year 1",
     ):
         assert added not in content, added
+
+
+# 10. What the memo says about amounts that round away. The figures are the model's, unchanged; only the
+# sentences about them are tested here. The seller notes are tiny so that a sub-cent amount decides the words.
+
+TINY = SELLER | {"senior_debt": "0"}
+
+
+def stored(service, actor, bid, deal_id):
+    return next(o for o in service.snapshot(actor, bid)["objects"] if o["id"] == deal_id)
+
+
+def test_a_payment_below_half_a_cent_is_still_due_in_year_one(client, setup):
+    _, service, actor, bid, _ = setup
+    body = TINY | {"seller_note": "0.001", "seller_rate": "0", "seller_years": 1}
+    # 0.001 at zero interest over 1 year: 0.001 is due in year 1, which shows as 0.00. Cash available is
+    # EBITDA (no tax, capex or interest), so the base coverage is 200,000 / 0.001 = 200,000,000.
+    result = deal(**body)
+    assert result["annual_debt_service"] == "0.00"
+    assert column(result, "coverage_ratio") == {
+        "base": "200000000.0000",
+        "downside": "100000000.0000",
+        "upside": "250000000.0000",
+    }
+    saved = post(client, bid, body).json()
+    before = stored(service, actor, bid, saved["id"])
+    content = memo(client, bid, saved["id"])
+    assert "Debt service due in year 1, the year screened: 0.00 USD." in content
+    assert "Nothing is due" not in content
+    assert "no year-1 coverage ratio" not in content
+    assert stored(service, actor, bid, saved["id"]) == before
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A deferred note over 5 years is due nothing in year 1.
+        TINY | {"seller_schedule": "deferred"},
+        # An interest-only note at zero interest over 3 years is due nothing in year 1.
+        TINY | {"seller_schedule": "interest_only", "seller_rate": "0", "seller_years": 3},
+        # The same note of only 0.001.
+        TINY | {"seller_schedule": "deferred", "seller_note": "0.001"},
+    ],
+    ids=["deferred", "interest_only_at_zero", "tiny_deferred"],
+)
+def test_a_note_with_nothing_due_in_year_one_says_so(client, setup, body):
+    _, _, _, bid, _ = setup
+    assert column(deal(**body), "coverage_ratio") == {"base": None, "downside": None, "upside": None}
+    saved = post(client, bid, body).json()
+    assert (
+        "Debt service due in year 1, the year screened: 0.00 USD. Nothing is due on any loan in year 1, "
+        "so there is no year-1 coverage ratio."
+    ) in memo(client, bid, saved["id"])
+
+
+def test_nothing_due_in_year_one_is_said_exactly_when_the_model_gives_no_coverage():
+    """The memo's words agree with the model's own test on the exact debt service, for every kind of loan,
+    with amounts above and below half a cent."""
+    from foundry.documents import nothing_due_in_year_one
+
+    loans = itertools.product(
+        ("0", "0.001"),
+        ("0", "0.001"),
+        ("0", "0.001", "1000"),
+        ("0", "0.05"),
+        (1, 3),
+        ("amortizing", "interest_only", "deferred"),
+    )
+    for senior, building, note, rate, years, schedule in loans:
+        result = deal(
+            **(
+                SELLER
+                | {
+                    "senior_debt": senior,
+                    "property_debt": building,
+                    "seller_note": note,
+                    "seller_rate": rate,
+                    "seller_years": years,
+                    "seller_schedule": schedule,
+                }
+            )
+        )
+        no_coverage = result["scenarios"]["base"]["coverage_ratio"] is None
+        assert nothing_due_in_year_one(result["inputs"]) == no_coverage, result["inputs"]
+
+
+@pytest.mark.parametrize(
+    "body, schedule, sentence",
+    [
+        # Interest only, one year: 1.005 + 1.005 × 0.01 = 1.01505 is due, shown as 1.02; the principal
+        # 1.005 shows as 1.00 (half-even); the interest 0.01005 shows as 0.01. The rounded amounts
+        # 1.02 − 1.00 would say 0.02.
+        (
+            {"seller_schedule": "interest_only", "seller_years": 1},
+            {
+                "schedule": "interest_only",
+                "years": 1,
+                "payments": [{"year": 1, "payment": "1.02"}],
+                "balloon": {"year": 1, "amount": "1.00", "principal": "1.00", "accrued_interest": "0.00"},
+            },
+            "The seller is paid once, at the end of year 1: 1.02 USD, the 1.00 lent plus 0.01 of interest.",
+        ),
+        # Interest only, three years: 0.01005 a year, shown as 0.01; in year 3, 1.01505, shown as 1.02.
+        # The rounded amounts 1.02 − 1.00 would say 0.02 a year.
+        (
+            {"seller_schedule": "interest_only", "seller_years": 3},
+            {
+                "schedule": "interest_only",
+                "years": 3,
+                "payments": [
+                    {"year": 1, "payment": "0.01"},
+                    {"year": 2, "payment": "0.01"},
+                    {"year": 3, "payment": "1.02"},
+                ],
+                "balloon": {"year": 3, "amount": "1.00", "principal": "1.00", "accrued_interest": "0.00"},
+            },
+            "The seller is paid 0.01 USD of interest a year, and in year 3 the 1.00 lent is due as well: "
+            "1.02 that year. The year-1 coverage does not include the 1.00.",
+        ),
+        # Deferred, two years: 1.005 × 1.01² = 1.005 × 1.0201 = 1.0252005, shown as 1.03; the accrued
+        # interest 0.0202005 shows as 0.02. The rounded amounts 1.03 − 1.00 would say 0.03.
+        (
+            {"seller_schedule": "deferred", "seller_years": 2},
+            {
+                "schedule": "deferred",
+                "years": 2,
+                "payments": [{"year": 1, "payment": "0.00"}, {"year": 2, "payment": "1.03"}],
+                "balloon": {"year": 2, "amount": "1.03", "principal": "1.00", "accrued_interest": "0.02"},
+            },
+            "The seller is paid nothing until year 2, when 1.03 USD is due: 1.00 lent plus 0.02 of interest. "
+            "The year-1 coverage does not include it.",
+        ),
+    ],
+    ids=["interest_only_one_year", "interest_only_three_years", "deferred_two_years"],
+)
+def test_the_interest_is_rounded_once_not_taken_from_rounded_amounts(client, setup, body, schedule, sentence):
+    _, service, actor, bid, _ = setup
+    body = TINY | {"seller_note": "1.005", "seller_rate": "0.01"} | body
+    saved = post(client, bid, body).json()
+    # The stored figures are the model's, as they were before the memo's wording changed.
+    assert saved["data"]["analysis"]["seller_note_schedule"] == schedule
+    before = stored(service, actor, bid, saved["id"])
+    assert sentence in memo(client, bid, saved["id"])
+    assert stored(service, actor, bid, saved["id"]) == before
