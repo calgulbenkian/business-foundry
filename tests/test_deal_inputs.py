@@ -375,8 +375,27 @@ def test_the_memo_lists_the_assumed_inputs_with_their_values(client, setup):
     )
     full = post(client, bid, SENT).json()
     assert inputs_section(memo(client, bid, full["id"])) == (
-        "Every input was given. The model used none of its example values."
+        "Every input the calculation used was given. The model used none of its example values."
     )
+
+
+def test_an_empty_list_claims_only_the_inputs_the_calculation_used(client, setup):
+    """With every loan at zero and their rates, terms and schedule left out, nothing assumed entered a
+    figure, so the list is empty. Those inputs were not given, so the memo does not say every input was."""
+    _, _, _, bid, _ = setup
+    terms = ("debt_rate", "debt_years", "property_rate", "property_years", "seller_rate", "seller_years")
+    body = without(SENT, *terms, "seller_schedule") | {
+        "senior_debt": "0",
+        "property_debt": "0",
+        "seller_note": "0",
+    }
+    saved = post(client, bid, body).json()
+    assert saved["data"]["assumed_inputs"] == []
+    content = memo(client, bid, saved["id"])
+    assert inputs_section(content) == (
+        "Every input the calculation used was given. The model used none of its example values."
+    )
+    assert "Every input was given." not in content
 
 
 # 3. Deals stored before this change still load.

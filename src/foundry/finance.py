@@ -413,6 +413,15 @@ def _seller_payments(a: DealInputs) -> list[Decimal | tuple[Decimal, Decimal]]:
     return [ZERO] * (n - 1) + [_mul(principal, _growth(rate, n))]
 
 
+def yearly_interest(principal: Decimal, rate: Decimal) -> str:
+    """An interest-only seller note's yearly interest in cents: principal × rate, exact, rounded once.
+
+    It is the product _seller_payments forms for each year of the note, so it equals the year-1 payment of a
+    note over more than one year. The memo and the page show it as the interest; it enters no figure.
+    """
+    return money(_mul(principal, rate))
+
+
 def _deal_values(a: DealInputs, verified_evidence: set[str]) -> dict:
     """The exact value of every acquisition figure and of each step that forms it (docs/FINANCE.md).
 

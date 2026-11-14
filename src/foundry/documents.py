@@ -5,7 +5,7 @@ import string
 import unicodedata
 from decimal import Decimal
 
-from foundry.finance import period_rollups
+from foundry.finance import period_rollups, yearly_interest
 
 TITLES = {
     "business_plan": "Business plan",
@@ -330,14 +330,15 @@ ASSUMED_NOT_RECORDED = (
     "Not recorded. This analysis was saved before Foundry recorded which inputs were given, "
     "so any of its figures may be the model's example values. Check each one."
 )
-NONE_ASSUMED = "Every input was given. The model used none of its example values."
+NONE_ASSUMED = "Every input the calculation used was given. The model used none of its example values."
 
 
 def assumed_text(deal) -> str:
     """One plain sentence naming each input the caller did not give, with the example value used.
 
     A deal saved before the list was recorded has no assumed_inputs: that is "not recorded", never
-    "none assumed".
+    "none assumed". An empty list says only that every input the calculation used was given: the rate and
+    term of a loan of zero enter no figure, so they are never listed, whether given or not.
     """
     assumed, inputs = deal["data"].get("assumed_inputs"), deal["data"]["inputs"]
     if not isinstance(assumed, list):
@@ -363,6 +364,30 @@ def has_debt(inputs) -> bool:
     return any(Decimal(str(inputs.get(k, 0))) for k in ("senior_debt", "property_debt", "seller_note"))
 
 
+def nothing_due_in_year_one(inputs) -> bool:
+    """Whether no loan has a payment due in year 1, decided from the loans as given, never from the debt
+    service rounded to cents: a payment below half a cent is still a payment, and the analysis gives it a
+    coverage ratio.
+
+    A senior or property loan above zero is due its level payment every year, and so is an amortizing seller
+    note. An interest-only or deferred seller note over one year is due whole at the end of year 1. Over more
+    years, a deferred note is due nothing in year 1 and an interest-only one its interest, principal × rate,
+    which is zero only at a zero rate.
+    """
+
+    def amount(key):
+        return Decimal(str(inputs.get(key, 0)))
+
+    if amount("senior_debt") or amount("property_debt"):
+        return False
+    if not amount("seller_note"):
+        return True
+    schedule = inputs.get("seller_schedule", "amortizing")
+    if schedule == "amortizing" or int(inputs["seller_years"]) == 1:
+        return False
+    return schedule == "deferred" or not amount("seller_rate")
+
+
 def debt_text(deal, currency) -> str:
     """The annual debt service, or, for a deal with no loan, that it has none.
 
@@ -377,7 +402,7 @@ def debt_text(deal, currency) -> str:
     if "debt_service_year" not in a:
         return f"Annual debt service: {fmt_money(a['annual_debt_service'])} {currency}."
     text = f"Debt service due in year 1, the year screened: {fmt_money(a['annual_debt_service'])} {currency}."
-    if not Decimal(a["annual_debt_service"]):
+    if nothing_due_in_year_one(inputs):
         text += " Nothing is due on any loan in year 1, so there is no year-1 coverage ratio."
     if deferral(a):
         text += (
@@ -399,7 +424,13 @@ def years(n: int) -> str:
 
 
 def seller_text(analysis, currency) -> str:
-    """The seller note's payments in plain words, from acquisition 1.1.0; empty without a seller note."""
+    """The seller note's payments in plain words, from acquisition 1.1.0; empty without a seller note.
+
+    The interest is never the difference of two amounts already rounded to cents. An interest-only note's
+    yearly interest is principal × rate from the inputs the analysis used, exact and rounded once to cents, as
+    the model forms that year's payment. A deferred note's interest is the balloon's accrued_interest, which
+    the model rounds once from the exact balloon less the principal.
+    """
     schedule = analysis.get("seller_note_schedule")
     if not schedule:
         return ""
@@ -411,7 +442,8 @@ def seller_text(analysis, currency) -> str:
         )
     lent, due = fmt_money(balloon["principal"]), fmt_money(payments[-1]["payment"])
     if schedule["schedule"] == "interest_only":
-        interest = fmt_money(Decimal(payments[-1]["payment"]) - Decimal(balloon["principal"]))
+        inputs = analysis["inputs"]
+        interest = fmt_money(yearly_interest(Decimal(inputs["seller_note"]), Decimal(inputs["seller_rate"])))
         if n == 1:
             return (
                 f"The seller is paid once, at the end of year 1: {due} {currency}, the {lent} lent plus "
