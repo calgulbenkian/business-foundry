@@ -119,6 +119,68 @@ def blocker_unlock(item):
     return "Save a fresh acquisition analysis from the current evidence."
 
 
+# A step can be ruled out from these states; an approved or submitted step is reopened first.
+RULE_OUT_FROM = {"pending", "in_progress", "prepared", "needs_review"}
+OLDER_WHY = (
+    "This step belongs to an older acquisition analysis whose evidence changed. A newer analysis was "
+    "saved after it, so saving another analysis does not clear it."
+)
+OLDER_UNLOCK = "An owner or reviewer rules it out as not applicable, with reviewed evidence."
+OLDER_REOPEN = "An owner or reviewer reopens it, then rules it out as not applicable, with reviewed evidence."
+OLDER_SAME_DEAL = (
+    "If you still want this deal, a fresh analysis of it is a new analysis with its own steps; these "
+    "still need ruling out."
+)
+
+
+def older_analysis(task, items, newest_id):
+    """A step of an analysis a newer one replaced: its evidence changed, and an analysis was saved
+    after it. It keeps the evidence versions it was saved with, so saving another analysis never
+    clears its blocker; ruling it out does. On the newest analysis the same blocker means save a
+    fresh analysis."""
+    deal_id = task["data"].get("deal_id")
+    return (
+        bool(deal_id)
+        and deal_id != newest_id
+        and task["state"] not in FINISHED
+        and any(i["code"] == "deal_evidence" for i in items)
+    )
+
+
+def older_next(task, actor):
+    """The rule-out, for an owner or reviewer: the server requires a reviewer for not applicable."""
+    if not reviewer(actor):
+        return None
+    title = task["title"]
+    if task["state"] in RULE_OUT_FROM:
+        return {
+            "do": "transition",
+            "task_id": task["id"],
+            "to": "not_applicable",
+            "label": f"Rule out {title}: a newer analysis replaced this one",
+        }
+    return {
+        "do": "transition",
+        "task_id": task["id"],
+        "to": "needs_review",
+        "label": f"Reopen {title} to rule it out: a newer analysis replaced this one",
+    }
+
+
+def older_waiting_on(task, actor):
+    if not writer(actor):
+        return "You can read this step. A person who can write to this business acts on it."
+    if task["state"] in RULE_OUT_FROM:
+        return (
+            "It waits on an owner or reviewer to rule it out as not applicable: a newer analysis "
+            "replaced this one."
+        )
+    return (
+        "It waits on an owner or reviewer to reopen it and rule it out as not applicable: a newer "
+        "analysis replaced this one."
+    )
+
+
 def reopen_note(task):
     history = task["data"].get("history")
     if isinstance(history, list):
@@ -212,11 +274,29 @@ def step_next(task, items, actor):
 def receipt_why(task, items):
     """Why a submitted step is the next action: it is with the outside body until their receipt arrives."""
     why = f"{task['title']} is with the outside body: add their receipt when it arrives."
-    # A prerequisite reopened after it was submitted: the action is to finish that first, and it says so.
+    # A step or record blocker reopens a submitted step, so the one it can still have is its analysis's:
+    # evidence the analysis cited was reviewed or changed after the step was submitted. On a start-up
+    # business no stop asks for an analysis, so this receipt can be the next action, and it says what
+    # holds it. On an older analysis the step is ruled out instead, and is never a receipt.
     return " ".join([why, blocker_why(items[0])]) if items else why
 
 
-def explain_step(task, items, actor):
+def explain_step(task, items, actor, newest_id):
+    if older_analysis(task, items, newest_id):
+        why = [OLDER_WHY]
+        if task["state"] == "needs_review":
+            why.append(state_why(task))
+        unlock = OLDER_UNLOCK if task["state"] in RULE_OUT_FROM else OLDER_REOPEN
+        action = older_next(task, actor)
+        return step_record(
+            task,
+            items,
+            actor,
+            why,
+            [unlock, OLDER_SAME_DEAL],
+            action,
+            None if action else older_waiting_on(task, actor),
+        )
     why = [blocker_why(i) for i in items]
     unlocks = [blocker_unlock(i) for i in items]
     if task["state"] not in FINISHED:
@@ -225,6 +305,11 @@ def explain_step(task, items, actor):
         if (u := state_unlock(task)) is not None:
             unlocks.append(u)
     action = step_next(task, items, actor)
+    waiting = None if action or task["state"] in FINISHED else waiting_on(task, actor)
+    return step_record(task, items, actor, why, unlocks, action, waiting)
+
+
+def step_record(task, items, actor, why, unlocks, action, waiting):
     return {
         "id": task["id"],
         "key": task["data"].get("key"),
@@ -238,7 +323,7 @@ def explain_step(task, items, actor):
         "why": why,
         "unlocks": unlocks,
         "next": action,
-        "waiting_on": None if action or task["state"] in FINISHED else waiting_on(task, actor),
+        "waiting_on": waiting,
     }
 
 
@@ -262,9 +347,11 @@ def build_guide(snapshot, items, actor):
     tasks = [o for o in objects if o["kind"] == "task" and o["id"] in items]
     lines = ordered_lines(tasks)
     tasks = [t for line in lines for t in line["tasks"]]
-    steps = {t["id"]: explain_step(t, items[t["id"]], actor) for t in tasks}
     deals = [o for o in objects if o["kind"] == "deal"]
     newest_deal = deals[-1] if deals else None
+    newest_id = newest_deal["id"] if newest_deal else None
+    steps = {t["id"]: explain_step(t, items[t["id"]], actor, newest_id) for t in tasks}
+    older = {t["id"] for t in tasks if older_analysis(t, items[t["id"]], newest_id)}
 
     def step_by_key(key, deal_id=None):
         return next(
@@ -286,9 +373,16 @@ def build_guide(snapshot, items, actor):
     ready = [t for t in ready if t["data"].get("category") == first_line] + [
         t for t in ready if t["data"].get("category") != first_line
     ]
+    # Today lists a step of an older analysis whose evidence changed with the rest, but it is not current
+    # work: it is ruled out once every current step waiting on you or ready to start is taken. It can be
+    # ruled out now, so it comes before a receipt, which waits on the outside body.
+    current = [t for t in mine if t["id"] not in older]
+    rule_out = [t for t in tasks if t["id"] in older and steps[t["id"]]["next"]]
     # A submitted step waits on the outside body, so Today does not count it as waiting on you. Once its
     # receipt arrives an owner or reviewer adds it, so it comes last: every other action can be taken now.
-    receipts = [t for t in tasks if t["state"] == "submitted" and steps[t["id"]]["next"]]
+    receipts = [
+        t for t in tasks if t["state"] == "submitted" and t["id"] not in older and steps[t["id"]]["next"]
+    ]
 
     def stop_on(line):
         stop = first_open
@@ -300,16 +394,21 @@ def build_guide(snapshot, items, actor):
     for line in lines:
         ids = {t["id"] for t in line["tasks"]}
         stop = stop_on(line)
-        yours = next((t for t in mine if t["id"] in ids), None)
+        yours = next((t for t in current if t["id"] in ids), None)
         start = next((t for t in ready if t["id"] in ids), None)
         receipt = next((t for t in receipts if t["id"] in ids), None)
         open_tasks = [t for t in line["tasks"] if t["state"] not in FINISHED]
+        # An older analysis's line: every open step on it is to be ruled out. For someone who cannot,
+        # it is still that, with no action, and its first open step says who it waits on.
+        outdated = [t for t in open_tasks if t["id"] in older]
         if stop:
             status, action, focus = "your_move", stop["action"], None
         elif yours:
             status, action, focus = "your_move", steps[yours["id"]]["next"], yours
         elif start:
             status, action, focus = "ready", steps[start["id"]]["next"], start
+        elif outdated:
+            status, action, focus = "rule_out", steps[outdated[0]["id"]]["next"], outdated[0]
         elif receipt:
             status, action, focus = "waiting", steps[receipt["id"]]["next"], receipt
         else:
@@ -358,16 +457,20 @@ def build_guide(snapshot, items, actor):
             )
 
     # The one next action for this person: the first stop of the path not done, if it is theirs to
-    # take; then the first step waiting on them, in Today's order; then the first step ready to start;
-    # then the first submitted step whose receipt they can add when it arrives.
+    # take; then the first current step waiting on them, in Today's order; then the first step ready to
+    # start; then the first step of an older analysis to rule out; then the first submitted step whose
+    # receipt they can add when it arrives.
     if first_open and first_open["action"]:
         nxt = {"from": "path", "stop": first_open["n"], "task_id": None, "action": first_open["action"]}
-    elif mine:
-        t = mine[0]
+    elif current:
+        t = current[0]
         nxt = {"from": "waiting_on_you", "stop": None, "task_id": t["id"], "action": steps[t["id"]]["next"]}
     elif ready and writer(actor):
         t = ready[0]
         nxt = {"from": "ready", "stop": None, "task_id": t["id"], "action": steps[t["id"]]["next"]}
+    elif rule_out:
+        t = rule_out[0]
+        nxt = {"from": "rule_out", "stop": None, "task_id": t["id"], "action": steps[t["id"]]["next"]}
     elif receipts:
         t = receipts[0]
         nxt = {"from": "receipt", "stop": None, "task_id": t["id"], "action": steps[t["id"]]["next"]}
@@ -375,7 +478,12 @@ def build_guide(snapshot, items, actor):
         nxt = {"from": None, "stop": None, "task_id": None, "action": None}
     if nxt["action"]:
         nxt["label"] = nxt["action"]["label"]
-        nxt["why"] = receipt_why(receipts[0], items[receipts[0]["id"]]) if nxt["from"] == "receipt" else None
+        if nxt["from"] == "receipt":
+            nxt["why"] = receipt_why(receipts[0], items[receipts[0]["id"]])
+        elif nxt["from"] == "rule_out":
+            nxt["why"] = OLDER_WHY
+        else:
+            nxt["why"] = None
     elif not writer(actor):
         nxt["label"] = "Nothing here is yours to do"
         nxt["why"] = "You can read this business. A person who can write to it takes each next step."

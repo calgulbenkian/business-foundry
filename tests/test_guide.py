@@ -13,6 +13,7 @@ from foundry import catalog, models
 from foundry.api import create_app
 from foundry.demo import seed
 from foundry.service import live
+from foundry.store import DomainError
 
 ACQUISITION_LINES = [
     "Acquisition",
@@ -698,6 +699,13 @@ def test_a_second_analysis_moves_the_path_and_the_lines_to_the_newest_deal(setup
 def submitted_registration(service, owner, bid, keep=()):
     """The demo with one external step submitted and every other unfinished step, but those titled in
     `keep`, ruled out."""
+    (registration,), receipt = submitted_steps(service, owner, bid, ["Verify applicable registrations"], keep)
+    return registration, receipt
+
+
+def submitted_steps(service, owner, bid, titles, keep=()):
+    """The demo with the external steps titled in `titles` submitted, in that order, and every other
+    unfinished step, but those titled in `keep`, ruled out."""
     receipt = service.add_evidence(
         owner,
         bid,
@@ -710,13 +718,17 @@ def submitted_registration(service, owner, bid, keep=()):
         ),
     )
     receipt = review(service, owner, bid, receipt)
-    registration = task(service, owner, bid, "Verify applicable registrations")
-    for state in ("needs_review", "prepared", "approved", "submitted"):
-        registration = move(service, owner, bid, registration, state, [receipt["id"]])
-    # Reopening the registration reopens the steps that relied on it; rule out every step left.
+    submitted = []
+    for title in titles:
+        item = task(service, owner, bid, title)
+        for state in ("needs_review", "prepared", "approved", "submitted"):
+            item = move(service, owner, bid, item, state, [receipt["id"]])
+        submitted.append(item)
+    ids = {t["id"] for t in submitted}
+    # Reopening a submitted step reopens the steps that relied on it; rule out every step left.
     for _ in range(3):
         for t in service.snapshot(owner, bid)["objects"]:
-            if t["kind"] != "task" or not live(t) or t["id"] == registration["id"]:
+            if t["kind"] != "task" or not live(t) or t["id"] in ids:
                 continue
             if t["state"] in {"verified", "not_applicable"} or t["title"] in keep:
                 continue
@@ -728,8 +740,9 @@ def submitted_registration(service, owner, bid, keep=()):
         for t in service.snapshot(owner, bid)["objects"]
         if t["kind"] == "task" and live(t) and t["state"] not in {"verified", "not_applicable"}
     ]
-    assert sorted(left) == sorted([registration["id"], *(task(service, owner, bid, k)["id"] for k in keep)])
-    return registration, receipt
+    assert sorted(left) == sorted([*ids, *(task(service, owner, bid, k)["id"] for k in keep)])
+    assert [t["state"] for t in submitted] == ["submitted"] * len(titles)
+    return submitted, receipt
 
 
 def test_a_submitted_step_is_the_next_action_for_whoever_can_add_its_receipt(setup):
@@ -852,3 +865,437 @@ def test_a_step_ready_to_start_comes_before_a_receipt_that_waits_on_the_outside_
         "Operate": ("done", None, None),
         "Acquisition": ("ready", thesis["id"], start),
     }
+
+
+def test_each_line_gives_its_own_receipt_and_the_first_in_line_order_is_next(setup):
+    _, service, owner, _, _ = setup
+    bid = seed(service, owner)["id"]
+    # Submitted in this order; Finance comes before Setup on the page, so its receipt is first.
+    (registration, banking), _ = submitted_steps(
+        service, owner, bid, ["Verify applicable registrations", "Establish banking and payment access"]
+    )
+    guide = service.guide(owner, bid)
+    assert guide["path"]["complete"]
+    bank = {
+        "do": "transition",
+        "task_id": banking["id"],
+        "to": "verified",
+        "label": "Add the receipt for Establish banking and payment access",
+    }
+    register = {
+        "do": "transition",
+        "task_id": registration["id"],
+        "to": "verified",
+        "label": "Add the receipt for Verify applicable registrations",
+    }
+    assert guide["next"] == {
+        "from": "receipt",
+        "stop": None,
+        "task_id": banking["id"],
+        "action": bank,
+        "label": "Add the receipt for Establish banking and payment access",
+        "why": "Establish banking and payment access is with the outside body: add their receipt when it "
+        "arrives.",
+    }
+    lines = {
+        x["category"]: (x["status"], x["focus"]["id"] if x["focus"] else None, x["next"])
+        for x in guide["lines"]
+    }
+    assert lines["Finance"] == ("waiting", banking["id"], bank)
+    assert lines["Setup"] == ("waiting", registration["id"], register)
+
+
+def test_a_receipt_whose_analysis_evidence_changed_says_what_holds_it(setup):
+    """A submitted step can have a blocker: an analysis saved citing evidence nobody had reviewed yet,
+    its closing submitted, then that evidence reviewed. Reviewing changes the evidence's version, so the
+    analysis is out of date and verifying the closing is blocked. On a start-up business no stop of the
+    path asks for an analysis, so the closing's receipt is the next action, and it says what holds it."""
+    _, service, owner, bid, _ = setup
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Interview notes · synthetic"))
+    receipt = review(service, owner, bid, external_receipt(service, owner, bid))
+    for kind, title in (
+        ("customer", "Synthetic buyer"),
+        ("offer", "Synthetic offer"),
+        ("decision", "Synthetic structure decision"),
+    ):
+        record(service, owner, bid, kind, title)
+    service.save_forecast(
+        owner,
+        bid,
+        key(),
+        data(
+            models.ForecastCreate, title="Synthetic forecast", inputs=models.ForecastInputs(), evidence_ids=[]
+        ),
+    )
+    structure = task(service, owner, bid, "Decide the entity and ownership structure")
+    for state in ("prepared", "approved", "verified"):
+        structure = move(service, owner, bid, structure, state, [notes["id"]])
+    rule_out_base(service, owner, bid, notes)
+    listing = evidence(service, owner, bid, "Seller's listing · synthetic")
+    analysis = deal_citing(service, owner, bid, listing, "Corner bakery")
+    walk(service, owner, bid, analysis["id"], receipt, upto="closing")
+    closing = task(service, owner, bid, "Verify agreement, funds and closing conditions")
+    assert (closing["state"], closing["blockers"]) == ("submitted", [])
+    review(service, owner, bid, listing)
+    closing = task(service, owner, bid, "Verify agreement, funds and closing conditions")
+    assert (closing["state"], closing["blockers"]) == ("submitted", [DEAL_BLOCKER])
+    guide = service.guide(owner, bid)
+    assert guide["path"]["complete"]
+    fresh = {"do": "deal", "deal_id": analysis["id"], "label": "Save a fresh acquisition analysis"}
+    assert guide["next"] == {
+        "from": "receipt",
+        "stop": None,
+        "task_id": closing["id"],
+        "action": fresh,
+        "label": "Save a fresh acquisition analysis",
+        "why": "Verify agreement, funds and closing conditions is with the outside body: add their receipt "
+        "when it arrives. It cannot be approved until there is a fresh acquisition analysis: the evidence "
+        "behind the saved one changed.",
+    }
+
+
+DEAL_BLOCKER = "Supporting deal evidence changed; create and review a fresh analysis"
+DEAL_STEPS = [
+    "Approve the acquisition thesis",
+    "Reconcile earnings and working capital",
+    "Review liabilities and transfer rights",
+    "Review valuation, financing and downside",
+    "Verify agreement, funds and closing conditions",
+    "Verify the transition into operations",
+    "Review results against the acquisition thesis",
+]
+OLDER_WHY = (
+    "This step belongs to an older acquisition analysis whose evidence changed. A newer analysis was saved "
+    "after it, so saving another analysis does not clear it."
+)
+RULE_OUT_UNLOCKS = [
+    "An owner or reviewer rules it out as not applicable, with reviewed evidence.",
+    "If you still want this deal, a fresh analysis of it is a new analysis with its own steps; these still "
+    "need ruling out.",
+]
+
+
+def external_receipt(service, owner, bid):
+    return service.add_evidence(
+        owner,
+        bid,
+        key(),
+        data(
+            models.EvidenceCreate,
+            title="Closing receipt · synthetic",
+            content="SYNTHETIC confirmation from an outside body.",
+            source_type="external_receipt",
+        ),
+    )
+
+
+def deal_citing(service, owner, bid, item, target):
+    return service.save_deal(
+        owner,
+        bid,
+        key(),
+        models.DealInputs(
+            target=target,
+            thesis="Synthetic thesis that cites one piece of evidence.",
+            annual_revenue="210000",
+            reported_ebitda="62000",
+            purchase_price="180000",
+            evidence_ids=[item["id"]],
+        ).model_dump(mode="json", exclude_unset=True),
+    )
+
+
+def deal_steps(service, owner, bid, deal_id):
+    """An analysis's steps in the catalog's order, as they are now."""
+    found = [
+        o
+        for o in service.snapshot(owner, bid)["objects"]
+        if o["kind"] == "task" and o["data"].get("deal_id") == deal_id
+    ]
+    assert [t["title"] for t in found] == DEAL_STEPS
+    return found
+
+
+def rule_out_base(service, owner, bid, item):
+    """Rule out every unfinished step that belongs to no analysis, so the analyses' steps are what is left."""
+    for t in service.snapshot(owner, bid)["objects"]:
+        if t["kind"] == "task" and live(t) and not t["data"].get("deal_id"):
+            if t["state"] not in {"verified", "not_applicable"}:
+                move(service, owner, bid, t, "not_applicable", [item["id"]])
+
+
+def walk(service, owner, bid, deal_id, receipt, upto=None):
+    """Take an analysis's steps to verified in order, or up to the step keyed `upto`, left submitted."""
+    order = ["pending", "prepared", "approved", "submitted", "verified"]
+    for t in deal_steps(service, owner, bid, deal_id):
+        last = t["data"]["key"] == upto
+        states = ["prepared", "approved"] + (["submitted"] if t["data"]["external"] else [])
+        for state in states + ([] if last else ["verified"]):
+            if order.index(t["state"]) < order.index(state):
+                t = move(service, owner, bid, t, state, [receipt["id"]])
+        if last:
+            return
+
+
+def by_id(guide, tid):
+    return next(s for s in guide["steps"] if s["id"] == tid)
+
+
+def acquisition_lines(guide):
+    return [
+        (x["deal_id"], x["status"], x["focus"]["id"] if x["focus"] else None, x["next"])
+        for x in guide["lines"]
+        if x["category"] == "Acquisition"
+    ]
+
+
+def rule_out(t):
+    return {
+        "do": "transition",
+        "task_id": t["id"],
+        "to": "not_applicable",
+        "label": f"Rule out {t['title']}: a newer analysis replaced this one",
+    }
+
+
+def withdraw(service, owner, bid, item, note):
+    return service.review_evidence(
+        owner,
+        bid,
+        item["id"],
+        key(),
+        data(models.Review, note=note, expected_version=item["version"]),
+        revoke=True,
+    )
+
+
+def test_an_older_analysis_whose_evidence_changed_is_ruled_out_not_saved_again(setup):
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Decision notes · synthetic"))
+    receipt = review(service, owner, bid, external_receipt(service, owner, bid))
+    rule_out_base(service, owner, bid, notes)
+
+    # 1. The first analysis cites the first listing; its thesis is approved.
+    first = review(service, owner, bid, evidence(service, owner, bid, "First listing · synthetic"))
+    d1 = deal_citing(service, owner, bid, first, "Juniper Street Laundry")
+    thesis1 = deal_steps(service, owner, bid, d1["id"])[0]
+    for state in ("prepared", "approved"):
+        thesis1 = move(service, owner, bid, thesis1, state, [notes["id"]])
+
+    # 2. Withdrawing that listing reopens the thesis; every step of the first analysis is blocked by it.
+    withdraw(service, owner, bid, first, "The seller withdrew the first listing.")
+    old = deal_steps(service, owner, bid, d1["id"])
+    assert [t["state"] for t in old] == ["needs_review"] + ["pending"] * 6
+    assert all(DEAL_BLOCKER in t["blockers"] for t in old)
+
+    # 3. A second analysis from a second listing; its thesis is approved and the path is complete.
+    second = review(service, owner, bid, evidence(service, owner, bid, "Second listing · synthetic"))
+    d2 = deal_citing(service, owner, bid, second, "Juniper Street Laundry · second listing")
+    thesis2 = deal_steps(service, owner, bid, d2["id"])[0]
+    for state in ("prepared", "approved"):
+        thesis2 = move(service, owner, bid, thesis2, state, [notes["id"]])
+
+    # 4. The first thesis is not offered "Save a fresh acquisition analysis" again: it is ruled out.
+    guide = service.guide(owner, bid)
+    assert guide["path"]["complete"]
+    explained = by_id(guide, thesis1["id"])
+    assert explained["next"] == rule_out(thesis1)
+    assert explained["waiting_on"] is None
+    assert explained["why"] == [OLDER_WHY, "It was reopened: Evidence withdrawn: First listing · synthetic."]
+    assert explained["unlocks"] == RULE_OUT_UNLOCKS
+    # Today's rule is unchanged: it is still listed as needing review, with this next action.
+    assert explained["your_move"] == "prepared"
+    # Current work comes first: the second thesis waits on the owner to verify it.
+    verify2 = {
+        "do": "transition",
+        "task_id": thesis2["id"],
+        "to": "verified",
+        "label": "Verify: Approve the acquisition thesis",
+    }
+    assert guide["next"] == {
+        "from": "waiting_on_you",
+        "stop": None,
+        "task_id": thesis2["id"],
+        "action": verify2,
+        "label": "Verify: Approve the acquisition thesis",
+        "why": None,
+    }
+    assert acquisition_lines(guide) == [
+        (d1["id"], "rule_out", thesis1["id"], rule_out(thesis1)),
+        (d2["id"], "your_move", thesis2["id"], verify2),
+    ]
+
+    # 5. A third analysis, its thesis approved. The first thesis is still to be ruled out, not redone.
+    d3 = deal_citing(service, owner, bid, second, "Juniper Street Laundry · third offer")
+    thesis3 = deal_steps(service, owner, bid, d3["id"])[0]
+    for state in ("prepared", "approved"):
+        thesis3 = move(service, owner, bid, thesis3, state, [notes["id"]])
+    guide = service.guide(owner, bid)
+    assert by_id(guide, thesis1["id"])["next"] == rule_out(thesis1)
+    assert (guide["next"]["from"], guide["next"]["task_id"]) == ("waiting_on_you", thesis2["id"])
+
+    # The current analyses' steps come first while any waits on you or is ready to start.
+    walk(service, owner, bid, d2["id"], receipt)
+    guide = service.guide(owner, bid)
+    assert (guide["next"]["from"], guide["next"]["task_id"]) == ("waiting_on_you", thesis3["id"])
+    move(service, owner, bid, thesis3, "verified", [notes["id"]])
+    guide = service.guide(owner, bid)
+    diligence = deal_steps(service, owner, bid, d3["id"])[1]
+    assert guide["next"] == {
+        "from": "ready",
+        "stop": None,
+        "task_id": diligence["id"],
+        "action": {
+            "do": "transition",
+            "task_id": diligence["id"],
+            "to": "in_progress",
+            "label": "Start work on Reconcile earnings and working capital",
+        },
+        "label": "Start work on Reconcile earnings and working capital",
+        "why": None,
+    }
+    walk(service, owner, bid, d3["id"], receipt, upto="closing")
+    closing3 = deal_steps(service, owner, bid, d3["id"])[4]
+    assert closing3["state"] == "submitted"
+
+    # Nothing current waits on the owner or is ready: ruling out comes next, before the third closing's
+    # receipt, which waits on the outside body. One by one, each step of the first analysis.
+    for n in range(7):
+        t = deal_steps(service, owner, bid, d1["id"])[n]
+        guide = service.guide(owner, bid)
+        assert guide["next"] == {
+            "from": "rule_out",
+            "stop": None,
+            "task_id": t["id"],
+            "action": rule_out(t),
+            "label": f"Rule out {DEAL_STEPS[n]}: a newer analysis replaced this one",
+            "why": OLDER_WHY,
+        }, n
+        assert acquisition_lines(guide)[0] == (d1["id"], "rule_out", t["id"], rule_out(t)), n
+        move(service, owner, bid, t, "not_applicable", [notes["id"]])
+
+    # The loop is over; the next action is current work again: the third closing's receipt.
+    guide = service.guide(owner, bid)
+    assert [t["state"] for t in deal_steps(service, owner, bid, d1["id"])] == ["not_applicable"] * 7
+    assert guide["next"] == {
+        "from": "receipt",
+        "stop": None,
+        "task_id": closing3["id"],
+        "action": {
+            "do": "transition",
+            "task_id": closing3["id"],
+            "to": "verified",
+            "label": "Add the receipt for Verify agreement, funds and closing conditions",
+        },
+        "label": "Add the receipt for Verify agreement, funds and closing conditions",
+        "why": "Verify agreement, funds and closing conditions is with the outside body: add their receipt "
+        "when it arrives.",
+    }
+    assert acquisition_lines(guide)[0] == (d1["id"], "done", None, None)
+
+
+def test_only_an_owner_or_reviewer_is_offered_the_rule_out(setup):
+    store, service, owner, _, owner_token = setup
+    bid = laundry(service, owner)
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Decision notes · synthetic"))
+    receipt = review(service, owner, bid, external_receipt(service, owner, bid))
+    rule_out_base(service, owner, bid, notes)
+    first = review(service, owner, bid, evidence(service, owner, bid, "First listing · synthetic"))
+    d1 = deal_citing(service, owner, bid, first, "Juniper Street Laundry")
+    withdraw(service, owner, bid, first, "The seller withdrew the first listing.")
+    second = review(service, owner, bid, evidence(service, owner, bid, "Second listing · synthetic"))
+    d2 = deal_citing(service, owner, bid, second, "Juniper Street Laundry · second listing")
+    walk(service, owner, bid, d2["id"], receipt, upto="closing")
+    thesis1 = deal_steps(service, owner, bid, d1["id"])[0]
+    assert (thesis1["state"], thesis1["blockers"]) == ("pending", [DEAL_BLOCKER])
+    made = {
+        role: service.add_principal(owner, {"name": f"Rule-out {role}", "role": role, "business_ids": [bid]})
+        for role in ("reviewer", "operator", "agent", "viewer")
+    }
+    guides = {
+        role: guide_as(store, token, bid).json()
+        for role, token in {"owner": owner_token, **{r: p["token"] for r, p in made.items()}}.items()
+    }
+    for role in ("owner", "reviewer"):
+        guide = guides[role]
+        assert guide["next"] == {
+            "from": "rule_out",
+            "stop": None,
+            "task_id": thesis1["id"],
+            "action": rule_out(thesis1),
+            "label": "Rule out Approve the acquisition thesis: a newer analysis replaced this one",
+            "why": OLDER_WHY,
+        }, role
+        explained = by_id(guide, thesis1["id"])
+        assert (explained["next"], explained["waiting_on"]) == (rule_out(thesis1), None), role
+        assert explained["why"] == [OLDER_WHY], role
+        assert explained["unlocks"] == RULE_OUT_UNLOCKS, role
+        assert acquisition_lines(guide)[0] == (d1["id"], "rule_out", thesis1["id"], rule_out(thesis1)), role
+    for role in ("operator", "agent"):
+        guide = guides[role]
+        assert guide["next"] == {
+            "from": None,
+            "stop": None,
+            "task_id": None,
+            "action": None,
+            "label": "Nothing is waiting on you",
+            "why": "Every step left waits on another step, or on someone else.",
+        }, role
+        explained = by_id(guide, thesis1["id"])
+        assert (explained["next"], explained["waiting_on"]) == (
+            None,
+            "It waits on an owner or reviewer to rule it out as not applicable: a newer analysis replaced "
+            "this one.",
+        ), role
+        assert acquisition_lines(guide)[0] == (d1["id"], "rule_out", thesis1["id"], None), role
+        # the server agrees: an operator or agent cannot rule a step out
+        actor = store.authenticate(made[role]["token"])
+        with pytest.raises(DomainError):
+            move(service, actor, bid, thesis1, "not_applicable", [notes["id"]])
+    viewer = guides["viewer"]
+    assert viewer["next"]["action"] is None
+    assert viewer["next"]["label"] == "Nothing here is yours to do"
+    explained = by_id(viewer, thesis1["id"])
+    assert (explained["next"], explained["waiting_on"]) == (
+        None,
+        "You can read this step. A person who can write to this business acts on it.",
+    )
+    assert acquisition_lines(viewer)[0] == (d1["id"], "rule_out", thesis1["id"], None)
+    # The reviewer's rule-out is the move the service accepts.
+    reviewer = store.authenticate(made["reviewer"]["token"])
+    assert move(service, reviewer, bid, thesis1, "not_applicable", [notes["id"]])["state"] == "not_applicable"
+
+
+def test_an_approved_step_of_an_older_analysis_is_reopened_then_ruled_out(setup):
+    _, service, owner, _, _ = setup
+    bid = laundry(service, owner)
+    notes = review(service, owner, bid, evidence(service, owner, bid, "Decision notes · synthetic"))
+    rule_out_base(service, owner, bid, notes)
+    # Saved citing a listing nobody had reviewed; the thesis is approved; then the listing is reviewed,
+    # which changes its version. Nothing reopens the thesis: it stays approved, with the blocker.
+    listing = evidence(service, owner, bid, "Listing text · synthetic")
+    d1 = deal_citing(service, owner, bid, listing, "Juniper Street Laundry")
+    thesis1 = deal_steps(service, owner, bid, d1["id"])[0]
+    for state in ("prepared", "approved"):
+        thesis1 = move(service, owner, bid, thesis1, state, [notes["id"]])
+    listing = review(service, owner, bid, listing)
+    deal_citing(service, owner, bid, listing, "Juniper Street Laundry · fresh")
+    thesis1 = deal_steps(service, owner, bid, d1["id"])[0]
+    assert (thesis1["state"], thesis1["blockers"]) == ("approved", [DEAL_BLOCKER])
+    explained = by_id(service.guide(owner, bid), thesis1["id"])
+    # An approved step cannot be ruled out directly: it is reopened first.
+    assert explained["next"] == {
+        "do": "transition",
+        "task_id": thesis1["id"],
+        "to": "needs_review",
+        "label": "Reopen Approve the acquisition thesis to rule it out: a newer analysis replaced this one",
+    }
+    assert explained["why"] == [OLDER_WHY]
+    assert explained["unlocks"] == [
+        "An owner or reviewer reopens it, then rules it out as not applicable, with reviewed evidence.",
+        RULE_OUT_UNLOCKS[1],
+    ]
+    thesis1 = move(service, owner, bid, thesis1, "needs_review")
+    assert by_id(service.guide(owner, bid), thesis1["id"])["next"] == rule_out(thesis1)
+    move(service, owner, bid, thesis1, "not_applicable", [notes["id"]])
