@@ -8,6 +8,7 @@ request gave on main (391b9fb) were calculated by main's own code and written in
 import asyncio
 import itertools
 import json
+from decimal import Decimal
 from fractions import Fraction
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ import httpx
 import pytest
 
 from foundry import mcp_server, models
-from foundry.finance import acquisition
+from foundry.finance import acquisition, yearly_interest
 from foundry.models import DealInputs
 from foundry.store import canonical, digest
 
@@ -813,3 +814,71 @@ def test_the_interest_is_rounded_once_not_taken_from_rounded_amounts(client, set
     before = stored(service, actor, bid, saved["id"])
     assert sentence in memo(client, bid, saved["id"])
     assert stored(service, actor, bid, saved["id"]) == before
+
+
+@pytest.mark.parametrize("rate", ["0E+999999999999999", "0E-999999999999999"], ids=["huge", "tiny"])
+def test_a_zero_rate_written_with_a_huge_exponent_is_no_interest(client, setup, rate):
+    """A zero written with any exponent is accepted and stored as written; the memo says it is no interest."""
+    _, service, actor, bid, _ = setup
+    body = TINY | {
+        "seller_note": "1",
+        "seller_rate": rate,
+        "seller_years": 2,
+        "seller_schedule": "interest_only",
+    }
+    saved = post(client, bid, body)
+    assert saved.status_code == 201, saved.text
+    saved = saved.json()
+    assert saved["data"]["inputs"]["seller_rate"] == rate
+    # 1 at zero interest: nothing in year 1, and the 1.00 lent in year 2.
+    assert saved["data"]["analysis"]["seller_note_schedule"]["payments"] == [
+        {"year": 1, "payment": "0.00"},
+        {"year": 2, "payment": "1.00"},
+    ]
+    before = stored(service, actor, bid, saved["id"])
+    assert (
+        "The seller is paid 0.00 USD of interest a year, and in year 2 the 1.00 lent is due as well: "
+        "1.00 that year. The year-1 coverage does not include the 1.00."
+    ) in memo(client, bid, saved["id"])
+    assert stored(service, actor, bid, saved["id"]) == before
+
+
+@pytest.mark.parametrize(
+    "note, yearly, last, sentence",
+    [
+        # 0.5 × 0.01 = 0.005, exactly half a cent: half-even gives 0.00 (half-up would give 0.01). In year 2,
+        # 0.5 + 0.005 = 0.505, also exactly half a cent: 0.50.
+        (
+            "0.5",
+            "0.00",
+            "0.50",
+            "The seller is paid 0.00 USD of interest a year, and in year 2 the 0.50 lent is due as well: "
+            "0.50 that year. The year-1 coverage does not include the 0.50.",
+        ),
+        # 1.5 × 0.01 = 0.015: 0.02 either way. In year 2, 1.5 + 0.015 = 1.515: half-even gives 1.52.
+        (
+            "1.5",
+            "0.02",
+            "1.52",
+            "The seller is paid 0.02 USD of interest a year, and in year 2 the 1.50 lent is due as well: "
+            "1.52 that year. The year-1 coverage does not include the 1.50.",
+        ),
+    ],
+    ids=["half_cent_to_even_zero", "half_cent_to_even_two"],
+)
+def test_interest_on_an_exact_half_cent_is_rounded_half_even(client, setup, note, yearly, last, sentence):
+    _, _, _, bid, _ = setup
+    body = TINY | {
+        "seller_note": note,
+        "seller_rate": "0.01",
+        "seller_years": 2,
+        "seller_schedule": "interest_only",
+    }
+    # The memo's figure is the model's year-1 payment for a note over more than one year.
+    assert yearly_interest(Decimal(note), Decimal("0.01")) == yearly
+    assert deal(**body)["seller_note_schedule"]["payments"] == [
+        {"year": 1, "payment": yearly},
+        {"year": 2, "payment": last},
+    ]
+    saved = post(client, bid, body).json()
+    assert sentence in memo(client, bid, saved["id"])

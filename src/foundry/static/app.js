@@ -3071,31 +3071,48 @@ function dealSellerText(s, inputs) {
   return `The seller is paid nothing until year ${n}, when ${money(last)} is due: ${lent} lent plus ${money(interest)} of interest. The year-1 coverage does not include it.`;
 }
 /* a × b for two decimal strings, formed exactly with BigInt and rounded once, half-even, to cents,
-   as the model rounds money (finance.yearly_interest). Neither is ever converted to a binary number. */
+   as the model rounds money (finance.yearly_interest). Neither is ever converted to a binary number.
+   The API stores each input as it was written, so a zero may carry any exponent (0E+999999999999999)
+   and a value any number of trailing zeros (1.000…0). Each factor is first reduced to its
+   significant digits, with its exponent read as a BigInt, so no power of ten is built from the way a
+   value is written: a zero gives 0.00 at once, and a product too small to reach half a cent gives
+   0.00 without building its divisor. An accepted input (docs/FINANCE.md) is at most 10^12 with at
+   most 12 decimal places, so a product of two has at most 15 digits of whole cents; a product past
+   MAX_CENT_DIGITS cannot come from accepted inputs and gives null, shown as a dash, not an error. */
+const MAX_CENT_DIGITS = 40n;
 function decimalTimesCents(a, b) {
   const parse = (v) => {
     const m = /^\s*([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?\s*$/.exec(String(v ?? ''));
     if (!m || !(m[2] || m[3])) throw new Error('Not a decimal: ' + v);
-    const digits = BigInt((m[2] || '') + (m[3] || ''));
-    return [m[1] === '-' ? -digits : digits, Number(m[4] || 0) - (m[3] || '').length];
+    const frac = m[3] || '',
+      all = ((m[2] || '') + frac).replace(/^0+/, ''),
+      digits = all.replace(/0+$/, '');
+    if (!digits) return null;
+    const exp = BigInt(m[4] || 0) - BigInt(frac.length) + BigInt(all.length - digits.length);
+    return [m[1] === '-' ? -BigInt(digits) : BigInt(digits), exp];
   };
-  const [x, xe] = parse(a),
-    [y, ye] = parse(b);
+  const p = parse(a),
+    r = parse(b);
+  if (!p || !r) return '0.00';
   // The product is n × 10^shift cents.
-  const n = x * y,
-    shift = xe + ye + 2;
+  const n = p[0] * r[0],
+    shift = p[1] + r[1] + 2n,
+    abs = n < 0n ? -n : n,
+    size = BigInt(String(abs).length);
   let c;
-  if (shift >= 0) c = n * 10n ** BigInt(shift);
-  else {
-    const d = 10n ** BigInt(-shift),
-      abs = n < 0n ? -n : n;
-    let q = abs / d;
+  if (shift >= 0n) {
+    if (size + shift > MAX_CENT_DIGITS) return null;
+    c = abs * 10n ** shift;
+  } else if (-shift > size) {
+    // abs < 10^size, so abs / 10^-shift is below a tenth of a cent and rounds to zero.
+    return '0.00';
+  } else {
+    const d = 10n ** -shift;
+    c = abs / d;
     const twice = 2n * (abs % d);
-    if (twice > d || (twice === d && q % 2n === 1n)) q += 1n;
-    c = n < 0n ? -q : q;
+    if (twice > d || (twice === d && c % 2n === 1n)) c += 1n;
   }
-  const abs = c < 0n ? -c : c;
-  return `${c < 0n ? '-' : ''}${abs / 100n}.${String(abs % 100n).padStart(2, '0')}`;
+  return `${n < 0n && c ? '-' : ''}${c / 100n}.${String(c % 100n).padStart(2, '0')}`;
 }
 /* What the buyer puts in at closing, as the investment memo says it (documents.buyer_cash_text). */
 function dealBuyerCashText(su) {
