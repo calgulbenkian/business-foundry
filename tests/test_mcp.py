@@ -238,7 +238,7 @@ def test_mcp_guided_prompts_are_static_and_state_human_review(setup):
             assert "prepare_task" in text
             assert (
                 "- Evidence in state 'rejected' has been withdrawn by a person. It cannot support an "
-                "analysis or a task decision; cite it only in a record that discusses it.\n"
+                "analysis or a step; cite it only in a record that discusses it.\n"
             ) in text
             assert "Test business" not in text  # no stored business content
             for topic in topics:

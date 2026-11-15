@@ -341,3 +341,294 @@ def test_a_record_may_still_cite_withdrawn_evidence(setup):
     )
     assert updated["data"]["evidence_ids"] == [gone["id"]]
     assert updated["data"]["details"] == "Synthetic, revised."
+
+
+# Evidence a saved analysis cites that the business does not hold. Only a damaged or hand-edited
+# database has such a row, so these tests write it straight to the database.
+DEAL_MISSING = (
+    "Evidence this deal analysis cites is not in this business's records. "
+    "Run a revised analysis before relying on these figures."
+)
+FORECAST_MISSING = (
+    "Evidence this forecast cites is not in this business's records. "
+    "Save a revised forecast before relying on these figures."
+)
+
+
+def missing_reason(kind):
+    return {"code": "evidence_missing", "message": DEAL_MISSING if kind == "deal" else FORECAST_MISSING}
+
+
+def overwrite(store, item, **fields):
+    """Replace fields of a stored row's data, as a damaged or hand-edited database would hold it."""
+    with store.write() as con:
+        (raw,) = con.execute("SELECT data FROM objects WHERE id=?", (item["id"],)).fetchone()
+        con.execute(
+            "UPDATE objects SET data=? WHERE id=?", (json.dumps(json.loads(raw) | fields), item["id"])
+        )
+
+
+def test_a_forecast_citing_evidence_the_business_does_not_hold_is_marked_and_the_snapshot_still_reads(
+    setup, client
+):
+    store, service, actor, bid, _ = setup
+    plan = save_forecast(service, actor, bid)
+    overwrite(store, plan, evidence_ids=["evidence_" + "0" * 20])
+    assert mark(service, actor, bid, plan) == (True, [missing_reason("financial_plan")])
+    for path in ("", "/guide", "/audit", "/export"):
+        assert client.get(f"/api/businesses/{bid}{path}").status_code == 200, path
+    content = service.generate_document(
+        actor, bid, key(), dump(models.DocumentCreate, template="business_plan")
+    )
+    assert f"## Financial scenarios\n\nWARNING: {FORECAST_MISSING}\n\nModel: " in content["data"]["content"]
+
+
+def test_a_deal_citing_a_held_and_a_missing_id_is_marked_and_its_steps_still_read(setup, client):
+    store, service, actor, bid, _ = setup
+    held = add_evidence(service, actor, bid, "Synthetic listing")
+    deal = save_deal(service, actor, bid, [held])
+    overwrite(store, deal, evidence_versions={held["id"]: held["version"], "evidence_" + "0" * 20: 1})
+    assert mark(service, actor, bid, deal) == (True, [missing_reason("deal")])
+    snapshot = client.get(f"/api/businesses/{bid}")
+    assert snapshot.status_code == 200
+    steps = [
+        o for o in snapshot.json()["objects"] if o["kind"] == "task" and o["data"]["deal_id"] == deal["id"]
+    ]
+    assert steps, "the deal has its steps"
+    # A missing id blocks no step; only changed evidence does, as before.
+    assert not any("Supporting deal evidence changed" in b for s in steps for b in s["blockers"])
+    assert client.get(f"/api/businesses/{bid}/guide").status_code == 200
+
+    review(service, actor, bid, held)  # the held item changes too: both reasons, changed first
+    assert mark(service, actor, bid, deal) == (True, [deal_reason(), missing_reason("deal")])
+    assert any(
+        "Supporting deal evidence changed" in b for b in current(service, actor, bid, steps[0])["blockers"]
+    )
+
+
+def test_ids_of_other_records_and_of_another_business_count_as_missing(setup):
+    store, service, actor, bid, _ = setup
+    other = service.create_business(
+        actor,
+        key(),
+        dump(models.BusinessCreate, name="Other business", concept="A synthetic second business."),
+    )
+    foreign = add_evidence(service, actor, other["id"], "Synthetic foreign listing")
+    a_step = next(o for o in service.snapshot(actor, bid)["objects"] if o["kind"] == "task")
+    for cited in ([foreign["id"]], [a_step["id"]], [{"not": "an id"}], [7]):
+        plan = save_forecast(service, actor, bid)
+        overwrite(store, plan, evidence_ids=cited)
+        assert mark(service, actor, bid, plan) == (True, [missing_reason("financial_plan")]), cited
+
+
+def test_stored_citations_of_the_wrong_shape_cite_nothing(setup):
+    store, service, actor, bid, _ = setup
+    for shape in (None, "evidence_x", {"evidence_x": 1}, 7):
+        plan = save_forecast(service, actor, bid)
+        overwrite(store, plan, evidence_ids=shape)
+        assert mark(service, actor, bid, plan) == (False, []), shape
+    for shape in (None, ["evidence_x"], "evidence_x", 7):
+        deal = save_deal(service, actor, bid)
+        overwrite(store, deal, evidence_versions=shape)
+        assert mark(service, actor, bid, deal) == (False, []), shape
+
+
+def test_every_reason_together_comes_in_order(setup):
+    store, service, actor, bid, _ = setup
+    gone = add_evidence(service, actor, bid, "Synthetic withdrawn quote")
+    plan = save_forecast(service, actor, bid, [gone])
+    overwrite(store, plan, evidence_ids=[gone["id"], "evidence_" + "0" * 20])
+    withdraw(service, actor, bid, gone)
+    version = service.snapshot(actor, bid)["business"]["version"]
+    payload = dump(
+        models.JurisdictionChange, expected_version=version, jurisdiction="GB", reason="Synthetic."
+    )
+    service.change_jurisdiction(actor, bid, key(), payload)
+    stale, reasons = mark(service, actor, bid, plan)
+    assert stale and [r["code"] for r in reasons] == [
+        "evidence_changed",
+        "evidence_missing",
+        "jurisdiction_changed",
+    ]
+    assert reasons[:2] == [withdrawn_reason(), missing_reason("financial_plan")]
+
+
+# A step cannot cite withdrawn evidence, whatever the move.
+def step_refusal(*evidence):
+    named = [f"{e['title']} ({e['id']})" for e in evidence]
+    if len(named) == 1:
+        return f"Evidence {named[0]} was withdrawn and cannot support a step. Leave it out, or cite the evidence that replaced it."
+    return (
+        f"Evidence {', '.join(named[:-1])} and {named[-1]} were withdrawn and cannot support a step. "
+        "Leave them out, or cite the evidence that replaced them."
+    )
+
+
+def free_step(service, actor, bid):
+    """A pending step with nothing blocking it."""
+    return next(
+        o
+        for o in service.snapshot(actor, bid)["objects"]
+        if o["kind"] == "task" and o["state"] == "pending" and not o["blockers"] and not o["data"]["external"]
+    )
+
+
+def move(service, actor, bid, step, state, evidence=(), command=None):
+    payload = dump(
+        models.TaskTransition,
+        state=state,
+        expected_version=current(service, actor, bid, step)["version"],
+        note="Synthetic decision note; it may name the withdrawn quote in words.",
+        evidence_ids=[e["id"] for e in evidence],
+    )
+    return service.transition(actor, bid, step["id"], command or key(), payload)
+
+
+def test_every_step_move_citing_withdrawn_evidence_is_refused_and_stores_nothing(setup):
+    store, service, actor, bid, _ = setup
+    reviewed = add_evidence(service, actor, bid, "Synthetic reviewed minutes")
+    review(service, actor, bid, reviewed)
+    reviewed = current(service, actor, bid, reviewed)
+    gone = add_evidence(service, actor, bid, "Synthetic withdrawn quote")
+    withdraw(service, actor, bid, gone)
+    step = free_step(service, actor, bid)
+
+    def refused_moves(states):
+        for state in states:
+            before = current(service, actor, bid, step)
+            command = key()
+            for _ in range(2):  # a replay of the refused request is refused again
+                refused(
+                    store,
+                    bid,
+                    lambda s=state, c=command: move(service, actor, bid, step, s, [reviewed, gone], c),
+                    step_refusal(gone),
+                )
+            assert current(service, actor, bid, step) == before, state
+
+    refused_moves(["in_progress", "prepared", "not_applicable"])  # from pending
+    move(service, actor, bid, step, "prepared", [reviewed])
+    refused_moves(["approved", "needs_review"])  # from prepared
+    move(service, actor, bid, step, "approved", [reviewed])
+    refused_moves(["submitted", "verified"])  # from approved
+    assert current(service, actor, bid, step)["state"] == "approved"
+
+
+def test_an_approval_citing_withdrawn_evidence_is_told_it_was_withdrawn_not_to_review_it(setup):
+    store, service, actor, bid, _ = setup
+    unreviewed = add_evidence(service, actor, bid, "Synthetic unreviewed note")
+    first = add_evidence(service, actor, bid, "Synthetic first quote")
+    second = add_evidence(service, actor, bid, "Synthetic second quote")
+    withdraw(service, actor, bid, first)
+    withdraw(service, actor, bid, second)
+    step = free_step(service, actor, bid)
+    move(service, actor, bid, step, "prepared", [unreviewed])
+    refused(store, bid, lambda: move(service, actor, bid, step, "approved", [first]), step_refusal(first))
+    # Withdrawn items are named in the order cited, ahead of any unreviewed one.
+    refused(
+        store,
+        bid,
+        lambda: move(service, actor, bid, step, "approved", [unreviewed, second, first, second]),
+        step_refusal(second, first),
+    )
+    # Without withdrawn evidence the review rule is as before.
+    refused(
+        store,
+        bid,
+        lambda: move(service, actor, bid, step, "approved", [unreviewed]),
+        "Review evidence first: Synthetic unreviewed note",
+    )
+    assert current(service, actor, bid, step)["state"] == "prepared"
+
+
+def run_cli(args, capsys):
+    try:
+        cli.main(args)
+        code = 0
+    except SystemExit as stopped:
+        code = stopped.code
+    return code, capsys.readouterr()
+
+
+def test_the_forecast_and_acquire_commands_refuse_withdrawn_evidence(setup, tmp_path, capsys):
+    store, service, actor, bid, token = setup
+    gone = add_evidence(service, actor, bid, "Synthetic withdrawn quote")
+    withdraw(service, actor, bid, gone)
+    (store.path.parent / "owner.key").write_text(token + "\n")
+    plan, deal = tmp_path / "plan.json", tmp_path / "deal.json"
+    plan.write_text(json.dumps({"title": "CLI forecast", "evidence_ids": [gone["id"]]}))
+    deal.write_text(json.dumps({**deal_payload(), "evidence_ids": [gone["id"]]}))
+    before = stored(store, bid)
+    for command, path in (("forecast", plan), ("acquire", deal)):
+        code, out = run_cli(["--db", str(store.path), command, bid, str(path)], capsys)
+        assert code == 1, command
+        assert out.err.strip() == f"Proprietor: {message(gone)}", command
+        assert out.out == ""
+    assert stored(store, bid) == before
+
+
+def test_the_mcp_tools_return_the_refusal_for_withdrawn_evidence(setup):
+    from test_mcp import foundry_api, run_client
+
+    store, service, owner, bid, _ = setup
+    agent = service.add_principal(owner, {"name": "Synthetic agent", "role": "agent", "business_ids": [bid]})
+    gone = add_evidence(service, owner, bid, "Synthetic withdrawn quote")
+    withdraw(service, owner, bid, gone)
+    step = free_step(service, owner, bid)
+    before = stored(store, bid)
+
+    async def check(client):
+        calls = [
+            (
+                "build_forecast",
+                {
+                    "business_id": bid,
+                    "command_key": "mcp-forecast",
+                    "title": "Agent forecast",
+                    "inputs": {"months": 12},
+                    "evidence_ids": [gone["id"]],
+                },
+                message(gone),
+            ),
+            (
+                "analyze_acquisition",
+                {"business_id": bid, "command_key": "mcp-deal", "inputs": deal_payload([gone])},
+                message(gone),
+            ),
+            (
+                "prepare_task",
+                {
+                    "business_id": bid,
+                    "task_id": step["id"],
+                    "command_key": "mcp-prepare",
+                    "expected_version": step["version"],
+                    "note": "Synthetic preparation note.",
+                    "evidence_ids": [gone["id"]],
+                },
+                step_refusal(gone),
+            ),
+        ]
+        for tool, arguments, expected in calls:
+            result = await client.call_tool(tool, arguments)
+            assert result.isError, tool
+            assert expected in result.content[0].text, (tool, result.content[0].text)
+
+    with foundry_api(store) as url:
+        run_client(url, agent["token"], check)
+    assert stored(store, bid) == before
+
+
+def test_start_here_asks_for_a_revised_forecast_after_its_evidence_is_withdrawn(setup):
+    _, service, actor, bid, _ = setup
+    quote = add_evidence(service, actor, bid, "Synthetic pilot quote")
+    save_forecast(service, actor, bid, [quote])
+
+    def forecast_stop():
+        return next(s for s in service.guide(actor, bid)["path"]["stops"] if s["key"] == "forecast")
+
+    assert forecast_stop()["done"] is True
+    withdraw(service, actor, bid, quote)
+    stop = forecast_stop()
+    assert stop["title"] == "Review cash needs"
+    assert stop["done"] is False
+    assert stop["action"] == {"do": "forecast", "label": "Save a revised forecast"}

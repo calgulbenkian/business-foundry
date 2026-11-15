@@ -2217,14 +2217,19 @@ function transitionButtons(t) {
 function txForm(t) {
   const to = state.open.to;
   const opts = choices(t);
+  // Withdrawn evidence supports no step: the form neither offers it nor keeps the step's own.
+  const withdrawn = (t.data.evidence_ids || [])
+    .map(find)
+    .filter((e) => e && e.state === 'rejected');
   return `<form class="confirm" id="tx-form" data-id="${h(t.id)}" data-bid="${h(state.bid)}" data-version="${h(t.version)}">
     <p id="tx-text">${h(moveText(to, t))}</p>
+    ${withdrawn.length ? `<p class="hint" id="tx-withdrawn">Withdrawn evidence cannot support a step, so it is left out: ${withdrawn.map((e) => h(e.title)).join(', ')}.</p>` : ''}
     <div class="form-grid one spaced">${choose(
       'state',
       'Next state',
       opts.map((s) => [s, STATES[s].label]),
       to,
-    )}${evidenceSelect('evidence_ids', 'Evidence for this decision', t.data.evidence_ids || [])}${area('note', 'Decision note', '', 'Explain what was done, reviewed or found not applicable.')}</div>
+    )}${evidenceSelect('evidence_ids', 'Evidence for this decision', t.data.evidence_ids || [], false, true, true)}${area('note', 'Decision note', '', 'Explain what was done, reviewed or found not applicable.')}</div>
     <p class="error spaced" role="alert"></p>
     <div class="i-actions"><button type="submit" class="btn primary">Record decision</button>${btn('Not yet', 'data-action="close-inline"')}</div></form>`;
 }
@@ -4103,12 +4108,13 @@ const choose = (name, title, options, current = '', hint = '', multi = false) =>
       return `<option value="${h(v)}" ${on ? 'selected' : ''}>${h(t)}</option>`;
     })
     .join('')}</select>${hint ? `<span class="hint">${h(hint)}</span>` : ''}</label>`;
-/* The evidence a form offers. A deal analysis or forecast cannot cite withdrawn evidence (the server
-   refuses it), so its forms leave withdrawn items out; a record or a step may still cite one. */
-const evidenceChoices = (onlyReviewed = false, analysis = false) =>
+/* The evidence a form offers. Withdrawn evidence supports nothing new: the server refuses it in a
+   deal analysis, a forecast or a step's move, so those forms (`supports`) leave withdrawn items out.
+   Only a record may still cite one, for example a risk that discusses the withdrawn document. */
+const evidenceChoices = (onlyReviewed = false, supports = false) =>
   objs('evidence')
     .filter((o) => !onlyReviewed || o.state === 'verified')
-    .filter((o) => !analysis || o.state !== 'rejected')
+    .filter((o) => !supports || o.state !== 'rejected')
     .map((o) => [o.id, `${o.title} · ${evInfo(o).short}`]);
 const evidenceSelect = (
   name = 'evidence_ids',
@@ -4116,12 +4122,12 @@ const evidenceSelect = (
   current = [],
   reviewed = false,
   multi = true,
-  analysis = false,
+  supports = false,
 ) =>
   choose(
     name,
     title,
-    (multi ? [] : [['', 'Choose evidence…']]).concat(evidenceChoices(reviewed, analysis)),
+    (multi ? [] : [['', 'Choose evidence…']]).concat(evidenceChoices(reviewed, supports)),
     current,
     multi ? 'Select one or more. On a computer, use Ctrl or Command to select several.' : '',
     multi,
@@ -4791,23 +4797,25 @@ function dealDialog(id) {
   const assumed = o ? o.data.assumed_inputs : [];
   const unrecorded = o && !Array.isArray(assumed);
   /* A new analysis cannot cite withdrawn evidence. The earlier analysis's withdrawn items are not
-     offered, and an adjustment it kept that cited one is kept without that evidence: an adjustment
-     enters normalized earnings only with reviewed evidence, so its figures are unchanged. */
+     offered, and an adjustment it kept that cited one is kept without that evidence. The new
+     analysis does not count such an adjustment, as with any adjustment without reviewed evidence.
+     If the earlier analysis counted it (its evidence was reviewed, then withdrawn), normalized
+     earnings fall. Each sentence below appears only when it applies. */
   const withdrawn = (id) => Boolean(id) && find(id)?.state === 'rejected';
-  const dropped = [
-    ...new Set([
-      ...(d.evidence_ids || []).filter(withdrawn),
-      ...(d.adjustments || []).map((a) => a.evidence_id).filter(withdrawn),
-    ]),
-  ];
+  const droppedSources = [...new Set((d.evidence_ids || []).filter(withdrawn))];
+  const droppedAdjustments = (d.adjustments || []).filter((a) => withdrawn(a.evidence_id));
   const retained = (d.adjustments || []).map((a) =>
     withdrawn(a.evidence_id) ? { ...a, evidence_id: null } : a,
   );
+  const one = droppedAdjustments.length === 1;
   formDialog(
     'Analyze an acquisition',
     input('target', 'Target business', d.target || '', 'text', '', 'required') +
-      (dropped.length
-        ? `<p class="hint full">Withdrawn evidence cannot support a new analysis, so it is left out: ${dropped.map((id) => h(find(id).title)).join(', ')}. An adjustment that cited it is kept without evidence and does not enter normalized earnings.</p>`
+      (droppedSources.length
+        ? `<p class="hint full" id="deal-withdrawn-sources">Withdrawn evidence cannot support a new analysis, so it is left out: ${droppedSources.map((id) => h(find(id).title)).join(', ')}.</p>`
+        : '') +
+      (droppedAdjustments.length
+        ? `<p class="hint full" id="deal-withdrawn-adjustments">${one ? 'An earnings adjustment cites' : 'Earnings adjustments cite'} withdrawn evidence: ${droppedAdjustments.map((a) => `${h(a.label)} (${h(find(a.evidence_id).title)})`).join(', ')}. ${one ? 'It is' : 'They are'} kept without evidence, and the new analysis does not count ${one ? 'it' : 'them'} in normalized earnings, as with any adjustment without reviewed evidence.</p>`
         : '') +
       evidenceSelect('evidence_ids', 'Source evidence', d.evidence_ids || [], false, true, true) +
       area('thesis', 'Investment thesis', d.thesis || '') +
