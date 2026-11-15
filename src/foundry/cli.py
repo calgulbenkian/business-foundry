@@ -24,7 +24,7 @@ from .store import DomainError, Store
 
 
 def not_foundry_database(source: Path) -> str:
-    return f"{source.resolve()} is not a Foundry database."
+    return f"{source.resolve()} is not a Proprietor database."
 
 
 def backup_database(source: Path, destination: Path) -> int:
@@ -210,7 +210,7 @@ def bind_local(port):
     never reports itself running at an address that serves another program.
     """
     taken = (
-        f"Port {port} is already in use. Foundry may already be running at "
+        f"Port {port} is already in use. Proprietor may already be running at "
         f"http://{START_HOST}:{port}; open that address, or choose another port with --port."
     )
     try:
@@ -284,8 +284,8 @@ def start_foundry(
                     )
         if held.asked:
             _say(
-                "\nFoundry has stopped. It finished setting up first, so your workspace in "
-                f"{db_path.parent} is complete. Run the same command again to start Foundry.",
+                "\nProprietor has stopped. It finished setting up first, so your workspace in "
+                f"{db_path.parent} is complete. Run the same command again to start Proprietor.",
                 out,
             )
             return 0
@@ -311,13 +311,13 @@ def start_foundry(
         block = "\n".join(
             [
                 "",
-                "Business Foundry is running.",
+                "Proprietor is running.",
                 "",
                 f"  Open this address in your web browser: {url}",
                 f"  {key_line}",
                 "",
                 "Keep the key private. Anyone who has it can sign in as the owner of this workspace.",
-                "To stop Foundry, press Ctrl+C in this window.",
+                "To stop Proprietor, press Ctrl+C in this window.",
                 "",
             ]
         )
@@ -350,7 +350,7 @@ def start_foundry(
         except KeyboardInterrupt:
             pass
         if server.started:
-            _say(f"\nFoundry has stopped. Your workspace is saved in {db_path.parent}", out)
+            _say(f"\nProprietor has stopped. Your workspace is saved in {db_path.parent}", out)
         return 0
     except KeyboardInterrupt:
         return 0
@@ -385,9 +385,7 @@ def read_configuration(model, path: Path, only_set=False) -> dict:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Business Foundry: start, acquire and operate with evidence."
-    )
+    parser = argparse.ArgumentParser(description="Proprietor: start, acquire and operate with evidence.")
     parser.add_argument(
         "--db", default=os.getenv("FOUNDRY_DB", ".foundry/foundry.db"), help="Private SQLite database path"
     )
@@ -463,7 +461,7 @@ def main(argv=None):
     principal.add_argument("--name", required=True)
     principal.add_argument("--role", choices=["operator", "reviewer", "viewer", "agent"], required=True)
     principal.add_argument("--business", required=True, action="append")
-    commands.add_parser("mcp", help="Run the stdio agent adapter against a running Foundry server")
+    commands.add_parser("mcp", help="Run the stdio agent adapter against a running Proprietor server")
     args = parser.parse_args(argv)
     db_path = Path(args.db).expanduser().resolve()
     token_path = db_path.parent / "owner.key"
@@ -594,7 +592,7 @@ def main(argv=None):
                     )
                 )
     except (DomainError, ValueError, OSError, sqlite3.Error) as exc:
-        print(f"Foundry: {exc}", file=sys.stderr)
+        print(f"Proprietor: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 
 

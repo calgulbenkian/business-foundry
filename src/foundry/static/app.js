@@ -1,6 +1,6 @@
 'use strict';
 /*
-  Business Foundry — Studio interface.
+  Proprietor: Studio interface.
 
   Three panes: sources, a grouped middle list, and an inspector of labelled rows. Each group of
   steps in the planning catalog (a task's category, and each acquisition analysis separately)
@@ -197,7 +197,7 @@ function plainDate(v) {
   });
 }
 const CALC_NOTE =
-  'Calculated by Business Foundry with exact decimal arithmetic. No assistant was involved.';
+  'Calculated by Proprietor with exact decimal arithmetic. No assistant was involved.';
 
 /* ---------------- the lines and steps, derived from the snapshot ---------------- */
 const PALETTE = ['s', 'm', 'p', 'c', 'e', 'v', 'o', 'b', 'r', 't'];
@@ -358,9 +358,9 @@ function moveText(to, t) {
     prepared:
       'Record that this step is prepared and ready for a person to approve. Preparing does not approve, send or sign anything.',
     approved:
-      'Approving records that you reviewed the prepared work and its evidence. It needs reviewed evidence and every prerequisite complete. Business Foundry will not send or sign anything.',
+      'Approving records that you reviewed the prepared work and its evidence. It needs reviewed evidence and every prerequisite complete. Proprietor will not send or sign anything.',
     submitted:
-      'Record that you sent this to the outside body yourself. Do this only after you have sent it, and attach a reviewed external receipt. Business Foundry does not send anything.',
+      'Record that you sent this to the outside body yourself. Do this only after you have sent it, and attach a reviewed external receipt. Proprietor does not send anything.',
     verified: t.data.external
       ? 'Record the outside body’s result and attach their reviewed receipt. Verifying means you checked the recorded result; it is not a legal certification.'
       : 'Verifying records that you checked the result of this internal review. It needs reviewed evidence.',
@@ -1609,11 +1609,7 @@ function renderList() {
     right = plural(inv.length, 'invoice') + headButton('+ Draft invoice', 'new-invoice');
     out += moneyRecordedRows();
     if (inv.length) {
-      out += grp(
-        'Invoices',
-        inv.length,
-        'A draft is internal. Business Foundry never sends an invoice.',
-      );
+      out += grp('Invoices', inv.length, 'A draft is internal. Proprietor never sends an invoice.');
       for (const o of inv.slice().reverse())
         out += row({
           key: 'inv:' + o.id,
@@ -1820,7 +1816,7 @@ function moneyRows(today) {
       });
   } else if (!today) {
     out += grp('Latest model');
-    out += `<p class="empty">No financial model yet. Start with units, price, delivery cost, fixed costs and when customers actually pay. Business Foundry calculates all three statements.</p>`;
+    out += `<p class="empty">No financial model yet. Start with units, price, delivery cost, fixed costs and when customers actually pay. Proprietor calculates all three statements.</p>`;
   }
   if (!today || objs('invoice').length) out += moneyRecordedRows();
   return out;
@@ -2281,7 +2277,7 @@ function stageGuide(st, t) {
   if (st === 'submitted')
     return [
       'Submit it yourself',
-      'Send it to the outside body, then record it here with a reviewed external receipt. Business Foundry cannot submit for you.',
+      'Send it to the outside body, then record it here with a reviewed external receipt. Proprietor cannot submit for you.',
     ];
   return t.data.external
     ? ['Add the outside body’s receipt', 'Record their reviewed receipt when it arrives.']
@@ -2407,7 +2403,7 @@ function inspStep(s) {
         [
           'Who acts',
           ext
-            ? 'An outside body. You send it yourself and record their receipt; Business Foundry does not submit anything.'
+            ? 'An outside body. You send it yourself and record their receipt; Proprietor does not submit anything.'
             : 'Internal. A person reviews and verifies it.',
         ],
         ['Records needed', h((t.data.required_record_kinds || []).map(label).join(', ') || 'None')],
@@ -2769,7 +2765,7 @@ function inspEvidence(o) {
     ) +
     sec(
       'Original',
-      `<pre class="original">${h(d.content)}</pre><p class="fine">Stored as received. Business Foundry never edits an original; a correction is new evidence. Fingerprint <code>${h(d.content_sha256)}</code></p>`,
+      `<pre class="original">${h(d.content)}</pre><p class="fine">Stored as received. Proprietor never edits an original; a correction is new evidence. Fingerprint <code>${h(d.content_sha256)}</code></p>`,
     ) +
     sec('Used by', attList(used), `<span class="h-note">${used.length}</span>`) +
     (history.length
@@ -3261,7 +3257,7 @@ function inspInvoice(o) {
     );
   if (o.state === 'draft')
     flags += flag(
-      'A draft stays internal. Business Foundry does not send invoices; record the issue after you have sent it yourself.',
+      'A draft stays internal. Proprietor does not send invoices; record the issue after you have sent it yourself.',
       true,
     );
   return (
@@ -3406,8 +3402,8 @@ function backupHelp() {
   const command = ready
     ? d.backup_command
     : 'uv run foundry --db DATABASE_PATH backup /private/path/backup.db';
-  const where = `Business Foundry keeps your records in <code>${h(d.database)}</code>.`,
-    run = `To back them up, open a terminal in the folder you start Business Foundry from. Then run <code>${h(command)}</code>.${ready ? '' : ' Put the path above, quoted for your shell, in place of <code>DATABASE_PATH</code>.'} Change <code>/private/path/backup.db</code> to where you want the backup saved.`,
+  const where = `Proprietor keeps your records in <code>${h(d.database)}</code>.`,
+    run = `To back them up, open a terminal in the folder you start Proprietor from. Then run <code>${h(command)}</code>.${ready ? '' : ' Put the path above, quoted for your shell, in place of <code>DATABASE_PATH</code>.'} Change <code>/private/path/backup.db</code> to where you want the backup saved.`,
     restore =
       'To restore, put the backup in a new folder: <code>uv run foundry --db /private/path/restored/foundry.db restore /private/path/backup.db</code>. Then open that folder in the app: <code>uv run foundry-desktop --data-dir /private/path/restored</code>.';
   const paras = (cls, list) => list.map((p) => `<p class="${cls}">${p}</p>`).join('');
@@ -3427,7 +3423,7 @@ function backupHelp() {
 }
 /* How to turn on the optional review, true for the way this person reached the workspace. A
    desktop app opened from Finder or the Start menu cannot be given a provider key, and its address
-   changes at every launch, so both ways in need Business Foundry started from a terminal. */
+   changes at every launch, so both ways in need Proprietor started from a terminal. */
 function aiSetupText() {
   if (state.actor.ai_configured)
     return 'Ask for a structured review of the concept and record summaries. Original evidence bodies and full financial tables are not sent. Each request asks you first.';
@@ -3435,12 +3431,12 @@ function aiSetupText() {
   if (!isOwner())
     return `${none} Whether to set one up is a decision for the owner of this workspace.`;
   if (state.actor.desktop)
-    return `${none} A desktop app opened from Finder or the Start menu cannot be given a provider key, and its address changes each time it opens, so your own AI app cannot reach it either. To use either, run Business Foundry from a terminal with <code>foundry start</code>, with <code>OPENAI_API_KEY</code> and <code>FOUNDRY_OPENAI_MODEL</code> set in that terminal for the review. The file docs/AI.md in the project explains how.`;
-  return `${none} To use the optional review, set <code>OPENAI_API_KEY</code> and <code>FOUNDRY_OPENAI_MODEL</code> in the terminal you start Business Foundry from, then start it again, for example with <code>foundry start</code>. To work from your own AI app instead, give it an agent key through the agent adapter, <code>foundry mcp</code>. The file docs/AI.md in the project explains both.`;
+    return `${none} A desktop app opened from Finder or the Start menu cannot be given a provider key, and its address changes each time it opens, so your own AI app cannot reach it either. To use either, run Proprietor from a terminal with <code>foundry start</code>, with <code>OPENAI_API_KEY</code> and <code>FOUNDRY_OPENAI_MODEL</code> set in that terminal for the review. The file docs/AI.md in the project explains how.`;
+  return `${none} To use the optional review, set <code>OPENAI_API_KEY</code> and <code>FOUNDRY_OPENAI_MODEL</code> in the terminal you start Proprietor from, then start it again, for example with <code>foundry start</code>. To work from your own AI app instead, give it an agent key through the agent adapter, <code>foundry mcp</code>. The file docs/AI.md in the project explains both.`;
 }
 function inspAccess(kind, id) {
   const authority = flag(
-    '<b>Assistants advise. They cannot approve, submit, verify or move money.</b> Business Foundry does every sum itself, and every decision stays with a person.',
+    '<b>Assistants advise. They cannot approve, submit, verify or move money.</b> Proprietor does every sum itself, and every decision stays with a person.',
     true,
   );
   if (kind === 'key') {
@@ -4624,7 +4620,7 @@ function forecastDialog() {
       );
     },
     'Calculate and save',
-    'Save a model version that is never changed afterwards. Business Foundry calculates base, downside and upside cases with the same linked statements, using exact decimal arithmetic in the workspace currency.',
+    'Save a model version that is never changed afterwards. Proprietor calculates base, downside and upside cases with the same linked statements, using exact decimal arithmetic in the workspace currency.',
     selectAfter('money', 'plan:'),
   );
 }
@@ -4707,7 +4703,7 @@ function assumedText(o) {
   const assumed = o.data.assumed_inputs,
     inputs = o.data.inputs || {};
   if (!Array.isArray(assumed))
-    return "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.";
+    return "Not recorded. This analysis was saved before Proprietor recorded which inputs were given, so any of its figures may be the model's example values. Check each one.";
   if (!assumed.length)
     return 'Every input the calculation used was given. The model used none of its example values.';
   const parts = assumed.map((k) => {
@@ -4796,7 +4792,7 @@ function dealDialog(id) {
       evidenceSelect('evidence_ids', 'Source evidence', d.evidence_ids || []) +
       area('thesis', 'Investment thesis', d.thesis || '') +
       (unrecorded
-        ? `<p class="hint full">This analysis was saved before Foundry recorded which figures were given. A figure equal to the model's example value, today's or the one it had then, is left empty, and so are the rate and term of a loan left empty; enter them again if they are yours.</p>`
+        ? `<p class="hint full">This analysis was saved before Proprietor recorded which figures were given. A figure equal to the model's example value, today's or the one it had then, is left empty, and so are the rate and term of a loan left empty; enter them again if they are yours.</p>`
         : '') +
       dealFields
         .map(([k, t, example]) =>

@@ -4,7 +4,7 @@
 
 A business is a coordinated set of promises, rights, resources, decisions and cash flows. A useful system helps people establish those things, then keeps them coherent as facts change. Producing documents or simulating an executive team is only part of that work.
 
-Business Foundry explores a reusable operating foundation. A concept creates a workspace and a work plan. The same records support starting, acquiring and operating. An AI client can prepare work, but accountable people and actual evidence determine consequential completion. The public engine is separated from private business records.
+Proprietor explores a reusable operating foundation. A concept creates a workspace and a work plan. The same records support starting, acquiring and operating. An AI client can prepare work, but accountable people and actual evidence determine consequential completion. The public engine is separated from private business records.
 
 This is an architectural/product thesis, not a proven market advantage or a claim to be the first such product.
 
@@ -12,7 +12,7 @@ This is an architectural/product thesis, not a proven market advantage or a clai
 
 Existing tools already solve substantial parts of the problem. The integration opportunity is maintaining a consistent connection among facts, decisions, evidence, obligations and outcomes across them.
 
-| Area | Examples to evaluate | Foundry's proposed relationship |
+| Area | Examples to evaluate | Proprietor's proposed relationship |
 |---|---|---|
 | Formation and company legal work | [Stripe Atlas](https://stripe.com/atlas), [Clerky](https://www.clerky.com/) | Prepare the factual brief and retain accepted provider results; do not recreate their legal/provider operations |
 | Commercial agreement standards | [Common Paper](https://commonpaper.com/standards/) | Link a reviewed standard where applicable; preserve its license and attribution if later vendoring any template |

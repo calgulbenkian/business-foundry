@@ -327,7 +327,7 @@ DEAL_EXAMPLE_ROWS = {
 }
 
 ASSUMED_NOT_RECORDED = (
-    "Not recorded. This analysis was saved before Foundry recorded which inputs were given, "
+    "Not recorded. This analysis was saved before Proprietor recorded which inputs were given, "
     "so any of its figures may be the model's example values. Check each one."
 )
 NONE_ASSUMED = "Every input the calculation used was given. The model used none of its example values."

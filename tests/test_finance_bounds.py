@@ -556,7 +556,7 @@ def test_cli_prints_a_refusal_instead_of_a_traceback(tmp_path, capsys, monkeypat
         cli.main(["--db", db, "forecast", bid, str(plan)])
     assert stopped.value.code == 1
     err = capsys.readouterr().err
-    assert err.startswith("Foundry: ") and "discount_rate" in err and "Traceback" not in err
+    assert err.startswith("Proprietor: ") and "discount_rate" in err and "Traceback" not in err
 
     monkeypatch.setattr(finance, "forecast", lambda *a: D(1) / D(0))
     monkeypatch.setattr(finance, "acquisition", lambda *a: D("1E+999999") * D("1E+999999"))
@@ -566,7 +566,7 @@ def test_cli_prints_a_refusal_instead_of_a_traceback(tmp_path, capsys, monkeypat
             cli.main(["--db", db, command, bid, str(path)])
         assert stopped.value.code == 1
         err = capsys.readouterr().err
-        assert err.startswith("Foundry: The financial model cannot evaluate these inputs")
+        assert err.startswith("Proprietor: The financial model cannot evaluate these inputs")
         assert "Traceback" not in err
 
 

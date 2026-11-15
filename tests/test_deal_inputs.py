@@ -120,7 +120,7 @@ MINIMAL_SENTENCE = (
     "Debt in valuation equity bridge 0.00."
 )
 NOT_RECORDED = (
-    "Not recorded. This analysis was saved before Foundry recorded which inputs were given, "
+    "Not recorded. This analysis was saved before Proprietor recorded which inputs were given, "
     "so any of its figures may be the model's example values. Check each one."
 )
 REQUIRED = ["annual_revenue", "reported_ebitda", "purchase_price"]
@@ -208,14 +208,14 @@ def test_cli_refuses_a_configuration_without_a_required_figure(tmp_path, capsys)
     assert stopped.value.code == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "Foundry: deal.json was not accepted: reported_ebitda is required.\n"
+    assert captured.err == "Proprietor: deal.json was not accepted: reported_ebitda is required.\n"
 
     deal.write_text(json.dumps(without(SENT, *REQUIRED)))
     with pytest.raises(SystemExit) as stopped:
         cli.main(["--db", db, "acquire", bid, str(deal)])
     assert stopped.value.code == 1
     assert capsys.readouterr().err == (
-        "Foundry: deal.json was not accepted: annual_revenue is required; reported_ebitda is required; "
+        "Proprietor: deal.json was not accepted: annual_revenue is required; reported_ebitda is required; "
         "purchase_price is required.\n"
     )
     assert counts(store) == before and kinds(store, "deal") == 0
@@ -885,7 +885,7 @@ def test_the_cli_gives_each_refusal_as_one_line(tmp_path, capsys):
         assert stopped.value.code == 1
         captured = capsys.readouterr()
         assert captured.out == ""
-        assert captured.err == f"Foundry: deal.json was not accepted: Value error, {message}\n"
+        assert captured.err == f"Proprietor: deal.json was not accepted: Value error, {message}\n"
     assert counts(store) == before
 
 
@@ -998,7 +998,7 @@ def test_the_demo_runs_again_on_a_database_seeded_by_main(tmp_path, capsys):
 
     code, out = run_cli(["--db", db, "demo"], capsys)
     assert code == 0, out.err
-    assert "Foundry:" not in out.err
+    assert "Proprietor:" not in out.err
     assert counts(store) == before
     with store.read() as con:
         assert [tuple(r) for r in con.execute("SELECT id, version, data FROM objects WHERE kind='deal'")] == [
@@ -1017,7 +1017,7 @@ def test_the_demo_runs_twice_on_a_fresh_database(tmp_path, capsys):
 
     code, out = run_cli(["--db", db, "demo"], capsys)
     assert code == 0, out.err
-    assert "Foundry:" not in out.err
+    assert "Proprietor:" not in out.err
     assert counts(store) == first
     verify_demo(db, capsys)
 

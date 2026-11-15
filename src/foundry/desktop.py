@@ -1,4 +1,4 @@
-"""Run Foundry as a desktop app: a native window onto the local web interface.
+"""Run Proprietor as a desktop app: a native window onto the local web interface.
 
 The existing web application is served in this same process, on a loopback socket that the
 operating system numbers (port 0), and is shown in a pywebview window. The window signs in
@@ -34,7 +34,11 @@ from pathlib import Path
 
 from .store import Store, digest, now
 
-APP_NAME = "Business Foundry"
+# The name a person reads: window titles, dialogs and messages.
+APP_NAME = "Proprietor"
+# The per-user data folder keeps the product's first name, so an existing install still finds its
+# records. It is a location, not a display name: change it only with a migration of the folder.
+DATA_FOLDER_NAME = "Business Foundry"
 # How long the window has to use a launch code, counted from the moment it is told to open the
 # start address. On macOS the first request arrived 11 seconds after server start on a cold
 # first launch of the Qt engine; a first WebView2 start on a slow Windows PC, with antivirus scanning a new program, can take
@@ -73,34 +77,34 @@ class DesktopError(Exception):
 
 
 BROWSER_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Business Foundry</title></head>
+<html lang="en"><head><meta charset="utf-8"><title>Proprietor</title></head>
 <body>
-<h1>Open Business Foundry from its icon</h1>
-<p>This address belongs to the Business Foundry desktop app and does not open in a web browser.
-Close this tab and open Business Foundry from its icon.</p>
-<p>If you see this inside the Business Foundry window, quit the app and open it again.</p>
+<h1>Open Proprietor from its icon</h1>
+<p>This address belongs to the Proprietor desktop app and does not open in a web browser.
+Close this tab and open Proprietor from its icon.</p>
+<p>If you see this inside the Proprietor window, quit the app and open it again.</p>
 </body></html>
 """
 
 OPENING_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Business Foundry</title></head>
-<body><p>Opening Business Foundry\u2026</p></body></html>
+<html lang="en"><head><meta charset="utf-8"><title>Proprietor</title></head>
+<body><p>Opening Proprietor\u2026</p></body></html>
 """
 
 SIGN_IN_FAILED_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Business Foundry</title></head>
+<html lang="en"><head><meta charset="utf-8"><title>Proprietor</title></head>
 <body>
-<h1>Business Foundry could not open your records</h1>
-<p>The window could not sign in. Quit Business Foundry and open it again.</p>
-<p>If this keeps happening, the details are in desktop.log in the Business Foundry data
-folder.</p>
+<h1>Proprietor could not open your records</h1>
+<p>The window could not sign in. Quit Proprietor and open it again.</p>
+<p>If this keeps happening, the details are in desktop.log in the app's data folder, which is
+named Business Foundry.</p>
 </body></html>
 """
 
 WEBVIEW2_MISSING = (
-    "Business Foundry needs the Microsoft Edge WebView2 Runtime, which is not installed on this "
+    "Proprietor needs the Microsoft Edge WebView2 Runtime, which is not installed on this "
     "computer. Install it from Microsoft (search for \u201cWebView2 Runtime\u201d), then open "
-    "Business Foundry again."
+    "Proprietor again."
 )
 
 
@@ -116,7 +120,7 @@ def default_data_dir() -> Path:
     """
     from platformdirs import user_data_dir
 
-    return Path(user_data_dir(APP_NAME, appauthor=False, roaming=False))
+    return Path(user_data_dir(DATA_FOLDER_NAME, appauthor=False, roaming=False))
 
 
 BACKUP_DESTINATION = "/private/path/backup.db"
@@ -271,7 +275,7 @@ def prepare_data_dir(path: Path | None = None) -> Path:
     path = Path(os.path.abspath(path))
     if is_network_path(path):
         raise DesktopError(
-            f"Business Foundry keeps its records in {path}, which is on a network drive. Its "
+            f"Proprietor keeps its records in {path}, which is on a network drive. Its "
             "database is only safe on this computer's own disk, so it has not been opened. Move "
             "your user folder to a local disk, or ask your administrator, then open the app again."
         )
@@ -558,7 +562,7 @@ def instance_lock(data_dir: Path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise DesktopError(
-                "Business Foundry is already open. Switch to its window instead of opening it again."
+                "Proprietor is already open. Switch to its window instead of opening it again."
             ) from None
         yield path
     finally:
@@ -940,7 +944,7 @@ class DesktopApp:
         while not self.server.started:
             if not self._thread.is_alive() or time.monotonic() > deadline:
                 sock.close()
-                raise DesktopError("Business Foundry could not start its local server. See desktop.log.")
+                raise DesktopError("Proprietor could not start its local server. See desktop.log.")
             time.sleep(0.02)
         log.info("Serving on %s", host)
         if os.getenv("FOUNDRY_PUBLIC_ORIGIN"):
@@ -1182,7 +1186,7 @@ def open_window(app: DesktopApp, signals: SignalShutdown | None = None):
 
 def show_error(message: str):
     log.error(message)
-    print("Business Foundry: " + message, file=sys.stderr)
+    print(APP_NAME + ": " + message, file=sys.stderr)
     try:
         if sys.platform == "win32":
             ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x10)
@@ -1205,7 +1209,7 @@ def show_error(message: str):
 def main(argv=None):
     multiprocessing.freeze_support()
     replace_missing_streams()
-    parser = argparse.ArgumentParser(prog="foundry-desktop", description="Open Business Foundry.")
+    parser = argparse.ArgumentParser(prog="foundry-desktop", description="Open Proprietor.")
     parser.add_argument("--data-dir", type=Path, help="Folder for the private database (default: per-user)")
     # A Finder launch can add its own arguments; ignore anything unrecognised.
     args, _ = parser.parse_known_args(argv)
@@ -1232,8 +1236,8 @@ def main(argv=None):
         show_error(str(exc))
         raise SystemExit(1) from None
     except Exception:
-        log.exception("Business Foundry stopped unexpectedly.")
-        show_error("Business Foundry stopped unexpectedly. Details are in desktop.log.")
+        log.exception("Proprietor stopped unexpectedly.")
+        show_error("Proprietor stopped unexpectedly. Details are in desktop.log.")
         raise SystemExit(1) from None
 
 

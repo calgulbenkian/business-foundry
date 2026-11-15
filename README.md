@@ -1,16 +1,16 @@
-# Business Foundry
+# Proprietor
 
 An open operating foundation for **starting, acquiring and running a business**.
 
 Turn a concept into a connected business workspace: customers, offers, assets and rights, roles, decisions, evidence, work, financial scenarios, acquisition diligence, working documents and a first sale through payment. Starting and buying are two entry paths over the same records.
 
-**v0.1 is a working local-first alpha.** It prepares and tracks real work with human review. Government filings, bank onboarding, signatures and payments happen with the relevant providers; Foundry records their receipts. It does not certify legal compliance or replace legal, tax, accounting or investment judgment.
+**v0.1 is a working local-first alpha.** It prepares and tracks real work with human review. Government filings, bank onboarding, signatures and payments happen with the relevant providers; Proprietor records their receipts. It does not certify legal compliance or replace legal, tax, accounting or investment judgment.
 
 ![The synthetic Polymer demo workspace: a source list with Start here, the journey lines and the records, Today's list with a strip of the journey map and the one next action, and a step's inspector saying where it stands](docs/images/workspace.png)
 
 ## Run it
 
-**New to the terminal? Follow [your first hour with Foundry](docs/FIRST_HOUR.md).**
+**New to the terminal? Follow [your first hour with Proprietor](docs/FIRST_HOUR.md).**
 
 You need [uv](https://docs.astral.sh/uv/getting-started/installation/). It also provides Python 3.11 or newer if your computer does not have it.
 
@@ -20,7 +20,9 @@ cd business-foundry
 uv run foundry start
 ```
 
-On the first run, uv installs Foundry's dependencies into `.venv` in that folder (downloading them if needed), then Foundry creates a private workspace and owner key in `.foundry/`. When the server is ready, the terminal shows the address to open, **http://127.0.0.1:8765**, your private sign-in key and how to stop (Ctrl+C), and your default browser opens at that address (on Linux, only when a desktop session is running). Paste the key into the sign-in screen. The application works without an AI subscription or API key.
+The command is still `foundry`, and technical names such as the `.foundry/` folder and the desktop data folder `Business Foundry` move in a later release.
+
+On the first run, uv installs Proprietor's dependencies into `.venv` in that folder (downloading them if needed), then Proprietor creates a private workspace and owner key in `.foundry/`. When the server is ready, the terminal shows the address to open, **http://127.0.0.1:8765**, your private sign-in key and how to stop (Ctrl+C), and your default browser opens at that address (on Linux, only when a desktop session is running). Paste the key into the sign-in screen. The application works without an AI subscription or API key.
 
 The first run also adds the synthetic example business described below; use `uv run foundry start --empty` for an empty workspace instead. Later runs reuse the same workspace and key and never add the example again. `start` listens on 127.0.0.1 only. `--port` chooses another port and `--no-browser` skips the browser. If the output is not a terminal (for example, piped or captured by a service), the key is not printed. The output names the command that shows it instead, for example `uv run foundry token`.
 
@@ -40,7 +42,7 @@ Alternative: `python -m venv .venv`, activate it, `pip install .`, then use `fou
 
 ### Desktop window (preview)
 
-Use `foundry start` to work in your web browser, or when an AI client must reach Foundry at a fixed address ([AI setup](docs/AI.md)). Use the desktop window if you would rather have Foundry in a window of its own.
+Use `foundry start` to work in your web browser, or when an AI client must reach Proprietor at a fixed address ([AI setup](docs/AI.md)). Use the desktop window if you would rather have Proprietor in a window of its own.
 
 ```sh
 uv sync --locked --extra desktop

@@ -34,7 +34,7 @@ from foundry.api import create_app
 from foundry.desktop import BROWSER_PAGE, DesktopApp, DesktopError, LaunchSignIn
 from foundry.store import Store, digest
 
-PLAIN_PAGE_TEXT = "Open Business Foundry from its icon"
+PLAIN_PAGE_TEXT = "Open Proprietor from its icon"
 
 
 @pytest.fixture
@@ -68,6 +68,20 @@ def test_data_dir_is_the_per_user_application_folder_on_this_os(monkeypatch):
     else:
         base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
         assert path == Path(base) / "Business Foundry"
+
+
+def test_the_shown_name_is_proprietor_and_the_data_folder_keeps_its_first_name(monkeypatch):
+    # The product was renamed; an existing install must still find its records. The window title and
+    # messages use the new name, and the per-user folder that holds the database does not move.
+    pytest.importorskip("platformdirs")
+    assert desktop.APP_NAME == "Proprietor"
+    assert desktop.DATA_FOLDER_NAME == "Business Foundry"
+    assert desktop.default_data_dir().name == "Business Foundry"
+    for page in (desktop.BROWSER_PAGE, desktop.OPENING_PAGE, desktop.SIGN_IN_FAILED_PAGE):
+        assert "<title>Proprietor</title>" in page
+    assert desktop.WEBVIEW2_MISSING.startswith("Proprietor needs")
+    # The sign-in failure page names the folder as it is on disk, so a person can find desktop.log.
+    assert "named Business Foundry" in desktop.SIGN_IN_FAILED_PAGE
 
 
 def test_the_old_default_fails_from_the_root_folder_and_the_desktop_app_does_not(tmp_path, monkeypatch):
