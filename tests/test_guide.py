@@ -381,7 +381,8 @@ def test_a_forecast_saved_under_another_jurisdiction_reopens_the_forecast_stop(s
         ),
     )
     assert done(service.guide(owner, bid)) == [True, True, True, True, True, False]
-    # A forecast stores no evidence versions: a jurisdiction change is what puts it out of date.
+    # This forecast cites no evidence, so a jurisdiction change is what puts it out of date here. A
+    # forecast whose cited evidence is withdrawn is out of date too (tests/test_forecast_evidence.py).
     service.change_jurisdiction(
         owner,
         bid,

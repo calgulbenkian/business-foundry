@@ -126,7 +126,7 @@ Steps move through states. The **Key** at the bottom of the sources lists them:
 
 These states are kept apart on purpose: preparing something is not approving it, and sending something is not the same as confirming it worked.
 
-**Evidence** is the original text you paste in, such as an email, an agreement clause or interview notes, with an optional web address. It cannot be edited after saving; a correction is a new item. It shows **Not yet reviewed** until an owner or reviewer records a human review, and then **Reviewed**. If that review is withdrawn with **Withdraw verification**, the item is kept and marked **Withdrawn**, and completed work that relied on it reopens as **Needs review**. An **external receipt** is evidence that something happened outside Proprietor, such as a filing confirmation or a bank receipt.
+**Evidence** is the original text you paste in, such as an email, an agreement clause or interview notes, with an optional web address. It cannot be edited after saving; a correction is a new item. It shows **Not yet reviewed** until an owner or reviewer records a human review, and then **Reviewed**. If that review is withdrawn with **Withdraw verification**, the item is kept and marked **Withdrawn**, and completed work that relied on it reopens as **Needs review**. Deal analyses and forecasts that cite it are marked out of date, and a new analysis, forecast or step decision cannot cite it; a record can, for example a risk that discusses it. An **external receipt** is evidence that something happened outside Proprietor, such as a filing confirmation or a bank receipt.
 
 ## Stop, start again, and keep your data safe
 

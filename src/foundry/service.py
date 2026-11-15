@@ -127,12 +127,59 @@ ANALYSIS_REDO = {"deal": "run a revised analysis", "financial_plan": "save a rev
 ANALYSIS_EVENTS = ("deal.created", "financial_plan.created")
 
 
-def evidence_changed_reason():
+EVIDENCE_CHANGED_MESSAGES = {
+    "deal": "Supporting evidence has changed since this deal analysis was saved. "
+    "Run a revised analysis before relying on these figures.",
+    "financial_plan": "Evidence this forecast cites has been withdrawn. "
+    "Save a revised forecast before relying on these figures.",
+}
+
+
+def evidence_changed_reason(kind):
+    return {"code": "evidence_changed", "message": EVIDENCE_CHANGED_MESSAGES[kind]}
+
+
+def evidence_missing_reason(kind):
+    redo = ANALYSIS_REDO[kind]
     return {
-        "code": "evidence_changed",
-        "message": "Supporting evidence has changed since this deal analysis was saved. "
-        "Run a revised analysis before relying on these figures.",
+        "code": "evidence_missing",
+        "message": f"Evidence this {ANALYSIS_NAMES[kind]} cites is not in this business's records. "
+        f"{redo[0].upper()}{redo[1:]} before relying on these figures.",
     }
+
+
+def evidence_standing(obj, by_id):
+    """(changed, missing) for the evidence a saved deal or forecast cites, given the business's records
+    by id.
+
+    changed: a deal keeps the version of each item it cited, and any later change counts: its earnings
+    adjustments count only when their evidence was reviewed, so a review changes its figures. A
+    forecast keeps no versions. Its figures do not depend on whether its evidence was reviewed, so only
+    withdrawal counts: an item it cites whose state is now rejected. A new forecast cannot cite withdrawn
+    evidence, so that is evidence withdrawn after the forecast was saved, or cited by a forecast saved
+    before that rule existed.
+
+    missing: a cited id that is not evidence of this business. Only a damaged or hand-edited database
+    holds one; it is reported, never raised, so the business can still be read. A stored
+    evidence_versions that is not an object, or evidence_ids that is not a list, cites nothing.
+    Both are worked out from current evidence on every read.
+    """
+    deal = obj["kind"] == "deal"
+    stored = obj["data"].get("evidence_versions" if deal else "evidence_ids")
+    if deal:
+        cited = stored.items() if isinstance(stored, dict) else []
+    else:
+        cited = [(e, None) for e in stored] if isinstance(stored, list) else []
+    changed = missing = False
+    for eid, version in cited:
+        held = by_id.get(eid) if isinstance(eid, str) else None
+        if held is None or held["kind"] != "evidence":
+            missing = True
+        elif deal:
+            changed = changed or held["version"] != version
+        else:
+            changed = changed or held["state"] == "rejected"
+    return changed, missing
 
 
 def jurisdiction_changed_reason(kind, saved, current):
@@ -457,6 +504,29 @@ class Service:
             result.append(obj)
         return result
 
+    def refuse_withdrawn(self, ids, evidence, supports="an analysis"):
+        """Refuse a new deal analysis, forecast or step move that cites withdrawn evidence, naming each item
+        in the order it was cited. A record may still cite withdrawn evidence: a risk can discuss the
+        withdrawn document.
+
+        Nothing saved before this rule is rewritten. A forecast saved earlier that cites evidence already
+        withdrawn is marked stale by the snapshot. A deal saved earlier that did is not: its rule compares
+        the versions it saved, and those were already the withdrawn ones. That is a known limit."""
+        by_id = {e["id"]: e for e in evidence}
+        withdrawn = [by_id[i] for i in dict.fromkeys(ids) if by_id[i]["state"] == "rejected"]
+        if not withdrawn:
+            return
+        names = [f"{e['title']} ({e['id']})" for e in withdrawn]
+        if len(names) == 1:
+            raise DomainError(
+                f"Evidence {names[0]} was withdrawn and cannot support {supports}. "
+                "Leave it out, or cite the evidence that replaced it."
+            )
+        raise DomainError(
+            f"Evidence {', '.join(names[:-1])} and {names[-1]} were withdrawn and cannot support "
+            f"{supports}. Leave them out, or cite the evidence that replaced them."
+        )
+
     def add_record(self, actor, bid, key, payload, object_id=None):
         review = payload["certainty"] == "verified"
 
@@ -617,10 +687,10 @@ class Service:
         items = []
         if item["data"].get("deal_id"):
             deal = self.store.get(con, bid, item["data"]["deal_id"], "deal")
-            if any(
-                self.store.get(con, bid, eid, "evidence")["version"] != version
-                for eid, version in deal["data"].get("evidence_versions", {}).items()
-            ):
+            held = {e["id"]: e for e in self.store.objects(con, bid, "evidence")}
+            # The snapshot's rule. A cited id the business does not hold marks the analysis stale there
+            # and blocks nothing here.
+            if evidence_standing(deal, held)[0]:
                 items.append(
                     {
                         "code": "deal_evidence",
@@ -686,14 +756,15 @@ class Service:
             }
             if state not in allowed.get(old["state"], set()):
                 raise DomainError(f"Cannot move from {old['state']} to {state}.")
-            evidence = self.references(
-                con,
-                bid,
-                payload["evidence_ids"],
-                "evidence",
-                verified=state in {"approved", "submitted", "verified", "not_applicable"},
-            )
-            if state in {"approved", "submitted", "verified", "not_applicable"} and not evidence:
+            decision = state in {"approved", "submitted", "verified", "not_applicable"}
+            evidence = self.references(con, bid, payload["evidence_ids"], "evidence")
+            # Withdrawn evidence supports no step, whatever the move. This comes before the review check
+            # so nobody is told to review a withdrawn item: a review would set it back to verified and
+            # undo the withdrawal. The note may still mention the withdrawn document in words.
+            self.refuse_withdrawn(payload["evidence_ids"], evidence, "a step")
+            if decision:
+                self.references(con, bid, payload["evidence_ids"], "evidence", verified=True)
+            if decision and not evidence:
                 raise DomainError("Attach reviewed evidence for this decision.")
             if state in {"approved", "submitted", "verified"}:
                 blockers = self.blockers(con, bid, old)
@@ -736,7 +807,8 @@ class Service:
 
     def save_forecast(self, actor, bid, key, payload):
         def run(con):
-            self.references(con, bid, payload["evidence_ids"], "evidence")
+            evidence = self.references(con, bid, payload["evidence_ids"], "evidence")
+            self.refuse_withdrawn(payload["evidence_ids"], evidence)
             result = evaluate(finance.forecast, ForecastInputs.model_validate(payload["inputs"]))
             item = self.store.add(
                 con,
@@ -775,6 +847,7 @@ class Service:
                 a["evidence_id"] for a in inputs["adjustments"] if a.get("evidence_id")
             ]
             evidence = self.references(con, bid, ids, "evidence")
+            self.refuse_withdrawn(ids, evidence)
             reviewed = {e["id"] for e in evidence if e["state"] == "verified"}
             result = evaluate(finance.acquisition, deal, reviewed)
             data = {
@@ -963,8 +1036,11 @@ class Service:
                 obj["stale_reasons"] = reasons
             if obj["kind"] in ANALYSIS_NAMES:
                 reasons = []
-                if any(by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()):
-                    reasons.append(evidence_changed_reason())
+                changed, missing = evidence_standing(obj, by_id)
+                if changed:
+                    reasons.append(evidence_changed_reason(obj["kind"]))
+                if missing:
+                    reasons.append(evidence_missing_reason(obj["kind"]))
                 saved = saved_under.get(obj["id"])
                 if saved is not None and saved != jurisdiction:
                     reasons.append(jurisdiction_changed_reason(obj["kind"], saved, jurisdiction))
