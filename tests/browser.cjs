@@ -906,7 +906,7 @@ async function startHere(page, context, browser, origin, keyFile) {
       .locator('p.prose')
       .innerText();
   const served = await advice();
-  assert(served.includes('in the terminal you start Business Foundry from'), served);
+  assert(served.includes('in the terminal you start Proprietor from'), served);
   assert(!served.includes('on the server'), served);
   await page.route('**/api/me', async (route) => {
     const response = await route.fetch();
@@ -971,6 +971,9 @@ async function main() {
     // the checks of what Today does not hold wait until the page has finished loading it
     await quiet(page);
     assert.equal(await page.locator('#list-title').innerText(), 'Today');
+    // The product's name, as a person reads it in the tab and the toolbar.
+    assert.equal(await page.title(), 'Proprietor');
+    assert.equal(await page.locator('.toolbar .appname').innerText(), 'Proprietor');
     // The demo's guided path is done, so it opens on Today, which names the one next action that
     // Start here gives: the first step ready to start. Its only ready step has no prerequisite, so
     // nothing claims its prerequisites are complete.
@@ -1153,7 +1156,7 @@ async function main() {
     await source('money');
     assert(
       (await page.locator('#list').innerText()).includes(
-        'Calculated by Business Foundry with exact decimal arithmetic. No assistant was involved.',
+        'Calculated by Proprietor with exact decimal arithmetic. No assistant was involved.',
       ),
     );
     const demoBid = await page.locator('#business-select').inputValue();
@@ -1878,7 +1881,7 @@ async function main() {
     await page.locator('#insp-title', { hasText: 'Browser synthetic target' }).waitFor();
     assert.equal(
       await page.locator('#insp .assumed-inputs').innerText(),
-      "Not recorded. This analysis was saved before Foundry recorded which inputs were given, so any of its figures may be the model's example values. Check each one.",
+      "Not recorded. This analysis was saved before Proprietor recorded which inputs were given, so any of its figures may be the model's example values. Check each one.",
     );
     // A 1.0.1 analysis shows the figures it has, under their earlier names, and none it lacks.
     const oldFigs = await page.locator('#insp .figs').innerText();
@@ -4427,17 +4430,17 @@ print(json.dumps({
       const database = '/Users/founder/Library/Application Support/Business Foundry/foundry.db';
       const command = `uv run foundry --db '${database}' backup /private/path/backup.db`;
       const runText = (c) =>
-        `To back them up, open a terminal in the folder you start Business Foundry from. Then run ${c}. Change /private/path/backup.db to where you want the backup saved.`;
+        `To back them up, open a terminal in the folder you start Proprietor from. Then run ${c}. Change /private/path/backup.db to where you want the backup saved.`;
       let shown = await shownWith({ database, backup_command: command });
       assert.deepEqual(shown.panel, [
-        `Business Foundry keeps your records in ${database}.`,
+        `Proprietor keeps your records in ${database}.`,
         runText(command),
         restoreText,
         protectText,
       ]);
       assert.equal(shown.panelCode[1], command, 'the second code is the command');
       assert.deepEqual(shown.integrity, [
-        `Business Foundry keeps your records in ${database}.`,
+        `Proprietor keeps your records in ${database}.`,
         runText(command),
         holdText,
       ]);
@@ -4453,7 +4456,7 @@ print(json.dumps({
       assert.equal(shown.integrityMarkup, 0, 'none in the integrity view');
       // no ready command: null, the key missing, an empty string, or not a string
       const noCommand =
-        'To back them up, open a terminal in the folder you start Business Foundry from. Then run uv run foundry --db DATABASE_PATH backup /private/path/backup.db. Put the path above, quoted for your shell, in place of DATABASE_PATH. Change /private/path/backup.db to where you want the backup saved.';
+        'To back them up, open a terminal in the folder you start Proprietor from. Then run uv run foundry --db DATABASE_PATH backup /private/path/backup.db. Put the path above, quoted for your shell, in place of DATABASE_PATH. Change /private/path/backup.db to where you want the backup saved.';
       for (const [what, value] of [
         ['a null command', { database, backup_command: null }],
         ['no command key', { database }],
@@ -4463,17 +4466,12 @@ print(json.dumps({
         shown = await shownWith(value);
         assert.deepEqual(
           shown.panel,
-          [
-            `Business Foundry keeps your records in ${database}.`,
-            noCommand,
-            restoreText,
-            protectText,
-          ],
+          [`Proprietor keeps your records in ${database}.`, noCommand, restoreText, protectText],
           `${what}: the panel`,
         );
         assert.deepEqual(
           shown.integrity,
-          [`Business Foundry keeps your records in ${database}.`, noCommand, holdText],
+          [`Proprietor keeps your records in ${database}.`, noCommand, holdText],
           `${what}: the integrity view`,
         );
       }

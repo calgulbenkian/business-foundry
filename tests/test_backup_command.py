@@ -1,4 +1,4 @@
-"""`foundry backup`: it copies only a Foundry database that exists, and says what it saved.
+"""`foundry backup`: it copies only a Proprietor database that exists, and says what it saved.
 
 Every command here names its database with --db, except the default-path test, which first
 changes to an empty temporary folder. No test runs a command without --db from the repository.
@@ -73,7 +73,7 @@ def test_a_named_database_that_does_not_exist_is_refused_and_nothing_is_created(
     )
     assert code == 1
     assert err == (
-        f"Foundry: No database at {real(work)}/absent/foundry.db. Name the database to back up with --db.\n"
+        f"Proprietor: No database at {real(work)}/absent/foundry.db. Name the database to back up with --db.\n"
     )
     assert tree(work) == []
 
@@ -84,7 +84,7 @@ def test_the_default_database_is_refused_when_absent_and_not_created(tmp_path, c
     code, err = refused(capsys, "backup", str(tmp_path / "out" / "backup.db"))
     assert code == 1
     assert err == (
-        f"Foundry: No database at {real(tmp_path)}/.foundry/foundry.db. "
+        f"Proprietor: No database at {real(tmp_path)}/.foundry/foundry.db. "
         "Name the database to back up with --db.\n"
     )
     assert tree(tmp_path) == []
@@ -95,12 +95,12 @@ def test_a_database_named_by_the_environment_is_refused_when_absent(tmp_path, ca
     code, err = refused(capsys, "backup", str(tmp_path / "out" / "backup.db"))
     assert code == 1
     assert err == (
-        f"Foundry: No database at {real(tmp_path)}/env/foundry.db. Name the database to back up with --db.\n"
+        f"Proprietor: No database at {real(tmp_path)}/env/foundry.db. Name the database to back up with --db.\n"
     )
     assert tree(tmp_path) == []
 
 
-# R2: a source that is not a Foundry database ------------------------------------------------
+# R2: a source that is not a Proprietor database ------------------------------------------------
 
 
 def other_sqlite(path: Path):
@@ -129,7 +129,7 @@ def test_a_source_that_is_not_a_foundry_database_is_refused_and_left_as_it_was(t
     source = folder / "foundry.db"
     SOURCES[kind](source)
     before, listing = contents(source), os.listdir(folder)
-    expected = f"Foundry: {real(source)} is not a Foundry database.\n"
+    expected = f"Proprietor: {real(source)} is not a Proprietor database.\n"
 
     destination = tmp_path / "out" / "new" / "backup.db"
     assert refused(capsys, "--db", str(source), "backup", str(destination)) == (1, expected)
@@ -164,7 +164,7 @@ def test_a_wal_mode_database_that_is_not_foundrys_is_refused_and_only_sqlite_add
     destination = tmp_path / "out" / "new" / "backup.db"
     assert refused(capsys, "--db", str(source), "backup", str(destination)) == (
         1,
-        f"Foundry: {real(source)} is not a Foundry database.\n",
+        f"Proprietor: {real(source)} is not a Proprietor database.\n",
     )
     assert tree(tmp_path) == ["source", "source/foundry.db", "source/foundry.db-shm", "source/foundry.db-wal"]
     assert source.read_bytes() == before
@@ -276,7 +276,7 @@ def test_restore_names_a_relative_source_that_is_not_foundrys_by_its_resolved_pa
     monkeypatch.chdir(tmp_path)  # never the repository folder
     assert refused(capsys, "--db", "new/foundry.db", "restore", "plain.db") == (
         1,
-        f"Foundry: {real(tmp_path)}/plain.db is not a Foundry database.\n",
+        f"Proprietor: {real(tmp_path)}/plain.db is not a Proprietor database.\n",
     )
     assert (tmp_path / "plain.db").read_bytes() == before
     assert not (tmp_path / "new" / "foundry.db").exists()
@@ -295,7 +295,7 @@ def test_a_database_with_foundrys_metadata_but_no_businesses_table_is_refused(tm
     destination = tmp_path / "out" / "backup.db"
     assert refused(capsys, "--db", str(source), "backup", str(destination)) == (
         1,
-        f"Foundry: {real(source)} is not a Foundry database.\n",
+        f"Proprietor: {real(source)} is not a Proprietor database.\n",
     )
     assert source.read_bytes() == before and os.listdir(folder) == ["foundry.db"]
     assert not destination.exists() and not (tmp_path / "out").exists()

@@ -1,4 +1,4 @@
-# Working in Business Foundry
+# Working in Proprietor
 
 - Keep `.foundry/`, credentials, private business data and real customer documents out of Git. Use synthetic fixtures and screenshots.
 - Business truth, assumptions, human reviews and external receipts are separate. Do not collapse prepared, approved, submitted and verified into one completion flag.

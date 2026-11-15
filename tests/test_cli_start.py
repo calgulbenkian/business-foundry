@@ -180,7 +180,7 @@ def test_block_and_browser_come_only_after_the_server_is_ready(tmp_path, monkeyp
 
     class RecordingTerminal(Terminal):
         def write(self, text):
-            if "Business Foundry is running." in text:
+            if "Proprietor is running." in text:
                 events.append("block shown")
             return super().write(text)
 
@@ -247,7 +247,7 @@ def test_port_already_taken(tmp_path, capsys, through_main):
             assert code == 1
             out, err = out_stream.getvalue(), err_stream.getvalue()
     assert f"Port {port} is already in use" in err
-    assert f"Foundry may already be running at http://127.0.0.1:{port}" in err
+    assert f"Proprietor may already be running at http://127.0.0.1:{port}" in err
     assert "--port" in err
     assert "Sign-in key" not in out + err and "bf_" not in out + err
     assert "running." not in out
@@ -397,8 +397,8 @@ def test_end_to_end_start_sign_in_and_interrupt(tmp_path):
             process.wait()
     reader.join(5)
     output = b"".join(chunks).decode()
-    assert "Business Foundry is running." in output
-    assert "Foundry has stopped." in output
+    assert "Proprietor is running." in output
+    assert "Proprietor has stopped." in output
     assert "Traceback" not in output and "KeyboardInterrupt" not in output
     assert key not in output
 
@@ -607,7 +607,7 @@ def test_sigterm_stops_start_as_ctrl_c_does(tmp_path):
     for name, (code, output) in results.items():
         assert code == 0, (name, output)
         last = output.rstrip().splitlines()[-1]
-        assert last == f"Foundry has stopped. Your workspace is saved in {tmp_path / name}", (name, output)
+        assert last == f"Proprietor has stopped. Your workspace is saved in {tmp_path / name}", (name, output)
         assert "Traceback" not in output and "KeyboardInterrupt" not in output, (name, output)
 
 
@@ -694,10 +694,10 @@ def test_a_stop_during_first_setup_waits_for_the_whole_example(tmp_path, monkeyp
     assert workspace_summary(db) == workspace_summary(reference.path)
     text = out.getvalue()
     assert "Added the example business 'Polymer Geospatial · demo'." in text
-    assert "Business Foundry is running." not in text
+    assert "Proprietor is running." not in text
     assert text.rstrip().endswith(
-        f"Foundry has stopped. It finished setting up first, so your workspace in {db.parent} is complete. "
-        "Run the same command again to start Foundry."
+        f"Proprietor has stopped. It finished setting up first, so your workspace in {db.parent} is complete. "
+        "Run the same command again to start Proprietor."
     )
     monkeypatch.setattr(Service, "save_forecast", original)
     with Running(db, opener=lambda url: None) as second:
@@ -734,4 +734,4 @@ def test_an_ignored_ctrl_c_during_setup_stays_ignored(tmp_path, monkeypatch):
         signal.signal(signal.SIGINT, previous)
     assert code == 0 and served == [True]
     assert after is signal.SIG_IGN
-    assert "Business Foundry is running." in out.getvalue()
+    assert "Proprietor is running." in out.getvalue()

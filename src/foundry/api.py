@@ -167,7 +167,7 @@ def create_app(db_path=None, *, allowed_hosts=None, ai_transport=None, desktop=N
     service, app = (
         Service(store),
         FastAPI(
-            title="Business Foundry",
+            title="Proprietor",
             version="0.1.0",
             # The Swagger page needs third-party scripts and an inline script, which the
             # content security policy forbids; publish the schema only.
