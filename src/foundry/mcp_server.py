@@ -183,6 +183,8 @@ def build_server():
         "evidence and records, and attest external submissions or payments.\n"
         "- The planning jurisdiction is a human decision. No tool changes it. Prepare the facts and "
         "evidence a human owner or reviewer needs to select it.\n"
+        "- Evidence in state 'rejected' has been withdrawn by a person. It cannot support an analysis "
+        "or a task decision; cite it only in a record that discusses it.\n"
         "- Confirm with the human before each change and say which tool you will call."
     )
 

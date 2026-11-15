@@ -4103,9 +4103,12 @@ const choose = (name, title, options, current = '', hint = '', multi = false) =>
       return `<option value="${h(v)}" ${on ? 'selected' : ''}>${h(t)}</option>`;
     })
     .join('')}</select>${hint ? `<span class="hint">${h(hint)}</span>` : ''}</label>`;
-const evidenceChoices = (onlyReviewed = false) =>
+/* The evidence a form offers. A deal analysis or forecast cannot cite withdrawn evidence (the server
+   refuses it), so its forms leave withdrawn items out; a record or a step may still cite one. */
+const evidenceChoices = (onlyReviewed = false, analysis = false) =>
   objs('evidence')
     .filter((o) => !onlyReviewed || o.state === 'verified')
+    .filter((o) => !analysis || o.state !== 'rejected')
     .map((o) => [o.id, `${o.title} · ${evInfo(o).short}`]);
 const evidenceSelect = (
   name = 'evidence_ids',
@@ -4113,11 +4116,12 @@ const evidenceSelect = (
   current = [],
   reviewed = false,
   multi = true,
+  analysis = false,
 ) =>
   choose(
     name,
     title,
-    (multi ? [] : [['', 'Choose evidence…']]).concat(evidenceChoices(reviewed)),
+    (multi ? [] : [['', 'Choose evidence…']]).concat(evidenceChoices(reviewed, analysis)),
     current,
     multi ? 'Select one or more. On a computer, use Ctrl or Command to select several.' : '',
     multi,
@@ -4577,7 +4581,7 @@ function forecastDialog() {
   formDialog(
     'Build a financial model',
     input('title', 'Version name', 'Operating plan', 'text', '', 'required') +
-      evidenceSelect() +
+      evidenceSelect('evidence_ids', 'Supporting evidence', [], false, true, true) +
       financeFields
         .map(([k, t, v]) =>
           k === 'fixed_cost_step_month'
@@ -4786,10 +4790,26 @@ function dealDialog(id) {
   const d = o ? o.data.inputs : {};
   const assumed = o ? o.data.assumed_inputs : [];
   const unrecorded = o && !Array.isArray(assumed);
+  /* A new analysis cannot cite withdrawn evidence. The earlier analysis's withdrawn items are not
+     offered, and an adjustment it kept that cited one is kept without that evidence: an adjustment
+     enters normalized earnings only with reviewed evidence, so its figures are unchanged. */
+  const withdrawn = (id) => Boolean(id) && find(id)?.state === 'rejected';
+  const dropped = [
+    ...new Set([
+      ...(d.evidence_ids || []).filter(withdrawn),
+      ...(d.adjustments || []).map((a) => a.evidence_id).filter(withdrawn),
+    ]),
+  ];
+  const retained = (d.adjustments || []).map((a) =>
+    withdrawn(a.evidence_id) ? { ...a, evidence_id: null } : a,
+  );
   formDialog(
     'Analyze an acquisition',
     input('target', 'Target business', d.target || '', 'text', '', 'required') +
-      evidenceSelect('evidence_ids', 'Source evidence', d.evidence_ids || []) +
+      (dropped.length
+        ? `<p class="hint full">Withdrawn evidence cannot support a new analysis, so it is left out: ${dropped.map((id) => h(find(id).title)).join(', ')}. An adjustment that cited it is kept without evidence and does not enter normalized earnings.</p>`
+        : '') +
+      evidenceSelect('evidence_ids', 'Source evidence', d.evidence_ids || [], false, true, true) +
       area('thesis', 'Investment thesis', d.thesis || '') +
       (unrecorded
         ? `<p class="hint full">This analysis was saved before Proprietor recorded which figures were given. A figure equal to the model's example value, today's or the one it had then, is left empty, and so are the rate and term of a loan left empty; enter them again if they are yours.</p>`
@@ -4824,13 +4844,13 @@ function dealDialog(id) {
               ),
         )
         .join('') +
-      `<details class="full"><summary>Earnings adjustments (${d.adjustments?.length || 0} retained from prior analysis)</summary><p class="hint">Existing adjustments are retained. Add another here; only adjustments with reviewed evidence enter normalized earnings. Management replacement is deducted separately.</p>${d.adjustments?.length ? `<pre>${h(JSON.stringify(d.adjustments, null, 2))}</pre>` : ''}<div class="form-grid spaced">${input('adjustment_label', 'New adjustment label')}${input('adjustment_amount', 'Adjustment amount', 0, 'number', 'Positive adds to EBITDA; negative deducts.', 'step="any"')}${evidenceSelect('adjustment_evidence', 'Adjustment evidence', '', false, false)}</div></details>`,
+      `<details class="full"><summary>Earnings adjustments (${retained.length} retained from prior analysis)</summary><p class="hint">Existing adjustments are retained. Add another here; only adjustments with reviewed evidence enter normalized earnings. Management replacement is deducted separately.</p>${retained.length ? `<pre>${h(JSON.stringify(retained, null, 2))}</pre>` : ''}<div class="form-grid spaced">${input('adjustment_label', 'New adjustment label')}${input('adjustment_amount', 'Adjustment amount', 0, 'number', 'Positive adds to EBITDA; negative deducts.', 'step="any"')}${evidenceSelect('adjustment_evidence', 'Adjustment evidence', '', false, false, true)}</div></details>`,
     async (f, key, scope) => {
       const body = {
         target: f.get('target'),
         thesis: f.get('thesis'),
         evidence_ids: f.getAll('evidence_ids'),
-        adjustments: d.adjustments || [],
+        adjustments: retained,
       };
       // An empty figure is left out, so the server records it as assumed rather than as given.
       for (const [k] of dealFields) {

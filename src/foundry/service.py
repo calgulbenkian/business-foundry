@@ -127,12 +127,31 @@ ANALYSIS_REDO = {"deal": "run a revised analysis", "financial_plan": "save a rev
 ANALYSIS_EVENTS = ("deal.created", "financial_plan.created")
 
 
-def evidence_changed_reason():
-    return {
-        "code": "evidence_changed",
-        "message": "Supporting evidence has changed since this deal analysis was saved. "
-        "Run a revised analysis before relying on these figures.",
-    }
+EVIDENCE_CHANGED_MESSAGES = {
+    "deal": "Supporting evidence has changed since this deal analysis was saved. "
+    "Run a revised analysis before relying on these figures.",
+    "financial_plan": "Evidence this forecast cites has been withdrawn. "
+    "Save a revised forecast before relying on these figures.",
+}
+
+
+def evidence_changed_reason(kind):
+    return {"code": "evidence_changed", "message": EVIDENCE_CHANGED_MESSAGES[kind]}
+
+
+def evidence_changed(obj, by_id):
+    """Whether evidence a saved deal or forecast relied on has changed in a way that undermines it.
+
+    A deal keeps the version of each item it cited, and any later change counts: its earnings
+    adjustments count only when their evidence was reviewed, so a review changes its figures. A
+    forecast keeps no versions. Its figures do not depend on whether its evidence was reviewed, so only
+    withdrawal counts: an item it cites whose state is now rejected. A new forecast cannot cite withdrawn
+    evidence, so that is evidence withdrawn after the forecast was saved, or cited by a forecast saved
+    before that rule existed. Both are worked out from current evidence on every read.
+    """
+    if obj["kind"] == "deal":
+        return any(by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items())
+    return any(by_id[e]["state"] == "rejected" for e in obj["data"].get("evidence_ids", []))
 
 
 def jurisdiction_changed_reason(kind, saved, current):
@@ -457,6 +476,25 @@ class Service:
             result.append(obj)
         return result
 
+    def refuse_withdrawn(self, ids, evidence):
+        """Refuse a new deal analysis or forecast that cites withdrawn evidence, naming each item in the
+        order it was cited. A record may still cite withdrawn evidence: a risk can discuss the withdrawn
+        document. Analyses saved before this rule are not rewritten; the snapshot marks them stale."""
+        by_id = {e["id"]: e for e in evidence}
+        withdrawn = [by_id[i] for i in dict.fromkeys(ids) if by_id[i]["state"] == "rejected"]
+        if not withdrawn:
+            return
+        names = [f"{e['title']} ({e['id']})" for e in withdrawn]
+        if len(names) == 1:
+            raise DomainError(
+                f"Evidence {names[0]} was withdrawn and cannot support an analysis. "
+                "Leave it out, or cite the evidence that replaced it."
+            )
+        raise DomainError(
+            f"Evidence {', '.join(names[:-1])} and {names[-1]} were withdrawn and cannot support an "
+            "analysis. Leave them out, or cite the evidence that replaced them."
+        )
+
     def add_record(self, actor, bid, key, payload, object_id=None):
         review = payload["certainty"] == "verified"
 
@@ -736,7 +774,8 @@ class Service:
 
     def save_forecast(self, actor, bid, key, payload):
         def run(con):
-            self.references(con, bid, payload["evidence_ids"], "evidence")
+            evidence = self.references(con, bid, payload["evidence_ids"], "evidence")
+            self.refuse_withdrawn(payload["evidence_ids"], evidence)
             result = evaluate(finance.forecast, ForecastInputs.model_validate(payload["inputs"]))
             item = self.store.add(
                 con,
@@ -775,6 +814,7 @@ class Service:
                 a["evidence_id"] for a in inputs["adjustments"] if a.get("evidence_id")
             ]
             evidence = self.references(con, bid, ids, "evidence")
+            self.refuse_withdrawn(ids, evidence)
             reviewed = {e["id"] for e in evidence if e["state"] == "verified"}
             result = evaluate(finance.acquisition, deal, reviewed)
             data = {
@@ -963,8 +1003,8 @@ class Service:
                 obj["stale_reasons"] = reasons
             if obj["kind"] in ANALYSIS_NAMES:
                 reasons = []
-                if any(by_id[e]["version"] != v for e, v in obj["data"].get("evidence_versions", {}).items()):
-                    reasons.append(evidence_changed_reason())
+                if evidence_changed(obj, by_id):
+                    reasons.append(evidence_changed_reason(obj["kind"]))
                 saved = saved_under.get(obj["id"])
                 if saved is not None and saved != jurisdiction:
                     reasons.append(jurisdiction_changed_reason(obj["kind"], saved, jurisdiction))
